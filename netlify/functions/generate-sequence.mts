@@ -125,7 +125,7 @@ export default async (req: Request): Promise<Response> => {
       system: SYSTEM,
       output_config: {
         effort: "medium",
-        format: { type: "json_schema", name: "cold_email_sequence", schema: SCHEMA },
+        format: { type: "json_schema", schema: SCHEMA },
       },
       messages: [{ role: "user", content: userPrompt }],
     } as Anthropic.MessageCreateParamsNonStreaming);
