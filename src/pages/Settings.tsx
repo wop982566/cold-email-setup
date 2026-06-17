@@ -166,6 +166,8 @@ VITE_SUPABASE_ANON_KEY=<anon public key>`}
                 ["OPENAI_API_KEY", "Functions", "AI lead enrichment"],
                 ["APP_FUNCTION_TOKEN", "Functions", "Optional — shared secret to lock the functions"],
                 ["VITE_APP_TOKEN", "Build", "Optional — must match APP_FUNCTION_TOKEN"],
+                ["VITE_APP_USERNAME", "Build", "Login username (optional)"],
+                ["VITE_APP_PASSWORD", "Build", "Login password — set to enable the login gate"],
               ].map(([name, scope, enables]) => (
                 <tr key={name} className="border-b border-ink/10">
                   <td className="table-cell"><code className="font-bold">{name}</code></td>

@@ -95,6 +95,7 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
 | `APP_FUNCTION_TOKEN` + `VITE_APP_TOKEN` | both | Optional shared secret so only your app can call the functions |
+| `VITE_APP_USERNAME` + `VITE_APP_PASSWORD` | build | Optional login gate. Set the password to require sign-in. |
 
 ---
 

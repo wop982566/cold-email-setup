@@ -16,7 +16,9 @@ import {
   X,
   Database,
   HardDrive,
+  LogOut,
 } from "lucide-react";
+import { authEnabled, signOut } from "../../lib/auth";
 import { cn } from "../../lib/utils";
 import { dbMode } from "../../lib/db";
 import { useCollection, useSettings } from "../../lib/hooks";
@@ -187,6 +189,18 @@ export function Layout({ children }: { children?: ReactNode }) {
           <div className="flex items-center gap-2">
             <ModeBadge />
             <ReminderBell />
+            {authEnabled ? (
+              <button
+                onClick={() => {
+                  signOut();
+                  window.location.reload();
+                }}
+                className="flex h-10 w-10 items-center justify-center rounded-xl border-2 border-ink bg-white shadow-hard-sm hover:bg-canvas"
+                title="Sign out"
+              >
+                <LogOut size={18} />
+              </button>
+            ) : null}
           </div>
         </header>
         <main className="flex-1 p-4 lg:p-6">{children ?? <Outlet />}</main>
