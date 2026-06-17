@@ -120,3 +120,39 @@ export async function generateSequence(
 }
 
 export type { SequenceEmail };
+
+export interface AnalyzeLeadsResult {
+  ok: boolean;
+  report?: {
+    icp_summary?: string;
+    insights?: string[];
+    relevance_keywords?: string[];
+    categories?: {
+      key: string;
+      label: string;
+      description: string;
+      action: "keep" | "review" | "discard";
+      signals?: { industries?: string[]; keywords?: string[]; titles?: string[]; seniorities?: string[] };
+    }[];
+  };
+  error?: string;
+}
+
+export async function analyzeLeads(payload: {
+  campaign: string;
+  sample: Record<string, unknown>[];
+  facets: unknown;
+}): Promise<AnalyzeLeadsResult> {
+  try {
+    const res = await fetch("/.netlify/functions/analyze-leads", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as AnalyzeLeadsResult;
+    if (!res.ok) return { ok: false, error: data.error ?? `HTTP ${res.status}` };
+    return data;
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Network error" };
+  }
+}

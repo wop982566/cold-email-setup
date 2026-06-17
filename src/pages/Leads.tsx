@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Papa from "papaparse";
 import {
   Plus,
@@ -15,6 +15,7 @@ import {
   Tag,
   Copy,
   Filter,
+  RotateCcw,
 } from "lucide-react";
 import { Card, Badge, EmptyState } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
@@ -37,6 +38,9 @@ import {
 } from "../lib/types";
 import { cn, download, uuid, uniqueBy } from "../lib/utils";
 import { enrichLeads } from "../lib/functions";
+import { ImportWizard, type ImportResult } from "../components/leads/ImportWizard";
+import { leadToExportRow } from "../lib/leadImport";
+import { dbMode } from "../lib/db";
 
 const STATUS_OPTIONS: { value: LeadStatus; label: string; tone: string }[] = [
   { value: "new", label: "New", tone: "bg-white" },
@@ -51,6 +55,10 @@ const STATUS_OPTIONS: { value: LeadStatus; label: string; tone: string }[] = [
 
 function statusTone(s: LeadStatus) {
   return STATUS_OPTIONS.find((o) => o.value === s)?.tone ?? "bg-white";
+}
+
+function relevanceTone(r: Lead["relevance"]) {
+  return r === "relevant" ? "mint" : r === "unrelated" ? "coral" : r === "review" ? "sun" : "white";
 }
 
 function blankLead(listId: string | null): Lead {
@@ -72,6 +80,10 @@ function blankLead(listId: string | null): Lead {
     used_in_campaign_id: null,
     used_at: null,
     enriched: false,
+    category: "",
+    relevance: "",
+    discarded: false,
+    discarded_at: null,
     score: 50,
     tags: [],
     enrichment: {},
@@ -93,6 +105,7 @@ export default function Leads() {
   const removeList = useRemove(TABLES.leadLists);
 
   const [activeListId, setActiveListId] = useState<string | null>(null); // null = all
+  const [showDiscarded, setShowDiscarded] = useState(false);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [industryFilter, setIndustryFilter] = useState("");
@@ -103,10 +116,17 @@ export default function Leads() {
   const [deleting, setDeleting] = useState<Lead | null>(null);
   const [showList, setShowList] = useState(false);
   const [showEnrich, setShowEnrich] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
 
-  // descendant list ids (so master shows leads in its sublists too)
+  // Reset paging + selection when the view changes.
+  useEffect(() => {
+    setPage(0);
+  }, [search, statusFilter, industryFilter, minScore, hideUsed, activeListId, showDiscarded]);
+
   const descendantIds = useMemo(() => {
-    if (!activeListId) return null;
+    if (showDiscarded || !activeListId) return null;
     const ids = new Set<string>([activeListId]);
     let changed = true;
     while (changed) {
@@ -119,7 +139,7 @@ export default function Leads() {
       }
     }
     return ids;
-  }, [activeListId, lists]);
+  }, [activeListId, lists, showDiscarded]);
 
   const industries = useMemo(
     () => Array.from(new Set(leads.map((l) => l.industry).filter(Boolean))).sort(),
@@ -129,21 +149,33 @@ export default function Leads() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return leads.filter((l) => {
-      if (descendantIds && !(l.list_id && descendantIds.has(l.list_id))) return false;
+      if (showDiscarded) {
+        if (!l.discarded) return false;
+      } else {
+        if (l.discarded) return false;
+        if (descendantIds && !(l.list_id && descendantIds.has(l.list_id))) return false;
+      }
       if (statusFilter && l.status !== statusFilter) return false;
       if (industryFilter && l.industry !== industryFilter) return false;
       if (minScore > 0 && l.score < minScore) return false;
       if (hideUsed && l.status === "used") return false;
       if (q) {
-        const hay = `${l.email} ${l.first_name} ${l.last_name} ${l.company} ${l.title} ${l.tags.join(" ")}`.toLowerCase();
+        const hay = `${l.email} ${l.first_name} ${l.last_name} ${l.company} ${l.title} ${l.category} ${l.tags.join(" ")}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [leads, descendantIds, statusFilter, industryFilter, minScore, hideUsed, search]);
+  }, [leads, descendantIds, statusFilter, industryFilter, minScore, hideUsed, search, showDiscarded]);
+
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, pages - 1);
+  const pageLeads = filtered.slice(safePage * pageSize, safePage * pageSize + pageSize);
 
   const allChecked = filtered.length > 0 && filtered.every((l) => selected.has(l.id));
   const selectedLeads = filtered.filter((l) => selected.has(l.id));
+
+  const activeCount = useMemo(() => leads.filter((l) => !l.discarded).length, [leads]);
+  const discardedCount = useMemo(() => leads.filter((l) => l.discarded).length, [leads]);
 
   function toggleAll() {
     if (allChecked) setSelected(new Set());
@@ -198,6 +230,30 @@ export default function Leads() {
     toast.push(`Tagged ${selectedLeads.length} leads`);
   }
 
+  async function discardSelected() {
+    for (const l of selectedLeads) {
+      await updateLead.mutateAsync({
+        id: l.id,
+        patch: { discarded: true, discarded_at: new Date().toISOString() } as Partial<Lead>,
+      });
+    }
+    toast.push(`Moved ${selectedLeads.length} leads to Discarded`);
+    setSelected(new Set());
+  }
+
+  async function restoreSelected() {
+    for (const l of selectedLeads) {
+      await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
+    }
+    toast.push(`Restored ${selectedLeads.length} leads`);
+    setSelected(new Set());
+  }
+
+  async function restoreOne(l: Lead) {
+    await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
+    toast.push(`Restored ${l.email}`);
+  }
+
   async function makeSublist() {
     if (selectedLeads.length === 0) return;
     const parent = activeListId ?? lists[0]?.id ?? null;
@@ -227,72 +283,48 @@ export default function Leads() {
   }
 
   function exportCsv() {
-    const rows = filtered.map((l) => ({
-      email: l.email,
-      first_name: l.first_name,
-      last_name: l.last_name,
-      company: l.company,
-      title: l.title,
-      website: l.website,
-      linkedin: l.linkedin,
-      phone: l.phone,
-      location: l.location,
-      industry: l.industry,
-      employees: l.employees,
-      status: l.status,
-      score: l.score,
-      tags: l.tags.join("|"),
-    }));
+    const rows = filtered.map(leadToExportRow);
+    if (rows.length === 0) {
+      toast.push("Nothing to export in this view", "info");
+      return;
+    }
     download(`leads-${new Date().toISOString().slice(0, 10)}.csv`, Papa.unparse(rows));
   }
 
-  function importCsv(file: File) {
-    const existingEmails = new Set(leads.map((l) => l.email.trim().toLowerCase()));
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async (result) => {
-        const targetList = activeListId ?? lists[0]?.id ?? null;
-        const rows: Lead[] = [];
-        let skipped = 0;
-        for (const r of result.data as Record<string, string>[]) {
-          const email = (r.email || r.Email || r["Email Address"] || "").trim();
-          if (!email) continue;
-          if (existingEmails.has(email.toLowerCase())) {
-            skipped++;
-            continue;
-          }
-          existingEmails.add(email.toLowerCase());
-          rows.push({
-            ...blankLead(targetList),
-            email,
-            first_name: r.first_name || r["First Name"] || r.firstName || "",
-            last_name: r.last_name || r["Last Name"] || r.lastName || "",
-            company: r.company || r.Company || r.organization || "",
-            title: r.title || r.Title || r["Job Title"] || "",
-            website: r.website || r.Website || r.domain || "",
-            linkedin: r.linkedin || r.LinkedIn || "",
-            phone: r.phone || r.Phone || "",
-            location: r.location || r.Location || r.city || "",
-            industry: r.industry || r.Industry || "",
-            employees: r.employees || r["Employee Count"] || "",
-          });
-        }
-        if (rows.length === 0) {
-          toast.push(`No new leads imported (${skipped} duplicates skipped)`, "info");
-          return;
-        }
-        await insertManyLeads.mutateAsync(rows);
-        toast.push(`Imported ${rows.length} leads (${skipped} duplicates skipped)`);
-      },
-      error: () => toast.push("Failed to parse CSV", "error"),
+  async function handleImport({ listName, kept, discarded }: ImportResult) {
+    const list = await insertList.mutateAsync({
+      id: uuid(),
+      name: listName,
+      parent_id: null,
+      description: `Imported — ${kept.length} kept, ${discarded.length} discarded`,
+      color: "#FF90E8",
+      source: "CSV import",
     });
+    const all = [...kept, ...discarded].map((l) => ({ ...l, id: uuid(), list_id: list.id }));
+    const CHUNK = 1000;
+    try {
+      for (let i = 0; i < all.length; i += CHUNK) {
+        await insertManyLeads.mutateAsync(all.slice(i, i + CHUNK));
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const quota = /quota|exceeded/i.test(msg) || (e as { name?: string })?.name === "QuotaExceededError";
+      throw new Error(
+        quota
+          ? `Browser storage is full at this size. ${dbMode === "local" ? "Connect Supabase" : "Import a smaller batch"} for large lists.`
+          : msg,
+      );
+    }
+    toast.push(`Imported ${kept.length} to "${listName}" · ${discarded.length} discarded`);
+    setShowImport(false);
+    setShowDiscarded(false);
+    setActiveListId(list.id);
   }
 
   const rootLists = lists.filter((l) => !l.parent_id);
   const childLists = (id: string) => lists.filter((l) => l.parent_id === id);
   const countFor = (listId: string | null) => {
-    if (!listId) return leads.length;
+    if (!listId) return activeCount;
     const ids = new Set<string>([listId]);
     let changed = true;
     while (changed) {
@@ -304,8 +336,16 @@ export default function Leads() {
         }
       }
     }
-    return leads.filter((l) => l.list_id && ids.has(l.list_id)).length;
+    return leads.filter((l) => !l.discarded && l.list_id && ids.has(l.list_id)).length;
   };
+
+  function selectList(id: string | null) {
+    setShowDiscarded(false);
+    setActiveListId(id);
+    setSelected(new Set());
+  }
+
+  const existingEmails = useMemo(() => new Set(leads.map((l) => l.email.trim().toLowerCase())), [leads]);
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_1fr]">
@@ -322,22 +362,22 @@ export default function Leads() {
         <button
           className={cn(
             "mb-1 flex w-full items-center justify-between rounded-lg border-2 px-2 py-1.5 text-sm font-bold",
-            activeListId === null ? "border-ink bg-sun" : "border-transparent hover:bg-canvas",
+            !showDiscarded && activeListId === null ? "border-ink bg-sun" : "border-transparent hover:bg-canvas",
           )}
-          onClick={() => setActiveListId(null)}
+          onClick={() => selectList(null)}
         >
           <span className="flex items-center gap-2">
             <Users size={14} /> All leads
           </span>
-          <span className="text-xs">{leads.length}</span>
+          <span className="text-xs">{activeCount}</span>
         </button>
         {rootLists.map((l) => (
           <div key={l.id}>
             <ListButton
               list={l}
-              active={activeListId === l.id}
+              active={!showDiscarded && activeListId === l.id}
               count={countFor(l.id)}
-              onClick={() => setActiveListId(l.id)}
+              onClick={() => selectList(l.id)}
               onDelete={() => removeList.mutate(l.id)}
             />
             <div className="ml-3 border-l-2 border-ink/15 pl-2">
@@ -345,9 +385,9 @@ export default function Leads() {
                 <ListButton
                   key={c.id}
                   list={c}
-                  active={activeListId === c.id}
+                  active={!showDiscarded && activeListId === c.id}
                   count={countFor(c.id)}
-                  onClick={() => setActiveListId(c.id)}
+                  onClick={() => selectList(c.id)}
                   onDelete={() => removeList.mutate(c.id)}
                   small
                 />
@@ -355,6 +395,24 @@ export default function Leads() {
             </div>
           </div>
         ))}
+
+        {/* Discarded folder */}
+        <button
+          className={cn(
+            "mt-3 flex w-full items-center justify-between rounded-lg border-2 px-2 py-1.5 text-sm font-bold",
+            showDiscarded ? "border-ink bg-coral text-white" : "border-transparent text-muted hover:bg-canvas",
+          )}
+          onClick={() => {
+            setShowDiscarded(true);
+            setSelected(new Set());
+          }}
+          title="Discarded leads are hidden everywhere else until you restore them"
+        >
+          <span className="flex items-center gap-2">
+            <Trash2 size={14} /> Discarded
+          </span>
+          <span className="text-xs">{discardedCount}</span>
+        </button>
       </Card>
 
       {/* Main */}
@@ -393,11 +451,10 @@ export default function Leads() {
           <button className="btn-ghost btn-sm" onClick={exportCsv}>
             <Download size={14} /> Export
           </button>
-          <label className="btn-ghost btn-sm cursor-pointer">
-            <Upload size={14} /> Import
-            <input type="file" accept=".csv" className="hidden" onChange={(e) => e.target.files?.[0] && importCsv(e.target.files[0])} />
-          </label>
-          <button className="btn-primary btn-sm" onClick={() => setEditing(blankLead(activeListId))}>
+          <button className="btn-primary btn-sm" onClick={() => setShowImport(true)}>
+            <Sparkles size={14} /> Import &amp; enrich
+          </button>
+          <button className="btn-ghost btn-sm" onClick={() => setEditing(blankLead(activeListId))}>
             <Plus size={14} /> Add lead
           </button>
         </Card>
@@ -406,61 +463,74 @@ export default function Leads() {
         {selectedLeads.length > 0 ? (
           <Card className="flex flex-wrap items-center gap-2 bg-pink/30 p-3">
             <span className="text-sm font-bold">{selectedLeads.length} selected</span>
-            <select
-              className="input max-w-[150px] cursor-pointer"
-              defaultValue=""
-              onChange={(e) => {
-                if (e.target.value) bulkSetStatus(e.target.value as LeadStatus);
-                e.target.value = "";
-              }}
-            >
-              <option value="">Set status…</option>
-              {STATUS_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-            <select
-              className="input max-w-[150px] cursor-pointer"
-              defaultValue=""
-              onChange={(e) => {
-                if (e.target.value) bulkMove(e.target.value);
-                e.target.value = "";
-              }}
-            >
-              <option value="">Move to list…</option>
-              {lists.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.name}
-                </option>
-              ))}
-            </select>
-            <button
-              className="btn-ghost btn-sm"
-              onClick={() => {
-                const t = prompt("Tag to add:");
-                if (t) bulkTag(t);
-              }}
-            >
-              <Tag size={14} /> Tag
-            </button>
-            <button className="btn-ghost btn-sm" onClick={makeSublist}>
-              <FolderPlus size={14} /> Make sub-list
-            </button>
-            <button className="btn-sun btn-sm" onClick={() => setShowEnrich(true)}>
-              <Sparkles size={14} /> Enrich
-            </button>
-            <button
-              className="btn-sm btn bg-danger text-white shadow-hard"
-              onClick={async () => {
-                await removeManyLeads.mutateAsync(selectedLeads.map((l) => l.id));
-                toast.push(`Deleted ${selectedLeads.length} leads`);
-                setSelected(new Set());
-              }}
-            >
-              <Trash2 size={14} /> Delete
-            </button>
+            {showDiscarded ? (
+              <>
+                <button className="btn-dark btn-sm" onClick={restoreSelected}>
+                  <RotateCcw size={14} /> Restore
+                </button>
+                <button
+                  className="btn-sm btn bg-danger text-white shadow-hard"
+                  onClick={async () => {
+                    await removeManyLeads.mutateAsync(selectedLeads.map((l) => l.id));
+                    toast.push(`Deleted ${selectedLeads.length} leads forever`);
+                    setSelected(new Set());
+                  }}
+                >
+                  <Trash2 size={14} /> Delete forever
+                </button>
+              </>
+            ) : (
+              <>
+                <select
+                  className="input max-w-[150px] cursor-pointer"
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) bulkSetStatus(e.target.value as LeadStatus);
+                    e.target.value = "";
+                  }}
+                >
+                  <option value="">Set status…</option>
+                  {STATUS_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="input max-w-[150px] cursor-pointer"
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) bulkMove(e.target.value);
+                    e.target.value = "";
+                  }}
+                >
+                  <option value="">Move to list…</option>
+                  {lists.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn-ghost btn-sm"
+                  onClick={() => {
+                    const t = prompt("Tag to add:");
+                    if (t) bulkTag(t);
+                  }}
+                >
+                  <Tag size={14} /> Tag
+                </button>
+                <button className="btn-ghost btn-sm" onClick={makeSublist}>
+                  <FolderPlus size={14} /> Make sub-list
+                </button>
+                <button className="btn-sun btn-sm" onClick={() => setShowEnrich(true)}>
+                  <Sparkles size={14} /> Enrich
+                </button>
+                <button className="btn-ghost btn-sm" onClick={discardSelected}>
+                  <Trash2 size={14} /> Discard
+                </button>
+              </>
+            )}
           </Card>
         ) : null}
 
@@ -469,68 +539,76 @@ export default function Leads() {
             <div className="p-6">
               <EmptyState
                 icon={<Users size={32} />}
-                title="No leads here"
-                description="Import a CSV of scraped leads or add one manually. Use sub-lists to slice your master list per campaign."
+                title={showDiscarded ? "No discarded leads" : "No leads here"}
+                description={
+                  showDiscarded
+                    ? "Leads you discard during import or review land here, hidden from everywhere else until you restore them."
+                    : "Import a CSV of scraped leads (AI will analyze and help you weed out the wrong ones) or add one manually."
+                }
                 action={
-                  <label className="btn-primary btn-sm cursor-pointer">
-                    <Upload size={14} /> Import CSV
-                    <input type="file" accept=".csv" className="hidden" onChange={(e) => e.target.files?.[0] && importCsv(e.target.files[0])} />
-                  </label>
+                  showDiscarded ? undefined : (
+                    <button className="btn-primary btn-sm" onClick={() => setShowImport(true)}>
+                      <Sparkles size={14} /> Import &amp; enrich
+                    </button>
+                  )
                 }
               />
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full border-collapse text-left text-sm">
+              <table className="w-full table-fixed border-collapse text-left text-sm">
                 <thead>
                   <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
-                    <th className="table-cell">
+                    <th className="w-9 px-2 py-2">
                       <input type="checkbox" checked={allChecked} onChange={toggleAll} />
                     </th>
-                    <th className="table-cell">Lead</th>
-                    <th className="table-cell">Company</th>
-                    <th className="table-cell">Title</th>
-                    <th className="table-cell">Industry</th>
-                    <th className="table-cell">Score</th>
-                    <th className="table-cell">Status</th>
-                    <th className="table-cell">Tags</th>
-                    <th className="table-cell text-right">Actions</th>
+                    <th className="px-2 py-2" style={{ width: "22%" }}>Lead</th>
+                    <th className="px-2 py-2" style={{ width: "16%" }}>Company</th>
+                    <th className="px-2 py-2" style={{ width: "16%" }}>Title</th>
+                    <th className="px-2 py-2" style={{ width: "15%" }}>Category</th>
+                    <th className="w-20 px-2 py-2">Fit</th>
+                    <th className="w-14 px-2 py-2">Score</th>
+                    <th className="w-24 px-2 py-2">Status</th>
+                    <th className="w-20 px-2 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((l) => (
+                  {pageLeads.map((l) => (
                     <tr key={l.id} className={cn("border-b border-ink/10 hover:bg-canvas/60", selected.has(l.id) && "bg-pink/10")}>
-                      <td className="table-cell">
+                      <td className="px-2 py-2">
                         <input type="checkbox" checked={selected.has(l.id)} onChange={() => toggleOne(l.id)} />
                       </td>
-                      <td className="table-cell">
-                        <p className="font-bold">{[l.first_name, l.last_name].filter(Boolean).join(" ") || "—"}</p>
-                        <p className="text-xs text-muted">{l.email}</p>
+                      <td className="px-2 py-2">
+                        <p className="truncate font-bold" title={[l.first_name, l.last_name].filter(Boolean).join(" ")}>
+                          {[l.first_name, l.last_name].filter(Boolean).join(" ") || "—"}
+                        </p>
+                        <p className="truncate text-xs text-muted" title={l.email}>{l.email}</p>
                       </td>
-                      <td className="table-cell">{l.company || "—"}</td>
-                      <td className="table-cell">{l.title || "—"}</td>
-                      <td className="table-cell">{l.industry || "—"}</td>
-                      <td className="table-cell">
-                        <span className="font-bold">{l.score}</span>
+                      <td className="truncate px-2 py-2" title={l.company}>{l.company || "—"}</td>
+                      <td className="truncate px-2 py-2" title={l.title}>{l.title || "—"}</td>
+                      <td className="truncate px-2 py-2" title={l.category}>{l.category || l.industry || "—"}</td>
+                      <td className="px-2 py-2">
+                        {l.relevance ? (
+                          <Badge tone={relevanceTone(l.relevance) as "mint"}>{l.relevance}</Badge>
+                        ) : (
+                          <span className="text-muted">—</span>
+                        )}
                       </td>
-                      <td className="table-cell">
+                      <td className="px-2 py-2 font-bold">{l.score}</td>
+                      <td className="px-2 py-2">
                         <span className={cn("badge", statusTone(l.status))}>{l.status}</span>
                       </td>
-                      <td className="table-cell">
-                        <div className="flex flex-wrap gap-1">
-                          {l.tags.slice(0, 3).map((t) => (
-                            <span key={t} className="chip">
-                              {t}
-                            </span>
-                          ))}
-                          {l.enriched ? <span className="chip bg-lavender">AI</span> : null}
-                        </div>
-                      </td>
-                      <td className="table-cell text-right">
+                      <td className="px-2 py-2 text-right">
                         <div className="flex justify-end gap-1">
-                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)}>
-                            <Pencil size={13} />
-                          </button>
+                          {showDiscarded ? (
+                            <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-mint hover:text-white" onClick={() => restoreOne(l)} title="Restore">
+                              <RotateCcw size={13} />
+                            </button>
+                          ) : (
+                            <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)}>
+                              <Pencil size={13} />
+                            </button>
+                          )}
                           <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-danger hover:text-white" onClick={() => setDeleting(l)}>
                             <Trash2 size={13} />
                           </button>
@@ -543,10 +621,25 @@ export default function Leads() {
             </div>
           )}
         </Card>
-        <p className="text-xs text-muted">
-          Showing {filtered.length} of {leads.length} leads
-          {selectedLeads.length > 0 ? ` · ${selectedLeads.length} selected` : ""}.
-        </p>
+
+        <div className="flex items-center justify-between text-xs text-muted">
+          <span>
+            Showing {pageLeads.length} of {filtered.length}
+            {showDiscarded ? " discarded" : ""} leads
+            {selectedLeads.length > 0 ? ` · ${selectedLeads.length} selected` : ""}.
+          </span>
+          {pages > 1 ? (
+            <div className="flex items-center gap-2">
+              <button className="btn-ghost btn-sm" disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>
+                Prev
+              </button>
+              <span>{safePage + 1}/{pages}</span>
+              <button className="btn-ghost btn-sm" disabled={safePage >= pages - 1} onClick={() => setPage(safePage + 1)}>
+                Next
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
 
       {editing ? (
@@ -559,6 +652,15 @@ export default function Leads() {
           toast.push("List created");
           setShowList(false);
         }} />
+      ) : null}
+
+      {showImport ? (
+        <ImportWizard
+          campaigns={campaigns}
+          existingEmails={existingEmails}
+          onClose={() => setShowImport(false)}
+          onComplete={handleImport}
+        />
       ) : null}
 
       {showEnrich ? (
@@ -582,7 +684,7 @@ export default function Leads() {
         onClose={() => setDeleting(null)}
         onConfirm={() => deleting && removeLead.mutate(deleting.id)}
         title="Delete lead"
-        message={`Remove ${deleting?.email}?`}
+        message={`Remove ${deleting?.email}? This permanently deletes it.`}
       />
     </div>
   );
@@ -746,6 +848,9 @@ function LeadModal({
         <Field label="Industry">
           <TextField value={form.industry} onChange={(v) => set("industry", v)} />
         </Field>
+        <Field label="Category">
+          <TextField value={form.category} onChange={(v) => set("category", v)} />
+        </Field>
         <Field label="Employees">
           <TextField value={form.employees} onChange={(v) => set("employees", v)} />
         </Field>
@@ -800,10 +905,8 @@ function EnrichModal({
 }) {
   const toast = useToast();
   const [tab, setTab] = useState<"manual" | "ai">("manual");
-  // manual
   const [field, setField] = useState<keyof Lead>("industry");
   const [value, setValue] = useState("");
-  // ai
   const [instructions, setInstructions] = useState(
     "Infer the industry and a 1-line summary for each lead from their company and title. Give a 0-100 fit score for a cold-email agency offer.",
   );
@@ -811,6 +914,7 @@ function EnrichModal({
 
   const manualFields: { value: keyof Lead; label: string }[] = [
     { value: "industry", label: "Industry" },
+    { value: "category", label: "Category" },
     { value: "title", label: "Title" },
     { value: "location", label: "Location" },
     { value: "employees", label: "Employees" },
@@ -915,8 +1019,8 @@ function EnrichModal({
       ) : (
         <div className="space-y-3">
           <p className="text-sm text-muted">
-            Runs through the <code>/enrich</code> Netlify function using your OpenAI key (added later). Returns
-            industry, a fit score and a summary. If the key isn't set yet, you'll get a clear error and can use manual mode.
+            Runs through the <code>/enrich</code> Netlify function using your OpenAI key. Returns industry, a fit score
+            and a summary. If the key isn't set yet, you'll get a clear error and can use manual mode.
           </p>
           <Field label="Instructions to the model">
             <TextArea rows={5} value={instructions} onChange={setInstructions} />

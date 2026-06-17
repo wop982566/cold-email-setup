@@ -122,6 +122,10 @@ export interface Lead extends BaseRow {
   used_in_campaign_id: ID | null;
   used_at: string | null;
   enriched: boolean;
+  category: string; // AI/rule assigned category (e.g. "Marketing agency")
+  relevance: "relevant" | "review" | "unrelated" | "";
+  discarded: boolean; // hidden from normal views until restored
+  discarded_at: string | null;
   score: number; // 0-100 lead quality score
   tags: string[];
   enrichment: Record<string, unknown>;
