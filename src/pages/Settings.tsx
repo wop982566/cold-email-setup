@@ -138,6 +138,45 @@ VITE_SUPABASE_ANON_KEY=<anon public key>`}
         )}
       </Card>
 
+      {/* Secrets & integrations */}
+      <Card className="p-5">
+        <h2 className="mb-2 flex items-center gap-2 text-lg">
+          <KeyRound size={18} /> Secrets & integrations
+        </h2>
+        <p className="mb-3 text-sm text-muted">
+          Add these in <b>Netlify → Site settings → Environment variables</b>. Once set, the matching feature works
+          automatically — no code change.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-left text-sm">
+            <thead>
+              <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
+                <th className="table-cell">Variable</th>
+                <th className="table-cell">Scope</th>
+                <th className="table-cell">Enables</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ["VITE_SUPABASE_URL", "Build", "Supabase database (project URL)"],
+                ["VITE_SUPABASE_ANON_KEY", "Build", "Supabase database (anon public key)"],
+                ["ANTHROPIC_API_KEY", "Functions", "Claude AI sequence generation"],
+                ["ANTHROPIC_MODEL", "Functions", "Optional — defaults to claude-opus-4-8"],
+                ["OPENAI_API_KEY", "Functions", "AI lead enrichment"],
+                ["APP_FUNCTION_TOKEN", "Functions", "Optional — shared secret to lock the functions"],
+                ["VITE_APP_TOKEN", "Build", "Optional — must match APP_FUNCTION_TOKEN"],
+              ].map(([name, scope, enables]) => (
+                <tr key={name} className="border-b border-ink/10">
+                  <td className="table-cell"><code className="font-bold">{name}</code></td>
+                  <td className="table-cell"><Badge tone={scope === "Build" ? "lavender" : "sky"}>{scope}</Badge></td>
+                  <td className="table-cell text-muted">{enables}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
       {/* Data tools */}
       <Card className="p-5">
         <h2 className="mb-3 text-lg">Data</h2>

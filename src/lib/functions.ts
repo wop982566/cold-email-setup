@@ -79,3 +79,44 @@ export async function enrichLeads(req: EnrichRequest): Promise<EnrichResult> {
     return { ok: false, error: e instanceof Error ? e.message : "Network error" };
   }
 }
+
+import { SequenceBrief, SequenceEmail, SequencePlatform } from "./types";
+
+export interface GeneratedEmail {
+  position: number;
+  day: number;
+  send_time?: string;
+  subject: string;
+  subject_variants?: string[];
+  body: string;
+  angle: string;
+  goal: string;
+  word_count?: number;
+}
+
+export interface GenerateSequenceResult {
+  ok: boolean;
+  emails?: GeneratedEmail[];
+  model?: string;
+  error?: string;
+}
+
+export async function generateSequence(
+  brief: SequenceBrief,
+  platform: SequencePlatform,
+): Promise<GenerateSequenceResult> {
+  try {
+    const res = await fetch("/.netlify/functions/generate-sequence", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ brief, platform }),
+    });
+    const data = (await res.json()) as GenerateSequenceResult;
+    if (!res.ok) return { ok: false, error: data.error ?? `HTTP ${res.status}` };
+    return data;
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Network error" };
+  }
+}
+
+export type { SequenceEmail };

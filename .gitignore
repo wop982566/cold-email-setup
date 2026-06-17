@@ -10,3 +10,6 @@ dist
 coverage
 
 *.tsbuildinfo
+
+cold-email-command-center.zip
+*.zip

@@ -147,6 +147,74 @@ export interface SetupStep extends BaseRow {
   done: boolean;
 }
 
+// --- Email sequences / campaigns ------------------------------------------
+export type SequencePlatform =
+  | "instantly"
+  | "smartlead"
+  | "apollo"
+  | "lemlist"
+  | "gmail"
+  | "manual";
+
+export type SequenceStatus = "draft" | "live" | "paused" | "won" | "archived";
+
+export type PersonalizationLevel = "hyper" | "account" | "segment" | "volume";
+
+export interface SequenceBrief {
+  audience: string; // ICP: role, company type, size
+  sender_name: string;
+  sender_role: string;
+  offer: string; // what you solve / value prop
+  proof: string; // case study / result / credibility
+  signal: string; // trigger / research signal (optional)
+  industry: string;
+  angle: string; // save time, reduce risk, growth, deliverability…
+  personalization: PersonalizationLevel;
+  tone: string; // peer/casual, professional, technical, C-suite brief
+  sequence_type: string; // classic7 | fast5 | nurture | custom
+  email_count: number;
+  length_pref: string; // ultra-short | short | medium
+  cta_style: string; // interest | soft | direct
+  use_spintax: boolean;
+  notes: string; // extra instructions
+}
+
+export interface SequencePerformance {
+  sent: number;
+  opens: number;
+  replies: number;
+  positive_replies: number;
+  meetings: number;
+  rating: number; // 0-5 stars
+  is_winner: boolean;
+  notes: string;
+}
+
+export interface Sequence extends BaseRow {
+  name: string;
+  platform: SequencePlatform;
+  campaign_id: ID | null;
+  status: SequenceStatus;
+  brief: SequenceBrief;
+  performance: SequencePerformance;
+  generated_by: "ai" | "manual";
+  model: string;
+}
+
+export interface SequenceEmail extends BaseRow {
+  sequence_id: ID;
+  position: number; // step number, 1-based
+  day: number; // send-day offset from start
+  send_time: string; // e.g. "10:00"
+  subject: string;
+  subject_variants: string[];
+  body: string; // may contain spintax + platform variables
+  angle: string;
+  goal: string;
+  word_count: number;
+  notes: string;
+}
+
 export type FieldType = "text" | "number" | "date" | "boolean" | "select";
 
 export interface CustomField extends BaseRow {
@@ -198,6 +266,8 @@ export const TABLES = {
   setups: "setups",
   setupSteps: "setup_steps",
   customFields: "custom_fields",
+  sequences: "sequences",
+  sequenceEmails: "sequence_emails",
   settings: "app_settings",
 } as const;
 
