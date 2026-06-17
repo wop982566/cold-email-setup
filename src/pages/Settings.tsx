@@ -162,6 +162,7 @@ VITE_SUPABASE_ANON_KEY=<anon public key>`}
                 ["VITE_SUPABASE_ANON_KEY", "Build", "Supabase database (anon public key)"],
                 ["ANTHROPIC_API_KEY", "Functions", "Claude AI sequence generation"],
                 ["ANTHROPIC_MODEL", "Functions", "Optional — defaults to claude-opus-4-8"],
+                ["INSTANTLY_API_KEY", "Functions", "Instantly v2 key (read scopes) — live insights"],
                 ["OPENAI_API_KEY", "Functions", "AI lead enrichment"],
                 ["APP_FUNCTION_TOKEN", "Functions", "Optional — shared secret to lock the functions"],
                 ["VITE_APP_TOKEN", "Build", "Optional — must match APP_FUNCTION_TOKEN"],

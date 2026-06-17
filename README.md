@@ -89,6 +89,9 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 |----------|-------|---------|
 | `VITE_SUPABASE_URL` | build | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | build | Supabase anon key |
+| `ANTHROPIC_API_KEY` | functions | Claude AI cold-email sequence generation |
+| `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
+| `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
 | `APP_FUNCTION_TOKEN` + `VITE_APP_TOKEN` | both | Optional shared secret so only your app can call the functions |
@@ -106,6 +109,15 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   instructions; it returns inferred `industry`, a 0-100 fit `score`, and a
   one-line `summary`. AI is intentionally optional — the Leads page has powerful
   manual filters + bulk-fill so you can enrich entirely on your own.
+- **`/.netlify/functions/generate-sequence`** — **Claude** cold-email sequence
+  generator. Takes the builder's brief, returns a structured multi-email
+  sequence using the target platform's merge variables + spintax (Instantly by
+  default). Defaults to `claude-opus-4-8`.
+- **`/.netlify/functions/instantly`** — read-only proxy for the **Instantly v2
+  API**. Whitelisted resources: `accounts`, `campaigns`, `analytics-overview`,
+  `analytics-campaigns`, `warmup`. Powers the Instantly insights page (campaign
+  analytics, mailbox/warmup health, sending volume vs plan) with the key kept
+  server-side.
 
 ---
 

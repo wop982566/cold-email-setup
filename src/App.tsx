@@ -8,6 +8,7 @@ const Domains = lazy(() => import("./pages/Domains"));
 const Capacity = lazy(() => import("./pages/Capacity"));
 const Leads = lazy(() => import("./pages/Leads"));
 const Sequences = lazy(() => import("./pages/Sequences"));
+const Instantly = lazy(() => import("./pages/Instantly"));
 const Costs = lazy(() => import("./pages/Costs"));
 const Setups = lazy(() => import("./pages/Setups"));
 const Insights = lazy(() => import("./pages/Insights"));
@@ -62,6 +63,14 @@ export default function App() {
           element={
             <Suspense fallback={<Loading />}>
               <Sequences />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/instantly"
+          element={
+            <Suspense fallback={<Loading />}>
+              <Instantly />
             </Suspense>
           }
         />
