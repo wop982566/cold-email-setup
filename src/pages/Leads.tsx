@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   Plus,
   Search,
@@ -17,6 +17,8 @@ import {
   RotateCcw,
   Archive,
   Eye,
+  ChevronRight,
+  ChevronDown,
 } from "lucide-react";
 import { Card, Badge, EmptyState } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
@@ -42,7 +44,7 @@ import {
 import { cn, uuid, uniqueBy } from "../lib/utils";
 import { enrichLeads } from "../lib/functions";
 import { ImportWizard, type ImportResult } from "../components/leads/ImportWizard";
-import { LeadDetailModal } from "../components/leads/LeadDetailModal";
+import { LeadDetailModal, LeadFields } from "../components/leads/LeadDetailModal";
 import { ExportModal } from "../components/leads/ExportModal";
 import { dbMode } from "../lib/db";
 
@@ -137,6 +139,7 @@ export default function Leads() {
   const [showImport, setShowImport] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [viewing, setViewing] = useState<Lead | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const [page, setPage] = useState(0);
   const pageSize = 50;
@@ -210,6 +213,13 @@ export default function Leads() {
     const next = new Set(selected);
     next.has(id) ? next.delete(id) : next.add(id);
     setSelected(next);
+  }
+  function toggleExpand(id: string) {
+    setExpanded((s) => {
+      const next = new Set(s);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   }
 
   async function saveLead(l: Lead) {
@@ -701,7 +711,8 @@ export default function Leads() {
                 </thead>
                 <tbody>
                   {pageLeads.map((l) => (
-                    <tr key={l.id} className={cn("border-b border-ink/10 hover:bg-canvas/60", selected.has(l.id) && "bg-pink/10")}>
+                    <Fragment key={l.id}>
+                    <tr className={cn("border-b border-ink/10 hover:bg-canvas/60", selected.has(l.id) && "bg-pink/10", expanded.has(l.id) && "bg-canvas/70")}>
                       <td className="px-2 py-2">
                         <input type="checkbox" checked={selected.has(l.id)} onChange={() => toggleOne(l.id)} />
                       </td>
@@ -727,7 +738,17 @@ export default function Leads() {
                       </td>
                       <td className="px-2 py-2 text-right">
                         <div className="flex justify-end gap-1">
-                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setViewing(l)} title="View all fields">
+                          <button
+                            className={cn(
+                              "rounded-lg border-2 border-ink p-1.5",
+                              expanded.has(l.id) ? "bg-sun" : "bg-white hover:bg-canvas",
+                            )}
+                            onClick={() => toggleExpand(l.id)}
+                            title="Expand all imported columns in list"
+                          >
+                            {expanded.has(l.id) ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                          </button>
+                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setViewing(l)} title="View all fields in a dialog">
                             <Eye size={13} />
                           </button>
                           {showDiscarded ? (
@@ -750,6 +771,14 @@ export default function Leads() {
                         </div>
                       </td>
                     </tr>
+                    {expanded.has(l.id) ? (
+                      <tr className="border-b-2 border-ink/20 bg-canvas/70">
+                        <td colSpan={9} className="px-4 py-3">
+                          <LeadFields lead={l} />
+                        </td>
+                      </tr>
+                    ) : null}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
