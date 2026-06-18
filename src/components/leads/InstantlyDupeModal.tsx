@@ -35,6 +35,9 @@ export function InstantlyDupeModal({
   const [campaignNames, setCampaignNames] = useState<Record<string, string>>({});
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [working, setWorking] = useState(false);
+  // "contacted" = only count a match when Instantly has actually emailed the
+  // lead; "any" = count any contact present in the workspace.
+  const [mode, setMode] = useState<"contacted" | "any">("contacted");
 
   async function load() {
     setLoading(true);
@@ -62,17 +65,28 @@ export function InstantlyDupeModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Emails present in Instantly at all (used for the "any" count + context).
+  const presentCount = useMemo(() => {
+    if (remote.length === 0) return 0;
+    const byEmail = new Set(remote.map((r) => r.email));
+    let n = 0;
+    for (const l of leads) if (byEmail.has(l.email.trim().toLowerCase())) n++;
+    return n;
+  }, [remote, leads]);
+
   const matches = useMemo<Match[]>(() => {
     if (remote.length === 0) return [];
     const byEmail = new Map(remote.map((r) => [r.email, r]));
     const out: Match[] = [];
     for (const l of leads) {
       const e = l.email.trim().toLowerCase();
-      const r = e && byEmail.get(e);
-      if (r) out.push({ lead: l, remote: r });
+      const r = e ? byEmail.get(e) : undefined;
+      if (!r) continue;
+      if (mode === "contacted" && !r.contacted) continue;
+      out.push({ lead: l, remote: r });
     }
     return out;
-  }, [remote, leads]);
+  }, [remote, leads, mode]);
 
   // Default: pre-select every duplicate that isn't already marked used.
   useEffect(() => {
@@ -126,10 +140,46 @@ export function InstantlyDupeModal({
     >
       <div className="space-y-3">
         <p className="text-sm text-muted">
-          Comparing <span className="font-bold text-ink">{leads.length}</span> leads in {scopeLabel} against every
-          contact already in your Instantly workspace. Matches are leads you've likely already loaded into Instantly —
-          mark them <span className="font-bold">used</span> here to keep them out of future sends.
+          Comparing <span className="font-bold text-ink">{leads.length}</span> leads in {scopeLabel} against the
+          contacts in your Instantly workspace. Mark the overlaps <span className="font-bold">used</span> here to keep
+          them out of future sends.
         </p>
+
+        {/* What counts as a duplicate */}
+        <div className="rounded-xl border-2 border-ink bg-canvas p-2">
+          <p className="mb-1 px-1 text-[11px] font-bold uppercase tracking-wide text-muted">Count as a duplicate when…</p>
+          <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+            <label
+              className={cn(
+                "flex cursor-pointer items-start gap-2 rounded-lg border-2 p-2 text-sm",
+                mode === "contacted" ? "border-ink bg-sun" : "border-transparent hover:bg-white",
+              )}
+            >
+              <input
+                type="radio"
+                className="mt-0.5"
+                checked={mode === "contacted"}
+                onChange={() => setMode("contacted")}
+              />
+              <span>
+                <span className="font-bold">Instantly already emailed them</span>
+                <span className="block text-xs text-muted">Contacted / opened / replied / sequence done.</span>
+              </span>
+            </label>
+            <label
+              className={cn(
+                "flex cursor-pointer items-start gap-2 rounded-lg border-2 p-2 text-sm",
+                mode === "any" ? "border-ink bg-sun" : "border-transparent hover:bg-white",
+              )}
+            >
+              <input type="radio" className="mt-0.5" checked={mode === "any"} onChange={() => setMode("any")} />
+              <span>
+                <span className="font-bold">Present in the workspace at all</span>
+                <span className="block text-xs text-muted">Imported into Instantly, even if not yet sent.</span>
+              </span>
+            </label>
+          </div>
+        </div>
 
         {loading ? (
           <Card className="flex items-center gap-2 p-6 text-sm">
@@ -153,8 +203,13 @@ export function InstantlyDupeModal({
           <>
             <div className="flex flex-wrap items-center gap-2">
               <Badge tone={matches.length ? "coral" : "mint"}>
-                {matches.length} duplicate{matches.length === 1 ? "" : "s"} found
+                {matches.length} duplicate{matches.length === 1 ? "" : "s"} ({mode === "contacted" ? "emailed" : "in workspace"})
               </Badge>
+              {mode === "contacted" && presentCount > matches.length ? (
+                <Badge tone="white">
+                  +{presentCount - matches.length} present but not yet emailed (ignored)
+                </Badge>
+              ) : null}
               <Badge tone="white">{remote.length.toLocaleString()} Instantly contacts scanned</Badge>
               {alreadyUsed > 0 ? <Badge tone="lavender">{alreadyUsed} already marked used</Badge> : null}
               {truncated ? (
@@ -166,7 +221,12 @@ export function InstantlyDupeModal({
 
             {matches.length === 0 ? (
               <Card className="flex items-center gap-2 border-mint bg-mint/10 p-6 text-sm font-bold">
-                <ShieldCheck size={18} /> No overlaps — none of these leads are in Instantly yet.
+                <ShieldCheck size={18} />
+                {mode === "contacted"
+                  ? presentCount > 0
+                    ? `No overlaps — these leads exist in Instantly but none have been emailed yet (${presentCount} present).`
+                    : "No overlaps — Instantly hasn't emailed any of these leads."
+                  : "No overlaps — none of these leads are in Instantly yet."}
               </Card>
             ) : (
               <Card className="overflow-hidden p-0">
@@ -199,11 +259,18 @@ export function InstantlyDupeModal({
                             </p>
                           </td>
                           <td className="px-2 py-2 text-xs">
-                            {remote.campaign ? (
-                              <span className="chip">{campaignNames[remote.campaign] ?? "In a campaign"}</span>
-                            ) : (
-                              <span className="text-muted">In workspace</span>
-                            )}
+                            <div className="flex flex-wrap items-center gap-1">
+                              {remote.campaign ? (
+                                <span className="chip">{campaignNames[remote.campaign] ?? "In a campaign"}</span>
+                              ) : (
+                                <span className="text-muted">In workspace</span>
+                              )}
+                              {remote.contacted ? (
+                                <Badge tone="mint">emailed</Badge>
+                              ) : (
+                                <Badge tone="white">not emailed</Badge>
+                              )}
+                            </div>
                           </td>
                           <td className="px-2 py-2">
                             <span

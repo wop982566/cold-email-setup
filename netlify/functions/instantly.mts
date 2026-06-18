@@ -55,12 +55,13 @@ export default async (req: Request): Promise<Response> => {
     // promptly even on large workspaces (flags `truncated` if it stops early).
     if (resource === "leads") {
       const campaignId = url.searchParams.get("campaign_id") || undefined;
-      const out: { email: string; campaign?: string; status?: number }[] = [];
+      const out: { email: string; campaign?: string; status?: number; contacted: boolean }[] = [];
       const seen = new Set<string>();
       let startingAfter: string | undefined;
       let truncated = false;
       const started = Date.now();
       const MAX_PAGES = 400; // up to ~40k leads
+      const num = (v: unknown) => (typeof v === "number" ? v : 0);
       for (let i = 0; i < MAX_PAGES; i++) {
         const body: Record<string, unknown> = { limit: 100 };
         if (startingAfter) body.starting_after = startingAfter;
@@ -77,10 +78,23 @@ export default async (req: Request): Promise<Response> => {
           const email = String(it.email ?? "").trim().toLowerCase();
           if (!email || seen.has(email)) continue;
           seen.add(email);
+          // "Contacted" = Instantly has actually sent at least one email to
+          // this lead. The cleanest signal is a last-contact timestamp; we
+          // also treat any open/reply/click or a completed sequence as proof
+          // of contact, since those can't happen without a send.
+          const lastContact =
+            it.timestamp_last_contact ?? it.timestamp_last_touch ?? it.last_contacted ?? null;
+          const contacted =
+            Boolean(lastContact) ||
+            num(it.email_reply_count) > 0 ||
+            num(it.email_open_count) > 0 ||
+            num(it.email_click_count) > 0 ||
+            it.status === 3; // 3 = Completed sequence
           out.push({
             email,
             campaign: typeof it.campaign === "string" ? it.campaign : undefined,
             status: typeof it.status === "number" ? it.status : undefined,
+            contacted,
           });
         }
         startingAfter = typeof data?.next_starting_after === "string" ? data.next_starting_after : undefined;

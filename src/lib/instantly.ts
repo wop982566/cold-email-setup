@@ -52,6 +52,8 @@ export interface InstantlyLead {
   email: string;
   campaign?: string;
   status?: number;
+  /** True when Instantly has actually sent ≥1 email to this contact. */
+  contacted?: boolean;
 }
 export interface InstantlyLeadsData {
   items: InstantlyLead[];
