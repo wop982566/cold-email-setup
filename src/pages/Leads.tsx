@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import Papa from "papaparse";
 import {
   Plus,
   Search,
@@ -17,6 +16,7 @@ import {
   Filter,
   RotateCcw,
   Archive,
+  Eye,
 } from "lucide-react";
 import { Card, Badge, EmptyState } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
@@ -39,10 +39,11 @@ import {
   LeadStatus,
   TABLES,
 } from "../lib/types";
-import { cn, download, uuid, uniqueBy } from "../lib/utils";
+import { cn, uuid, uniqueBy } from "../lib/utils";
 import { enrichLeads } from "../lib/functions";
 import { ImportWizard, type ImportResult } from "../components/leads/ImportWizard";
-import { leadToExportRow } from "../lib/leadImport";
+import { LeadDetailModal } from "../components/leads/LeadDetailModal";
+import { ExportModal } from "../components/leads/ExportModal";
 import { dbMode } from "../lib/db";
 
 const STATUS_OPTIONS: { value: LeadStatus; label: string; tone: string }[] = [
@@ -133,6 +134,8 @@ export default function Leads() {
   const [showList, setShowList] = useState(false);
   const [showEnrich, setShowEnrich] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [viewing, setViewing] = useState<Lead | null>(null);
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const [page, setPage] = useState(0);
   const pageSize = 50;
@@ -188,15 +191,18 @@ export default function Leads() {
   const safePage = Math.min(page, pages - 1);
   const pageLeads = filtered.slice(safePage * pageSize, safePage * pageSize + pageSize);
 
-  const allChecked = filtered.length > 0 && filtered.every((l) => selected.has(l.id));
   const selectedLeads = filtered.filter((l) => selected.has(l.id));
+  const pageAllSelected = pageLeads.length > 0 && pageLeads.every((l) => selected.has(l.id));
+  const allFilteredSelected = filtered.length > 0 && filtered.every((l) => selected.has(l.id));
 
   const activeCount = useMemo(() => leads.filter((l) => !l.discarded).length, [leads]);
   const discardedCount = useMemo(() => leads.filter((l) => l.discarded).length, [leads]);
 
-  function toggleAll() {
-    if (allChecked) setSelected(new Set());
-    else setSelected(new Set(filtered.map((l) => l.id)));
+  function togglePage() {
+    const next = new Set(selected);
+    if (pageAllSelected) pageLeads.forEach((l) => next.delete(l.id));
+    else pageLeads.forEach((l) => next.add(l.id));
+    setSelected(next);
   }
   function toggleOne(id: string) {
     const next = new Set(selected);
@@ -347,15 +353,6 @@ export default function Leads() {
     await removeManyLeads.mutateAsync(dupeIds);
     toast.push(`Removed ${dupeIds.length} duplicate leads`);
     setSelected(new Set());
-  }
-
-  function exportCsv() {
-    const rows = filtered.map(leadToExportRow);
-    if (rows.length === 0) {
-      toast.push("Nothing to export in this view", "info");
-      return;
-    }
-    download(`leads-${new Date().toISOString().slice(0, 10)}.csv`, Papa.unparse(rows));
   }
 
   async function handleImport({ listName, kept, discarded }: ImportResult) {
@@ -515,7 +512,10 @@ export default function Leads() {
           <button className="btn-ghost btn-sm" onClick={removeDuplicates}>
             <Copy size={14} /> Dedupe
           </button>
-          <button className="btn-ghost btn-sm" onClick={exportCsv}>
+          <button
+            className="btn-ghost btn-sm"
+            onClick={() => (filtered.length ? setShowExport(true) : toast.push("Nothing to export in this view", "info"))}
+          >
             <Download size={14} /> Export
           </button>
           <button className="btn-primary btn-sm" onClick={() => setShowImport(true)}>
@@ -603,6 +603,32 @@ export default function Leads() {
           </Card>
         ) : null}
 
+        {/* Page vs all-matching selection */}
+        {pageAllSelected && filtered.length > pageLeads.length ? (
+          <Card
+            className={cn(
+              "flex flex-wrap items-center justify-center gap-2 p-2 text-sm font-bold",
+              allFilteredSelected ? "bg-mint text-white" : "bg-sun",
+            )}
+          >
+            {allFilteredSelected ? (
+              <>
+                All {filtered.length} matching leads selected.
+                <button className="underline" onClick={() => setSelected(new Set())}>
+                  Clear selection
+                </button>
+              </>
+            ) : (
+              <>
+                All {pageLeads.length} on this page selected.
+                <button className="underline" onClick={() => setSelected(new Set(filtered.map((l) => l.id)))}>
+                  Select all {filtered.length} matching
+                </button>
+              </>
+            )}
+          </Card>
+        ) : null}
+
         <Card className="overflow-hidden p-0">
           {filtered.length === 0 ? (
             <div className="p-6">
@@ -629,7 +655,7 @@ export default function Leads() {
                 <thead>
                   <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
                     <th className="w-9 px-2 py-2">
-                      <input type="checkbox" checked={allChecked} onChange={toggleAll} />
+                      <input type="checkbox" checked={pageAllSelected} onChange={togglePage} title="Select this page" />
                     </th>
                     <th className="px-2 py-2" style={{ width: "22%" }}>Lead</th>
                     <th className="px-2 py-2" style={{ width: "16%" }}>Company</th>
@@ -669,6 +695,9 @@ export default function Leads() {
                       </td>
                       <td className="px-2 py-2 text-right">
                         <div className="flex justify-end gap-1">
+                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setViewing(l)} title="View all fields">
+                            <Eye size={13} />
+                          </button>
                           {showDiscarded ? (
                             <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-mint hover:text-white" onClick={() => restoreOne(l)} title="Restore">
                               <RotateCcw size={13} />
@@ -736,6 +765,10 @@ export default function Leads() {
           onComplete={handleImport}
         />
       ) : null}
+
+      {showExport ? <ExportModal leads={filtered} onClose={() => setShowExport(false)} /> : null}
+
+      {viewing ? <LeadDetailModal lead={viewing} onClose={() => setViewing(null)} /> : null}
 
       {showEnrich ? (
         <EnrichModal

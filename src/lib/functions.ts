@@ -142,6 +142,7 @@ export async function analyzeLeads(payload: {
   campaign: string;
   sample: Record<string, unknown>[];
   facets: unknown;
+  provider?: AiProvider;
 }): Promise<AnalyzeLeadsResult> {
   try {
     const res = await fetch("/.netlify/functions/analyze-leads", {
@@ -150,6 +151,41 @@ export async function analyzeLeads(payload: {
       body: JSON.stringify(payload),
     });
     const data = (await res.json()) as AnalyzeLeadsResult;
+    if (!res.ok) return { ok: false, error: data.error ?? `HTTP ${res.status}` };
+    return data;
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Network error" };
+  }
+}
+
+export type AiProvider = "openai" | "claude";
+
+export interface ClassifiedLead {
+  id: string;
+  relevance: "relevant" | "review" | "unrelated";
+  category: string;
+  reason: string;
+  score: number;
+}
+
+export interface ClassifyResult {
+  ok: boolean;
+  results?: ClassifiedLead[];
+  error?: string;
+}
+
+export async function classifyLeads(payload: {
+  campaign: string;
+  leads: Record<string, unknown>[];
+  provider?: AiProvider;
+}): Promise<ClassifyResult> {
+  try {
+    const res = await fetch("/.netlify/functions/classify-leads", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as ClassifyResult;
     if (!res.ok) return { ok: false, error: data.error ?? `HTTP ${res.status}` };
     return data;
   } catch (e) {
