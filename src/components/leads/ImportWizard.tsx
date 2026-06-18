@@ -15,6 +15,12 @@ import {
   Check,
   Bot,
   Zap,
+  ShieldCheck,
+  RefreshCw,
+  AlertTriangle,
+  Database,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import { Modal } from "../ui/Modal";
 import { Card, Badge, Spinner } from "../ui/primitives";
@@ -33,10 +39,19 @@ import {
   type Relevance,
 } from "../../lib/leadAnalysis";
 import { analyzeLeads, classifyLeads, type AiProvider } from "../../lib/functions";
+import { instantly, asItems, type InstantlyLead } from "../../lib/instantly";
 import { cn } from "../../lib/utils";
 
 type ParsedLead = Omit<Lead, "id">;
 type Step = "upload" | "campaign" | "review";
+
+// A row we removed during parsing, with the reason why — for full transparency.
+type DupReason = "file" | "tool";
+interface DupSample {
+  email: string;
+  company: string;
+  reason: DupReason;
+}
 
 const STOPWORDS = new Set(
   "the and for with that this our your you who are from into want need looking based their they will would about cold email campaign leads lead target targeting companies company people".split(/\s+/),
@@ -81,11 +96,73 @@ export function ImportWizard({
   const [step, setStep] = useState<Step>("upload");
   const [busy, setBusy] = useState(false);
 
-  // upload
+  // upload — `allLeads` is every unique, email-bearing row kept after removing
+  // in-file and already-in-tool duplicates. The importable `leads` set is
+  // derived from it (optionally minus Instantly matches) further down.
   const [fileName, setFileName] = useState("");
-  const [leads, setLeads] = useState<ParsedLead[]>([]);
+  const [totalRows, setTotalRows] = useState(0);
+  const [allLeads, setAllLeads] = useState<ParsedLead[]>([]);
   const [report, setReport] = useState<ReturnType<typeof analyzeHeaders> | null>(null);
-  const [dupes, setDupes] = useState(0);
+  const [dupInFile, setDupInFile] = useState(0);
+  const [dupInTool, setDupInTool] = useState(0);
+  const [dupSamples, setDupSamples] = useState<DupSample[]>([]);
+  const [showDupDetail, setShowDupDetail] = useState(false);
+
+  // Instantly cross-check (Step 1)
+  const [instMode, setInstMode] = useState<"contacted" | "any">("contacted");
+  const [instBusy, setInstBusy] = useState(false);
+  const [instErr, setInstErr] = useState<string | null>(null);
+  const [instConfigured, setInstConfigured] = useState(true);
+  const [instChecked, setInstChecked] = useState(false);
+  const [instMap, setInstMap] = useState<Map<string, InstantlyLead>>(new Map());
+  const [instScanned, setInstScanned] = useState(0);
+  const [instTruncated, setInstTruncated] = useState(false);
+  const [excludeInst, setExcludeInst] = useState(true);
+  const [showInstDetail, setShowInstDetail] = useState(false);
+  const [instCampaigns, setInstCampaigns] = useState<Record<string, string>>({});
+
+  // Which of our parsed leads already exist in Instantly (filtered by mode).
+  const instMatches = useMemo(() => {
+    if (instMap.size === 0) return [] as { lead: ParsedLead; remote: InstantlyLead }[];
+    const out: { lead: ParsedLead; remote: InstantlyLead }[] = [];
+    for (const l of allLeads) {
+      const r = instMap.get(l.email.trim().toLowerCase());
+      if (!r) continue;
+      if (instMode === "contacted" && !r.contacted) continue;
+      out.push({ lead: l, remote: r });
+    }
+    return out;
+  }, [allLeads, instMap, instMode]);
+
+  const instPresent = useMemo(() => {
+    if (instMap.size === 0) return 0;
+    let n = 0;
+    for (const l of allLeads) if (instMap.has(l.email.trim().toLowerCase())) n++;
+    return n;
+  }, [allLeads, instMap]);
+  const instEmailed = useMemo(() => {
+    if (instMap.size === 0) return 0;
+    let n = 0;
+    for (const l of allLeads) {
+      const r = instMap.get(l.email.trim().toLowerCase());
+      if (r?.contacted) n++;
+    }
+    return n;
+  }, [allLeads, instMap]);
+
+  const instMatchEmails = useMemo(
+    () => new Set(instMatches.map((m) => m.lead.email.trim().toLowerCase())),
+    [instMatches],
+  );
+
+  // The set that actually flows into analysis + import.
+  const leads = useMemo<ParsedLead[]>(
+    () =>
+      excludeInst && instChecked
+        ? allLeads.filter((l) => !instMatchEmails.has(l.email.trim().toLowerCase()))
+        : allLeads,
+    [allLeads, excludeInst, instChecked, instMatchEmails],
+  );
 
   // campaign
   const [campaignText, setCampaignText] = useState("");
@@ -199,33 +276,74 @@ export function ImportWizard({
 
   function handleFile(file: File) {
     setFileName(file.name);
+    // Reset any prior Instantly cross-check when a new file is loaded.
+    setInstChecked(false);
+    setInstMap(new Map());
+    setInstErr(null);
+    setShowInstDetail(false);
+    setShowDupDetail(false);
     Papa.parse<Record<string, string>>(file, {
       header: true,
       skipEmptyLines: true,
       complete: (res) => {
         const headers = res.meta.fields ?? [];
         const rep = analyzeHeaders(headers);
-        const seen = new Set(existingEmails);
-        let dup = 0;
+        const fileSeen = new Set<string>(); // emails seen so far IN THIS FILE
+        let inFile = 0;
+        let inTool = 0;
+        const samples: DupSample[] = [];
         const built: ParsedLead[] = [];
         for (const row of res.data) {
           const lead = buildLeadFromRow(row, null);
           const key = lead.email.trim().toLowerCase();
-          if (!key) continue;
-          if (seen.has(key)) {
-            dup++;
+          if (!key) continue; // no email — not a duplicate, just unusable
+          if (fileSeen.has(key)) {
+            inFile++;
+            if (samples.length < 200) samples.push({ email: key, company: lead.company, reason: "file" });
             continue;
           }
-          seen.add(key);
+          fileSeen.add(key);
+          if (existingEmails.has(key)) {
+            inTool++;
+            if (samples.length < 200) samples.push({ email: key, company: lead.company, reason: "tool" });
+            continue;
+          }
           built.push(lead);
         }
         setReport(rep);
-        setLeads(built);
-        setDupes(dup);
+        setTotalRows(res.data.length);
+        setAllLeads(built);
+        setDupInFile(inFile);
+        setDupInTool(inTool);
+        setDupSamples(samples);
         if (built.length === 0) toast.push("No new leads found (missing email or all duplicates)", "error");
       },
       error: () => toast.push("Failed to parse CSV", "error"),
     });
+  }
+
+  async function crossCheckInstantly() {
+    setInstBusy(true);
+    setInstErr(null);
+    const [res, camp] = await Promise.all([instantly.workspaceLeads(), instantly.campaigns()]);
+    setInstBusy(false);
+    setInstChecked(true);
+    if (!res.ok || !res.data) {
+      setInstConfigured(res.configured !== false);
+      setInstErr(res.error ?? "Could not reach Instantly.");
+      setInstMap(new Map());
+      return;
+    }
+    setInstConfigured(true);
+    setInstMap(new Map(res.data.items.map((r) => [r.email, r])));
+    setInstScanned(res.data.count);
+    setInstTruncated(res.data.truncated);
+    if (camp.ok) {
+      const map: Record<string, string> = {};
+      for (const c of asItems<{ id?: string; name?: string }>(camp.data)) if (c.id) map[c.id] = c.name ?? c.id;
+      setInstCampaigns(map);
+    }
+    setShowInstDetail(true);
   }
 
   async function doComplete(kept: ParsedLead[], discarded: ParsedLead[]) {
@@ -414,17 +532,186 @@ export function ImportWizard({
 
           {report ? (
             <>
+              {/* Headline stats */}
               <Card className="p-4">
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  <Stat label="Valid leads" value={leads.length} tone="mint" />
-                  <Stat label="Duplicates skipped" value={dupes} tone="sun" />
+                  <Stat label="Ready to import" value={leads.length} tone="mint" sub={`of ${totalRows} rows`} />
+                  <button className="block h-full w-full text-left" onClick={() => setShowDupDetail((v) => !v)} title="See exactly which rows were removed and why">
+                    <Stat
+                      label="Duplicates removed"
+                      value={dupInFile + dupInTool}
+                      tone="sun"
+                      sub={showDupDetail ? "hide details ▲" : "show details ▾"}
+                    />
+                  </button>
                   <Stat label="Mapped fields" value={report.mappedFields.length} tone="lavender" />
                   <Stat label="Extra columns kept" value={report.extraColumns.length} tone="sky" />
                 </div>
+
                 {!report.hasEmailColumn ? (
                   <p className="mt-3 rounded-lg border-2 border-ink bg-danger px-3 py-1.5 text-sm font-bold text-white">No email column detected — can't import without emails.</p>
                 ) : null}
+
+                {/* Where duplicates came from — full transparency */}
+                <div className="mt-3 rounded-lg border-2 border-ink/20 bg-canvas p-3 text-sm">
+                  <p className="mb-1 text-[11px] font-bold uppercase tracking-wide text-muted">How duplicates were detected</p>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1">
+                    <span className="flex items-center gap-1.5">
+                      <Badge tone={dupInFile ? "sun" : "white"}>{dupInFile}</Badge> repeated within this CSV file
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <Badge tone={dupInTool ? "sun" : "white"}>{dupInTool}</Badge> already saved in this tool
+                    </span>
+                    <span className="flex items-center gap-1.5 text-muted">
+                      <ShieldCheck size={13} /> Instantly: {instChecked ? `${instMatches.length} matched` : "not checked yet — see below"}
+                    </span>
+                  </div>
+                  {showDupDetail ? (
+                    <div className="mt-2 max-h-44 overflow-auto rounded-lg border-2 border-ink/15">
+                      {dupSamples.length === 0 ? (
+                        <p className="p-2 text-xs text-muted">No duplicates were removed.</p>
+                      ) : (
+                        <table className="w-full text-left text-xs">
+                          <tbody>
+                            {dupSamples.map((d, i) => (
+                              <tr key={i} className="border-b border-ink/10">
+                                <td className="px-2 py-1 font-semibold">{d.email}</td>
+                                <td className="truncate px-2 py-1 text-muted">{d.company || "—"}</td>
+                                <td className="px-2 py-1 text-right">
+                                  <Badge tone="white">{d.reason === "file" ? "in this file" : "in your tool"}</Badge>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                      {dupInFile + dupInTool > dupSamples.length ? (
+                        <p className="p-2 text-xs text-muted">…and {dupInFile + dupInTool - dupSamples.length} more.</p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
               </Card>
+
+              {/* Instantly cross-check */}
+              <Card className="p-4">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <p className="flex items-center gap-2 text-sm font-bold">
+                    <ShieldCheck size={16} /> Cross-check against Instantly
+                  </p>
+                  <button
+                    className="btn-dark btn-sm"
+                    onClick={crossCheckInstantly}
+                    disabled={instBusy || allLeads.length === 0}
+                  >
+                    <RefreshCw size={14} className={instBusy ? "animate-spin" : ""} />
+                    {instBusy ? "Scanning…" : instChecked ? "Re-scan" : "Scan Instantly"}
+                  </button>
+                </div>
+                <p className="mb-2 text-xs text-muted">
+                  Checks these {allLeads.length} new leads against every contact in your connected Instantly workspace —
+                  so you can catch people Instantly is already emailing before you import them again.
+                </p>
+
+                {/* What counts as an Instantly duplicate */}
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="font-bold text-muted">Count as duplicate when:</span>
+                  {(["contacted", "any"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setInstMode(m)}
+                      className={cn(
+                        "rounded-lg border-2 border-ink px-2 py-1 font-bold",
+                        instMode === m ? "bg-sun" : "bg-paper hover:bg-canvas",
+                      )}
+                    >
+                      {m === "contacted" ? "Instantly already emailed them" : "Present in workspace at all"}
+                    </button>
+                  ))}
+                </div>
+
+                {instBusy ? (
+                  <div className="flex items-center gap-2 rounded-lg border-2 border-ink/20 p-3 text-sm">
+                    <RefreshCw size={14} className="animate-spin" /> Loading Instantly contacts…
+                  </div>
+                ) : instErr ? (
+                  <div className="space-y-1 rounded-lg border-2 border-coral bg-coral/10 p-3 text-sm">
+                    <p className="flex items-center gap-2 font-bold">
+                      <AlertTriangle size={14} /> {instConfigured ? "Instantly error" : "Instantly not connected"}
+                    </p>
+                    <p>{instErr}</p>
+                    {!instConfigured ? (
+                      <p className="text-muted">
+                        Add <code>INSTANTLY_API_KEY</code> (a v2 key with read scope on leads) in Netlify, redeploy, then
+                        re-scan. You can still import without this check.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : instChecked ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge tone={instMatches.length ? "coral" : "mint"}>
+                        {instMatches.length} of your {allLeads.length} already in Instantly
+                        {instMode === "contacted" ? " (emailed)" : ""}
+                      </Badge>
+                      {instMode === "contacted" && instPresent > instEmailed ? (
+                        <Badge tone="white">{instPresent - instEmailed} present but not yet emailed (ignored)</Badge>
+                      ) : null}
+                      <Badge tone="lavender">{instScanned.toLocaleString()} contacts scanned</Badge>
+                      {instTruncated ? <Badge tone="sun">partial scan — very large workspace</Badge> : null}
+                      {instMatches.length ? (
+                        <button className="ml-auto text-xs underline" onClick={() => setShowInstDetail((v) => !v)}>
+                          {showInstDetail ? "hide" : "show"} matches
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {instMatches.length ? (
+                      <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border-2 border-ink bg-sun/40 p-2 text-sm font-bold">
+                        <input type="checkbox" checked={excludeInst} onChange={(e) => setExcludeInst(e.target.checked)} />
+                        Exclude these {instMatches.length} from the import (recommended)
+                      </label>
+                    ) : (
+                      <p className="mt-2 flex items-center gap-2 text-sm font-bold text-mint">
+                        <CheckCircle2 size={15} /> None of these leads are
+                        {instMode === "contacted" ? " being emailed by" : " in"} Instantly yet.
+                      </p>
+                    )}
+
+                    {showInstDetail && instMatches.length ? (
+                      <div className="mt-2 max-h-44 overflow-auto rounded-lg border-2 border-ink/15">
+                        <table className="w-full text-left text-xs">
+                          <tbody>
+                            {instMatches.slice(0, 200).map((m, i) => (
+                              <tr key={i} className="border-b border-ink/10">
+                                <td className="px-2 py-1 font-semibold">{m.lead.email}</td>
+                                <td className="truncate px-2 py-1 text-muted">{m.lead.company || "—"}</td>
+                                <td className="px-2 py-1 text-muted">
+                                  {m.remote.campaign ? instCampaigns[m.remote.campaign] ?? "in a campaign" : "in workspace"}
+                                </td>
+                                <td className="px-2 py-1 text-right">
+                                  <Badge tone={m.remote.contacted ? "mint" : "white"}>
+                                    {m.remote.contacted ? "emailed" : "not emailed"}
+                                  </Badge>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {instMatches.length > 200 ? (
+                          <p className="p-2 text-xs text-muted">…and {instMatches.length - 200} more.</p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-lg border-2 border-dashed border-ink/30 p-3 text-sm text-muted">
+                    <Database size={15} /> Not scanned yet — click “Scan Instantly” to see overlaps before importing.
+                  </div>
+                )}
+              </Card>
+
+              {/* Quick import */}
               <Card className="flex flex-wrap items-center gap-2 bg-canvas p-3">
                 <FileText size={16} />
                 <span className="text-sm font-bold">Quick import — skip AI, just add them:</span>
@@ -436,11 +723,16 @@ export function ImportWizard({
             </>
           ) : null}
 
-          <div className="flex justify-end gap-2">
-            <button className="btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn-primary" disabled={leads.length === 0 || !report?.hasEmailColumn} onClick={() => setStep("campaign")}>
-              Analyze &amp; weed <ArrowRight size={16} />
-            </button>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs text-muted">
+              {report ? `${leads.length} will import${excludeInst && instChecked && instMatches.length ? ` · ${instMatches.length} Instantly dupes excluded` : ""}` : ""}
+            </span>
+            <div className="flex gap-2">
+              <button className="btn-ghost" onClick={onClose}>Cancel</button>
+              <button className="btn-primary" disabled={leads.length === 0 || !report?.hasEmailColumn} onClick={() => setStep("campaign")}>
+                Analyze &amp; weed <ArrowRight size={16} />
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -680,12 +972,13 @@ export function ImportWizard({
   );
 }
 
-function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
+function Stat({ label, value, tone, sub }: { label: string; value: number; tone: string; sub?: string }) {
   const bg: Record<string, string> = { mint: "bg-mint text-white", sun: "bg-sun", lavender: "bg-lavender", sky: "bg-sky" };
   return (
-    <div className={cn("rounded-xl border-2 border-ink p-3", bg[tone])}>
+    <div className={cn("h-full rounded-xl border-2 border-ink p-3", bg[tone])}>
       <p className="text-xs font-bold uppercase opacity-70">{label}</p>
       <p className="text-2xl font-extrabold">{value}</p>
+      {sub ? <p className="text-[11px] font-bold opacity-70">{sub}</p> : null}
     </div>
   );
 }
