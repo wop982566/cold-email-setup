@@ -16,6 +16,7 @@ import {
   Copy,
   Filter,
   RotateCcw,
+  Archive,
 } from "lucide-react";
 import { Card, Badge, EmptyState } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
@@ -59,6 +60,17 @@ function statusTone(s: LeadStatus) {
 
 function relevanceTone(r: Lead["relevance"]) {
   return r === "relevant" ? "mint" : r === "unrelated" ? "coral" : r === "review" ? "sun" : "white";
+}
+
+// Turn a mutation failure into a useful message — notably catching the case
+// where the Supabase project hasn't had migration 0004 applied yet.
+function explainError(e: unknown): string {
+  const anyE = e as { message?: string };
+  const msg = anyE?.message ?? (typeof e === "string" ? e : "Something went wrong");
+  if (/column/i.test(msg) && /(discarded|category|relevance)/i.test(msg)) {
+    return "Your database is missing the new lead columns. Run migration 0004 in Supabase (SQL editor), then retry.";
+  }
+  return msg;
 }
 
 function blankLead(listId: string | null): Lead {
@@ -117,6 +129,7 @@ export default function Leads() {
   const [showList, setShowList] = useState(false);
   const [showEnrich, setShowEnrich] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const [page, setPage] = useState(0);
   const pageSize = 50;
 
@@ -231,27 +244,70 @@ export default function Leads() {
   }
 
   async function discardSelected() {
-    for (const l of selectedLeads) {
+    try {
+      for (const l of selectedLeads) {
+        await updateLead.mutateAsync({
+          id: l.id,
+          patch: { discarded: true, discarded_at: new Date().toISOString() } as Partial<Lead>,
+        });
+      }
+      toast.push(`Moved ${selectedLeads.length} leads to Discarded`);
+      setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  async function restoreSelected() {
+    try {
+      for (const l of selectedLeads) {
+        await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
+      }
+      toast.push(`Restored ${selectedLeads.length} leads`);
+      setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  async function deleteForeverSelected() {
+    try {
+      await removeManyLeads.mutateAsync(selectedLeads.map((l) => l.id));
+      toast.push(`Permanently deleted ${selectedLeads.length} leads`);
+      setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  async function discardOne(l: Lead) {
+    try {
       await updateLead.mutateAsync({
         id: l.id,
         patch: { discarded: true, discarded_at: new Date().toISOString() } as Partial<Lead>,
       });
+      toast.push(`Discarded ${l.email}`);
+    } catch (e) {
+      toast.push(explainError(e), "error");
     }
-    toast.push(`Moved ${selectedLeads.length} leads to Discarded`);
-    setSelected(new Set());
-  }
-
-  async function restoreSelected() {
-    for (const l of selectedLeads) {
-      await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
-    }
-    toast.push(`Restored ${selectedLeads.length} leads`);
-    setSelected(new Set());
   }
 
   async function restoreOne(l: Lead) {
-    await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
-    toast.push(`Restored ${l.email}`);
+    try {
+      await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
+      toast.push(`Restored ${l.email}`);
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  async function deleteOne(l: Lead) {
+    try {
+      await removeLead.mutateAsync(l.id);
+      toast.push(`Permanently deleted ${l.email}`);
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
   }
 
   async function makeSublist() {
@@ -470,11 +526,7 @@ export default function Leads() {
                 </button>
                 <button
                   className="btn-sm btn bg-danger text-white shadow-hard"
-                  onClick={async () => {
-                    await removeManyLeads.mutateAsync(selectedLeads.map((l) => l.id));
-                    toast.push(`Deleted ${selectedLeads.length} leads forever`);
-                    setSelected(new Set());
-                  }}
+                  onClick={() => setConfirmBulkDelete(true)}
                 >
                   <Trash2 size={14} /> Delete forever
                 </button>
@@ -527,7 +579,13 @@ export default function Leads() {
                   <Sparkles size={14} /> Enrich
                 </button>
                 <button className="btn-ghost btn-sm" onClick={discardSelected}>
-                  <Trash2 size={14} /> Discard
+                  <Archive size={14} /> Discard
+                </button>
+                <button
+                  className="btn-sm btn bg-danger text-white shadow-hard"
+                  onClick={() => setConfirmBulkDelete(true)}
+                >
+                  <Trash2 size={14} /> Delete forever
                 </button>
               </>
             )}
@@ -605,11 +663,16 @@ export default function Leads() {
                               <RotateCcw size={13} />
                             </button>
                           ) : (
-                            <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)}>
-                              <Pencil size={13} />
-                            </button>
+                            <>
+                              <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)} title="Edit">
+                                <Pencil size={13} />
+                              </button>
+                              <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-sun" onClick={() => discardOne(l)} title="Discard (move to Discarded)">
+                                <Archive size={13} />
+                              </button>
+                            </>
                           )}
-                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-danger hover:text-white" onClick={() => setDeleting(l)}>
+                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-danger hover:text-white" onClick={() => setDeleting(l)} title="Delete permanently">
                             <Trash2 size={13} />
                           </button>
                         </div>
@@ -682,9 +745,19 @@ export default function Leads() {
       <ConfirmDialog
         open={!!deleting}
         onClose={() => setDeleting(null)}
-        onConfirm={() => deleting && removeLead.mutate(deleting.id)}
-        title="Delete lead"
-        message={`Remove ${deleting?.email}? This permanently deletes it.`}
+        onConfirm={() => deleting && deleteOne(deleting)}
+        title="Delete lead permanently"
+        message={`Permanently delete ${deleting?.email}? It's removed from the database and can be re-imported later (it won't be flagged as a duplicate).`}
+        confirmLabel="Delete forever"
+      />
+
+      <ConfirmDialog
+        open={confirmBulkDelete}
+        onClose={() => setConfirmBulkDelete(false)}
+        onConfirm={deleteForeverSelected}
+        title="Delete leads permanently"
+        message={`Permanently delete ${selectedLeads.length} lead(s)? They're removed from the database (not recoverable from Discarded) and can be re-imported later.`}
+        confirmLabel="Delete forever"
       />
     </div>
   );
