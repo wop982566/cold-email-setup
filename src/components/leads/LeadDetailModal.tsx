@@ -35,7 +35,9 @@ function Row({ label, value }: { label: string; value: string }) {
 
 export function LeadDetailModal({ lead, onClose }: { lead: Lead; onClose: () => void }) {
   const customEntries = Object.entries(lead.custom ?? {}).filter(([, v]) => v != null && String(v).trim() !== "");
-  const enrichmentSummary = (lead.enrichment as { summary?: string })?.summary;
+  const enr = (lead.enrichment ?? {}) as { summary?: string; reason?: string };
+  const enrichmentSummary = enr.summary;
+  const relevanceReason = enr.reason;
 
   return (
     <Modal open onClose={onClose} size="lg" title={lead.email || "Lead details"}>
@@ -51,6 +53,13 @@ export function LeadDetailModal({ lead, onClose }: { lead: Lead; onClose: () => 
           {lead.discarded ? <Badge tone="coral">discarded</Badge> : null}
           {lead.enriched ? <Badge tone="sky">AI enriched</Badge> : null}
         </div>
+
+        {relevanceReason ? (
+          <div className="rounded-xl border-2 border-ink bg-sky/30 p-3 text-sm">
+            <span className="font-bold">Why this fit: </span>
+            {relevanceReason}
+          </div>
+        ) : null}
 
         {enrichmentSummary ? (
           <div className="rounded-xl border-2 border-ink bg-pink/20 p-3 text-sm">

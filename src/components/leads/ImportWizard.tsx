@@ -103,6 +103,8 @@ export function ImportWizard({
 
   // selection — a single source of truth (indices to KEEP/import)
   const [keep, setKeep] = useState<Set<number>>(new Set());
+  // manual fit overrides (index -> relevance) so the operator can re-classify
+  const [fitOverride, setFitOverride] = useState<Map<number, Relevance>>(new Map());
   const [relFilter, setRelFilter] = useState<string>("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -113,8 +115,13 @@ export function ImportWizard({
     [leads, categories, keywords],
   );
   const verdicts = useMemo<Verdict[]>(
-    () => rubric.map((v, i) => aiVerdicts.get(i) ?? v),
-    [rubric, aiVerdicts],
+    () =>
+      rubric.map((v, i) => {
+        const base = aiVerdicts.get(i) ?? v;
+        const fo = fitOverride.get(i);
+        return fo && fo !== base.relevance ? { ...base, relevance: fo } : base;
+      }),
+    [rubric, aiVerdicts, fitOverride],
   );
 
   const relCounts = useMemo(() => {
@@ -236,9 +243,18 @@ export function ImportWizard({
     doComplete(leads.map((l) => ({ ...l, discarded: false })), []);
   }
 
+  function setFitShown(rel: Relevance) {
+    setFitOverride((m) => {
+      const next = new Map(m);
+      for (const i of filteredIdx) next.set(i, rel);
+      return next;
+    });
+  }
+
   async function runAnalysis() {
     setBusy(true);
     setAiVerdicts(new Map());
+    setFitOverride(new Map());
     const f = computeFacets(leads);
     let cats: LeadCategory[] = [];
     let kws = keywordsFromText(campaignText);
@@ -342,7 +358,13 @@ export function ImportWizard({
     const discarded: ParsedLead[] = [];
     leads.forEach((l, i) => {
       const v = verdicts[i];
-      const enriched: ParsedLead = { ...l, category: v?.category ?? "", relevance: v?.relevance ?? "", score: v?.score ?? l.score };
+      const enriched: ParsedLead = {
+        ...l,
+        category: v?.category ?? "",
+        relevance: v?.relevance ?? "",
+        score: v?.score ?? l.score,
+        enrichment: { ...(l.enrichment as Record<string, unknown>), reason: v?.reason ?? "" },
+      };
       if (keep.has(i)) kept.push({ ...enriched, discarded: false });
       else discarded.push({ ...enriched, discarded: true, discarded_at: new Date().toISOString() });
     });
@@ -558,6 +580,17 @@ export function ImportWizard({
                 <option value="review">Review</option>
                 <option value="unrelated">Unrelated</option>
               </select>
+              <select
+                className="input w-32 cursor-pointer py-1.5 text-sm"
+                defaultValue=""
+                onChange={(e) => { if (e.target.value) setFitShown(e.target.value as Relevance); e.target.value = ""; }}
+                title="Re-classify all shown leads"
+              >
+                <option value="">Set fit shown…</option>
+                <option value="relevant">→ Relevant</option>
+                <option value="review">→ Review</option>
+                <option value="unrelated">→ Unrelated</option>
+              </select>
               <button className="btn-ghost btn-sm" onClick={() => addRemove(filteredIdx, true)}>Keep shown</button>
               <button className="btn-ghost btn-sm" onClick={() => addRemove(filteredIdx, false)}>Discard shown</button>
             </div>
@@ -566,10 +599,10 @@ export function ImportWizard({
                 <thead>
                   <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
                     <th className="w-10 px-2 py-2"></th>
-                    <th className="px-2 py-2" style={{ width: "26%" }}>Lead</th>
-                    <th className="px-2 py-2" style={{ width: "18%" }}>Category</th>
-                    <th className="px-2 py-2" style={{ width: "30%" }}>Why</th>
-                    <th className="px-2 py-2">Fit</th>
+                    <th className="px-2 py-2" style={{ width: "22%" }}>Lead</th>
+                    <th className="px-2 py-2" style={{ width: "14%" }}>Category</th>
+                    <th className="px-2 py-2" style={{ width: "34%" }}>Why</th>
+                    <th className="w-28 px-2 py-2">Fit</th>
                     <th className="w-12 px-2 py-2 text-right">Score</th>
                   </tr>
                 </thead>
@@ -587,10 +620,23 @@ export function ImportWizard({
                           <p className="truncate font-bold" title={l.company}>{l.company || l.email}</p>
                           <p className="truncate text-xs text-muted" title={l.title}>{l.title || l.email}</p>
                         </td>
-                        <td className="truncate px-2 py-2" title={v?.category}>{v?.category}</td>
-                        <td className="truncate px-2 py-2 text-xs text-muted" title={v?.reason}>{v?.reason || "—"}</td>
-                        <td className="px-2 py-2"><Badge tone={RELEVANCE_META[v?.relevance ?? "review"].tone as "mint"}>{RELEVANCE_META[v?.relevance ?? "review"].label}</Badge></td>
-                        <td className="px-2 py-2 text-right font-bold">{v?.score}</td>
+                        <td className="truncate px-2 py-2 align-top" title={v?.category}>{v?.category}</td>
+                        <td className="whitespace-normal break-words px-2 py-2 align-top text-xs text-muted">{v?.reason || "—"}</td>
+                        <td className="px-2 py-2 align-top">
+                          <select
+                            value={v?.relevance ?? "review"}
+                            onChange={(e) => setFitOverride((m) => new Map(m).set(i, e.target.value as Relevance))}
+                            className={cn(
+                              "cursor-pointer rounded-md border-2 border-ink px-1 py-0.5 text-xs font-bold",
+                              v?.relevance === "relevant" ? "bg-mint text-white" : v?.relevance === "unrelated" ? "bg-coral text-white" : "bg-sun",
+                            )}
+                          >
+                            <option value="relevant">Relevant</option>
+                            <option value="review">Review</option>
+                            <option value="unrelated">Unrelated</option>
+                          </select>
+                        </td>
+                        <td className="px-2 py-2 text-right align-top font-bold">{v?.score}</td>
                       </tr>
                     );
                   })}
