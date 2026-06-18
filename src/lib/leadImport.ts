@@ -6,7 +6,9 @@
 import { Lead } from "./types";
 
 export function normHeader(h: string): string {
-  return h.trim().toLowerCase().replace(/^"|"$/g, "").replace(/\s+/g, " ");
+  // Treat underscores and hyphens as spaces so "first_name", "first-name" and
+  // "First Name" all normalise the same way.
+  return h.trim().toLowerCase().replace(/^"|"$/g, "").replace(/[\s_-]+/g, " ").trim();
 }
 
 // Known header (normalised) -> standard Lead field.
@@ -14,14 +16,20 @@ const STANDARD: Record<string, keyof Lead> = {
   email: "email",
   "email address": "email",
   "work email": "email",
+  "e mail": "email",
   "first name": "first_name",
   firstname: "first_name",
+  "given name": "first_name",
   "last name": "last_name",
   lastname: "last_name",
+  surname: "last_name",
+  "family name": "last_name",
   "company name": "company",
+  "company name for emails": "company",
   company: "company",
   organization: "company",
   "organization name": "company",
+  employer: "company",
   account: "company",
   "company website": "website",
   website: "website",
@@ -31,10 +39,12 @@ const STANDARD: Record<string, keyof Lead> = {
   linkedin: "linkedin",
   "linkedin url": "linkedin",
   "person linkedin": "linkedin",
+  "person linkedin url": "linkedin",
   "linkedin profile": "linkedin",
   title: "title",
   "job title": "title",
   position: "title",
+  role: "title",
   industry: "industry",
   "employees count": "employees",
   employees: "employees",

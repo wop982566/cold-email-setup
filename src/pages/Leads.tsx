@@ -69,6 +69,47 @@ function relevanceTone(r: Lead["relevance"]) {
   return r === "relevant" ? "mint" : r === "unrelated" ? "coral" : r === "review" ? "sun" : "white";
 }
 
+// Some CSVs (non-standard headers) don't map cleanly to first_name/company/etc,
+// so the data lands in `custom`. These helpers recover a sensible display value
+// from the preserved columns, and as a last resort derive a name from the email.
+function customValue(l: Lead, keys: string[]): string {
+  const custom = l.custom ?? {};
+  for (const [k, v] of Object.entries(custom)) {
+    const nk = k.trim().toLowerCase().replace(/[\s_-]+/g, " ");
+    if (keys.includes(nk) && v != null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+function nameFromEmail(email: string): string {
+  const local = (email.split("@")[0] ?? "").trim();
+  if (!local || !/[._-]/.test(local)) return "";
+  return local
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+function leadName(l: Lead): string {
+  const direct = [l.first_name, l.last_name].filter(Boolean).join(" ").trim();
+  if (direct) return direct;
+  const first = customValue(l, ["first name", "firstname", "first", "given name"]);
+  const last = customValue(l, ["last name", "lastname", "surname", "last", "family name"]);
+  const combo = [first, last].filter(Boolean).join(" ").trim();
+  if (combo) return combo;
+  const full = customValue(l, ["full name", "fullname", "name", "contact name", "contact"]);
+  if (full) return full;
+  return nameFromEmail(l.email);
+}
+function leadCompany(l: Lead): string {
+  return (
+    l.company ||
+    customValue(l, ["company", "company name", "organization", "organization name", "account", "employer", "company name for emails"])
+  );
+}
+function leadTitle(l: Lead): string {
+  return l.title || customValue(l, ["title", "job title", "position", "role", "headline"]);
+}
+
 // Turn a mutation failure into a useful message — notably catching the case
 // where the Supabase project hasn't had migration 0004 applied yet.
 function explainError(e: unknown): string {
@@ -720,20 +761,20 @@ export default function Leads() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full table-fixed border-collapse text-left text-sm">
+              <table className="w-full min-w-[1040px] table-fixed border-collapse text-left text-sm">
                 <thead>
                   <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
-                    <th className="w-9 px-2 py-2">
+                    <th className="w-10 px-2 py-2">
                       <input type="checkbox" checked={pageAllSelected} onChange={togglePage} title="Select this page" />
                     </th>
-                    <th className="px-2 py-2" style={{ width: "22%" }}>Lead</th>
-                    <th className="px-2 py-2" style={{ width: "16%" }}>Company</th>
-                    <th className="px-2 py-2" style={{ width: "16%" }}>Title</th>
-                    <th className="px-2 py-2" style={{ width: "15%" }}>Category</th>
-                    <th className="w-20 px-2 py-2">Fit</th>
+                    <th className="px-2 py-2" style={{ width: "26%" }}>Lead</th>
+                    <th className="px-2 py-2" style={{ width: "15%" }}>Company</th>
+                    <th className="px-2 py-2" style={{ width: "15%" }}>Title</th>
+                    <th className="px-2 py-2" style={{ width: "13%" }}>Category</th>
+                    <th className="w-24 px-2 py-2">Fit</th>
                     <th className="w-14 px-2 py-2">Score</th>
                     <th className="w-24 px-2 py-2">Status</th>
-                    <th className="w-20 px-2 py-2 text-right">Actions</th>
+                    <th className="w-[148px] px-2 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -744,13 +785,22 @@ export default function Leads() {
                         <input type="checkbox" checked={selected.has(l.id)} onChange={() => toggleOne(l.id)} />
                       </td>
                       <td className="px-2 py-2">
-                        <p className="truncate font-bold" title={[l.first_name, l.last_name].filter(Boolean).join(" ")}>
-                          {[l.first_name, l.last_name].filter(Boolean).join(" ") || "—"}
-                        </p>
-                        <p className="truncate text-xs text-muted" title={l.email}>{l.email}</p>
+                        <div className="flex items-start gap-1.5">
+                          <button
+                            className="mt-0.5 shrink-0 rounded border-2 border-ink/30 p-0.5 hover:bg-canvas"
+                            onClick={() => toggleExpand(l.id)}
+                            title="Expand all imported columns"
+                          >
+                            {expanded.has(l.id) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                          </button>
+                          <div className="min-w-0">
+                            <p className="truncate font-bold" title={leadName(l)}>{leadName(l) || "—"}</p>
+                            <p className="truncate text-xs text-muted" title={l.email}>{l.email}</p>
+                          </div>
+                        </div>
                       </td>
-                      <td className="truncate px-2 py-2" title={l.company}>{l.company || "—"}</td>
-                      <td className="truncate px-2 py-2" title={l.title}>{l.title || "—"}</td>
+                      <td className="truncate px-2 py-2" title={leadCompany(l)}>{leadCompany(l) || "—"}</td>
+                      <td className="truncate px-2 py-2" title={leadTitle(l)}>{leadTitle(l) || "—"}</td>
                       <td className="truncate px-2 py-2" title={l.category}>{l.category || l.industry || "—"}</td>
                       <td className="px-2 py-2">
                         {l.relevance ? (
@@ -763,36 +813,26 @@ export default function Leads() {
                       <td className="px-2 py-2">
                         <span className={cn("badge", statusTone(l.status))}>{l.status}</span>
                       </td>
-                      <td className="px-2 py-2 text-right">
-                        <div className="flex justify-end gap-1">
-                          <button
-                            className={cn(
-                              "rounded-lg border-2 border-ink p-1.5",
-                              expanded.has(l.id) ? "bg-sun" : "bg-white hover:bg-canvas",
-                            )}
-                            onClick={() => toggleExpand(l.id)}
-                            title="Expand all imported columns in list"
-                          >
-                            {expanded.has(l.id) ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                          </button>
-                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setViewing(l)} title="View all fields in a dialog">
+                      <td className="px-2 py-2">
+                        <div className="flex flex-nowrap justify-end gap-1">
+                          <button className="shrink-0 rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setViewing(l)} title="View all fields in a dialog">
                             <Eye size={13} />
                           </button>
                           {showDiscarded ? (
-                            <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-mint hover:text-white" onClick={() => restoreOne(l)} title="Restore">
+                            <button className="shrink-0 rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-mint hover:text-white" onClick={() => restoreOne(l)} title="Restore">
                               <RotateCcw size={13} />
                             </button>
                           ) : (
                             <>
-                              <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)} title="Edit">
+                              <button className="shrink-0 rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-canvas" onClick={() => setEditing(l)} title="Edit">
                                 <Pencil size={13} />
                               </button>
-                              <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-sun" onClick={() => discardOne(l)} title="Discard (move to Discarded)">
+                              <button className="shrink-0 rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-sun" onClick={() => discardOne(l)} title="Discard (move to Discarded)">
                                 <Archive size={13} />
                               </button>
                             </>
                           )}
-                          <button className="rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-danger hover:text-white" onClick={() => setDeleting(l)} title="Delete permanently">
+                          <button className="shrink-0 rounded-lg border-2 border-ink bg-white p-1.5 hover:bg-danger hover:text-white" onClick={() => setDeleting(l)} title="Delete permanently">
                             <Trash2 size={13} />
                           </button>
                         </div>
