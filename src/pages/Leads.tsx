@@ -126,6 +126,7 @@ export default function Leads() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [industryFilter, setIndustryFilter] = useState("");
+  const [relevanceFilter, setRelevanceFilter] = useState("");
   const [minScore, setMinScore] = useState(0);
   const [hideUsed, setHideUsed] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -143,7 +144,7 @@ export default function Leads() {
   // Reset paging + selection when the view changes.
   useEffect(() => {
     setPage(0);
-  }, [search, statusFilter, industryFilter, minScore, hideUsed, activeListId, showDiscarded]);
+  }, [search, statusFilter, industryFilter, relevanceFilter, minScore, hideUsed, activeListId, showDiscarded]);
 
   const descendantIds = useMemo(() => {
     if (showDiscarded || !activeListId) return null;
@@ -177,6 +178,7 @@ export default function Leads() {
       }
       if (statusFilter && l.status !== statusFilter) return false;
       if (industryFilter && l.industry !== industryFilter) return false;
+      if (relevanceFilter && l.relevance !== relevanceFilter) return false;
       if (minScore > 0 && l.score < minScore) return false;
       if (hideUsed && l.status === "used") return false;
       if (q) {
@@ -185,7 +187,7 @@ export default function Leads() {
       }
       return true;
     });
-  }, [leads, descendantIds, statusFilter, industryFilter, minScore, hideUsed, search, showDiscarded]);
+  }, [leads, descendantIds, statusFilter, industryFilter, relevanceFilter, minScore, hideUsed, search, showDiscarded]);
 
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, pages - 1);
@@ -257,6 +259,17 @@ export default function Leads() {
       }));
       await upsertManyLeads.mutateAsync(rows);
       toast.push(`Tagged ${rows.length} leads`);
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  async function bulkSetRelevance(relevance: Lead["relevance"]) {
+    try {
+      const ids = selectedLeads.map((l) => l.id);
+      await updateManyLeads.mutateAsync({ ids, patch: { relevance } as Partial<Lead> });
+      toast.push(`Set fit for ${ids.length} leads`);
+      setSelected(new Set());
     } catch (e) {
       toast.push(explainError(e), "error");
     }
@@ -502,6 +515,12 @@ export default function Leads() {
               </option>
             ))}
           </select>
+          <select className="input max-w-[130px] cursor-pointer" value={relevanceFilter} onChange={(e) => setRelevanceFilter(e.target.value)}>
+            <option value="">All fit</option>
+            <option value="relevant">Relevant</option>
+            <option value="review">Review</option>
+            <option value="unrelated">Unrelated</option>
+          </select>
           <div className="flex items-center gap-1">
             <span className="text-xs font-bold text-muted">Min score</span>
             <input type="number" className="input w-16" value={minScore} min={0} max={100} onChange={(e) => setMinScore(Number(e.target.value))} />
@@ -558,6 +577,19 @@ export default function Leads() {
                       {o.label}
                     </option>
                   ))}
+                </select>
+                <select
+                  className="input max-w-[140px] cursor-pointer"
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) bulkSetRelevance(e.target.value as Lead["relevance"]);
+                    e.target.value = "";
+                  }}
+                >
+                  <option value="">Set fit…</option>
+                  <option value="relevant">Relevant</option>
+                  <option value="review">Review</option>
+                  <option value="unrelated">Unrelated</option>
                 </select>
                 <select
                   className="input max-w-[150px] cursor-pointer"

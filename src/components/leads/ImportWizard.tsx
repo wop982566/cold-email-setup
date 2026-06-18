@@ -30,6 +30,7 @@ import {
   type LeadCategory,
   type Verdict,
   type CatAction,
+  type Relevance,
 } from "../../lib/leadAnalysis";
 import { analyzeLeads, classifyLeads, type AiProvider } from "../../lib/functions";
 import { cn } from "../../lib/utils";
@@ -53,11 +54,11 @@ function keywordsFromText(text: string): string[] {
   return out;
 }
 
-const RELEVANCE_META = {
+const RELEVANCE_META: Record<Relevance, { label: string; tone: string; icon: JSX.Element }> = {
   relevant: { label: "Relevant", tone: "mint", icon: <CheckCircle2 size={13} /> },
   review: { label: "Review", tone: "sun", icon: <CircleDashed size={13} /> },
   unrelated: { label: "Unrelated", tone: "coral", icon: <XCircle size={13} /> },
-} as const;
+};
 
 export interface ImportResult {
   listName: string;
@@ -93,7 +94,6 @@ export function ImportWizard({
   const [provider, setProvider] = useState<AiProvider>("claude");
 
   // analysis
-  const [facetsData, setFacetsData] = useState<Facets | null>(null);
   const [categories, setCategories] = useState<LeadCategory[]>([]);
   const [keywords, setKeywords] = useState<string[]>([]);
   const [icp, setIcp] = useState("");
@@ -101,9 +101,8 @@ export function ImportWizard({
   const [aiVerdicts, setAiVerdicts] = useState<Map<number, Verdict>>(new Map());
   const [classifying, setClassifying] = useState<{ done: number; total: number } | null>(null);
 
-  // review controls
-  const [buckets, setBuckets] = useState({ relevant: true, review: true, unrelated: false });
-  const [overrides, setOverrides] = useState<Map<number, boolean>>(new Map());
+  // selection — a single source of truth (indices to KEEP/import)
+  const [keep, setKeep] = useState<Set<number>>(new Set());
   const [relFilter, setRelFilter] = useState<string>("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -118,30 +117,33 @@ export function ImportWizard({
     [rubric, aiVerdicts],
   );
 
-  const effectiveKeep = (i: number) => {
-    if (overrides.has(i)) return overrides.get(i) as boolean;
-    return buckets[verdicts[i]?.relevance ?? "review"];
-  };
+  const relCounts = useMemo(() => {
+    const c = { relevant: 0, review: 0, unrelated: 0 } as Record<Relevance, number>;
+    for (const v of verdicts) c[v.relevance]++;
+    return c;
+  }, [verdicts]);
 
-  const tally = useMemo(() => {
-    let keep = 0;
-    for (let i = 0; i < verdicts.length; i++) if (effectiveKeep(i)) keep++;
-    return { keep, discard: verdicts.length - keep };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [verdicts, buckets, overrides]);
+  const relKept = useMemo(() => {
+    const c = { relevant: 0, review: 0, unrelated: 0 } as Record<Relevance, number>;
+    verdicts.forEach((v, i) => {
+      if (keep.has(i)) c[v.relevance]++;
+    });
+    return c;
+  }, [verdicts, keep]);
 
   const categoryRows = useMemo(() => {
-    const m = new Map<string, { count: number; companies: string[] }>();
+    const m = new Map<string, { count: number; kept: number; companies: string[] }>();
     verdicts.forEach((v, i) => {
-      const e = m.get(v.category) ?? { count: 0, companies: [] };
+      const e = m.get(v.category) ?? { count: 0, kept: 0, companies: [] };
       e.count++;
+      if (keep.has(i)) e.kept++;
       if (e.companies.length < 3 && leads[i]?.company) e.companies.push(leads[i].company);
       m.set(v.category, e);
     });
     return Array.from(m.entries())
       .map(([label, e]) => ({ label, ...e }))
       .sort((a, b) => b.count - a.count);
-  }, [verdicts, leads]);
+  }, [verdicts, leads, keep]);
 
   const filteredIdx = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -160,6 +162,33 @@ export function ImportWizard({
   const pages = Math.max(1, Math.ceil(filteredIdx.length / pageSize));
   const safePage = Math.min(page, pages - 1);
   const pageIdx = filteredIdx.slice(safePage * pageSize, safePage * pageSize + pageSize);
+
+  // ---- selection helpers (all write directly to `keep`) --------------------
+  function indicesWhere(pred: (v: Verdict, i: number) => boolean) {
+    const out: number[] = [];
+    verdicts.forEach((v, i) => {
+      if (pred(v, i)) out.push(i);
+    });
+    return out;
+  }
+  function setKeepTo(idxs: number[]) {
+    setKeep(new Set(idxs));
+  }
+  function addRemove(idxs: number[], add: boolean) {
+    setKeep((prev) => {
+      const next = new Set(prev);
+      for (const i of idxs) (add ? next.add(i) : next.delete(i));
+      return next;
+    });
+  }
+  function toggleRelevanceGroup(rel: Relevance) {
+    const idxs = indicesWhere((v) => v.relevance === rel);
+    const allIn = idxs.length > 0 && idxs.every((i) => keep.has(i));
+    addRemove(idxs, !allIn);
+  }
+  function setCategoryKeep(label: string, keepIt: boolean) {
+    addRemove(indicesWhere((v) => v.category === label), keepIt);
+  }
 
   function handleFile(file: File) {
     setFileName(file.name);
@@ -204,17 +233,13 @@ export function ImportWizard({
 
   function quickImport() {
     if (leads.length === 0) return;
-    doComplete(
-      leads.map((l) => ({ ...l, discarded: false })),
-      [],
-    );
+    doComplete(leads.map((l) => ({ ...l, discarded: false })), []);
   }
 
   async function runAnalysis() {
     setBusy(true);
     setAiVerdicts(new Map());
     const f = computeFacets(leads);
-    setFacetsData(f);
     let cats: LeadCategory[] = [];
     let kws = keywordsFromText(campaignText);
     let summary = "";
@@ -227,9 +252,7 @@ export function ImportWizard({
         industry: l.industry,
         headline: String(l.custom?.["Headline"] ?? "").slice(0, 160),
         keywords: String(l.custom?.["Keywords"] ?? l.custom?.["keywords"] ?? "").slice(0, 220),
-        description: String(
-          l.custom?.["Company Short Description"] ?? l.custom?.["Company SEO Description"] ?? "",
-        ).slice(0, 260),
+        description: String(l.custom?.["Company Short Description"] ?? l.custom?.["Company SEO Description"] ?? "").slice(0, 260),
         seniority: String(l.custom?.["Seniority"] ?? ""),
       }));
       const res = await analyzeLeads({ campaign: campaignText, sample, facets: f, provider });
@@ -251,10 +274,7 @@ export function ImportWizard({
     if (cats.length === 0) {
       cats = buildCategoriesFromFacets(f);
       if (!summary)
-        summary = `${leads.length} leads across ${f.industries.length} industries. Top: ${f.industries
-          .slice(0, 3)
-          .map((i) => i.label)
-          .join(", ")}.`;
+        summary = `${leads.length} leads across ${f.industries.length} industries. Top: ${f.industries.slice(0, 3).map((i) => i.label).join(", ")}.`;
       if (ins.length === 0)
         ins = [
           `Largest segment: ${f.industries[0]?.label ?? "—"} (${f.industries[0]?.count ?? 0} leads).`,
@@ -266,17 +286,17 @@ export function ImportWizard({
     setKeywords(kws);
     setIcp(summary);
     setInsights(ins);
-    setBuckets({ relevant: true, review: true, unrelated: false });
-    setOverrides(new Map());
+    // Default keep = everything the AI didn't flag as unrelated.
+    const initial = applyVerdicts(leads, cats, kws);
+    setKeep(new Set(initial.map((v, i) => (v.relevance !== "unrelated" ? i : -1)).filter((i) => i >= 0)));
     setBusy(false);
     setStep("review");
   }
 
-  // Per-lead AI classification over the currently filtered subset (batched).
   async function deepClassify() {
     const idxs = filteredIdx;
     if (idxs.length === 0) return;
-    if (idxs.length > 400 && !confirm(`Deep-classify ${idxs.length} leads with AI? This sends them in batches and can take a while / cost tokens. Tip: filter to the "Review" bucket first.`)) {
+    if (idxs.length > 400 && !confirm(`Deep-classify ${idxs.length} leads with AI? Tip: filter to the "Review" bucket first to save time/tokens.`)) {
       return;
     }
     setClassifying({ done: 0, total: idxs.length });
@@ -291,9 +311,7 @@ export function ImportWizard({
           company: l.company,
           title: l.title,
           industry: l.industry,
-          description: String(
-            l.custom?.["Company Short Description"] ?? l.custom?.["Company SEO Description"] ?? "",
-          ).slice(0, 300),
+          description: String(l.custom?.["Company Short Description"] ?? l.custom?.["Company SEO Description"] ?? "").slice(0, 300),
           keywords: String(l.custom?.["Keywords"] ?? l.custom?.["keywords"] ?? "").slice(0, 200),
         };
       });
@@ -316,19 +334,7 @@ export function ImportWizard({
       setClassifying({ done: Math.min(b + BATCH, idxs.length), total: idxs.length });
     }
     setClassifying(null);
-    toast.push("AI classification applied — buckets updated");
-  }
-
-  function setCategoryAction(key: string, action: CatAction) {
-    setCategories((cs) => cs.map((c) => (c.key === key ? { ...c, action } : c)));
-  }
-
-  function bulkPage(keep: boolean) {
-    setOverrides((m) => {
-      const next = new Map(m);
-      for (const i of filteredIdx) next.set(i, keep);
-      return next;
-    });
+    toast.push('Re-classified. Use "Relevant only" to update your selection.', "success");
   }
 
   function finalize() {
@@ -336,13 +342,8 @@ export function ImportWizard({
     const discarded: ParsedLead[] = [];
     leads.forEach((l, i) => {
       const v = verdicts[i];
-      const enriched: ParsedLead = {
-        ...l,
-        category: v?.category ?? "",
-        relevance: v?.relevance ?? "",
-        score: v?.score ?? l.score,
-      };
-      if (effectiveKeep(i)) kept.push({ ...enriched, discarded: false });
+      const enriched: ParsedLead = { ...l, category: v?.category ?? "", relevance: v?.relevance ?? "", score: v?.score ?? l.score };
+      if (keep.has(i)) kept.push({ ...enriched, discarded: false });
       else discarded.push({ ...enriched, discarded: true, discarded_at: new Date().toISOString() });
     });
     doComplete(kept, discarded);
@@ -356,10 +357,7 @@ export function ImportWizard({
           <button
             key={p}
             onClick={() => setProvider(p)}
-            className={cn(
-              "px-3 py-1.5 text-xs font-bold first:rounded-l-lg last:rounded-r-lg",
-              provider === p ? "bg-ink text-paper" : "bg-paper hover:bg-canvas",
-            )}
+            className={cn("px-3 py-1.5 text-xs font-bold first:rounded-l-lg last:rounded-r-lg", provider === p ? "bg-ink text-paper" : "bg-paper hover:bg-canvas")}
           >
             {p === "claude" ? "Claude" : "OpenAI"}
           </button>
@@ -374,9 +372,7 @@ export function ImportWizard({
       <div className="mb-4 flex items-center gap-2 text-xs font-bold">
         {(["upload", "campaign", "review"] as Step[]).map((s, i) => (
           <div key={s} className="flex items-center gap-2">
-            <span className={cn("flex h-6 w-6 items-center justify-center rounded-full border-2 border-ink", step === s ? "bg-pink" : "bg-white")}>
-              {i + 1}
-            </span>
+            <span className={cn("flex h-6 w-6 items-center justify-center rounded-full border-2 border-ink", step === s ? "bg-pink" : "bg-white")}>{i + 1}</span>
             <span className={cn("uppercase", step === s ? "text-ink" : "text-muted")}>
               {s === "upload" ? "Upload" : s === "campaign" ? "Campaign" : "Report & weed"}
             </span>
@@ -404,16 +400,9 @@ export function ImportWizard({
                   <Stat label="Extra columns kept" value={report.extraColumns.length} tone="sky" />
                 </div>
                 {!report.hasEmailColumn ? (
-                  <p className="mt-3 rounded-lg border-2 border-ink bg-danger px-3 py-1.5 text-sm font-bold text-white">
-                    No email column detected — can't import without emails.
-                  </p>
+                  <p className="mt-3 rounded-lg border-2 border-ink bg-danger px-3 py-1.5 text-sm font-bold text-white">No email column detected — can't import without emails.</p>
                 ) : null}
-                <p className="mt-3 text-xs text-muted">
-                  Every column is stored on each lead (view them all from the lead's eye icon after import) and used for AI analysis + personalization.
-                </p>
               </Card>
-
-              {/* Quick import */}
               <Card className="flex flex-wrap items-center gap-2 bg-canvas p-3">
                 <FileText size={16} />
                 <span className="text-sm font-bold">Quick import — skip AI, just add them:</span>
@@ -426,9 +415,7 @@ export function ImportWizard({
           ) : null}
 
           <div className="flex justify-end gap-2">
-            <button className="btn-ghost" onClick={onClose}>
-              Cancel
-            </button>
+            <button className="btn-ghost" onClick={onClose}>Cancel</button>
             <button className="btn-primary" disabled={leads.length === 0 || !report?.hasEmailColumn} onClick={() => setStep("campaign")}>
               Analyze &amp; weed <ArrowRight size={16} />
             </button>
@@ -439,26 +426,14 @@ export function ImportWizard({
       {step === "campaign" ? (
         <div className="space-y-4">
           <Field label="What campaign are you running?" hint="Describe your offer + ideal target. The AI reads each company's description to flag leads that don't fit.">
-            <TextArea
-              rows={4}
-              value={campaignText}
-              onChange={setCampaignText}
-              placeholder="e.g. Backlink/guest-post outreach to SEO & marketing agencies (10-200 staff) in the US. Avoid big enterprises and non-marketing companies."
-            />
+            <TextArea rows={4} value={campaignText} onChange={setCampaignText} placeholder="e.g. Backlink/guest-post outreach to SEO & marketing agencies (10-200 staff) in the US. Avoid big enterprises and non-marketing companies." />
           </Field>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field label="Save imported leads as (list name)">
               <TextField value={listName} onChange={setListName} />
             </Field>
             <Field label="Prefill from a campaign (optional)">
-              <SelectField
-                value=""
-                onChange={(id) => {
-                  const c = campaigns.find((x) => x.id === id);
-                  if (c) setCampaignText((t) => t || `${c.name}: ${c.description}`);
-                }}
-                options={[{ value: "", label: "—" }, ...campaigns.map((c) => ({ value: c.id, label: c.name }))]}
-              />
+              <SelectField value="" onChange={(id) => { const c = campaigns.find((x) => x.id === id); if (c) setCampaignText((t) => t || `${c.name}: ${c.description}`); }} options={[{ value: "", label: "—" }, ...campaigns.map((c) => ({ value: c.id, label: c.name }))]} />
             </Field>
           </div>
           <Card className="flex flex-wrap items-center justify-between gap-3 bg-lavender/40 p-3">
@@ -468,14 +443,8 @@ export function ImportWizard({
             </label>
             {useAI ? ProviderPicker : null}
           </Card>
-          <p className="text-xs text-muted">
-            Claude usually gives sharper relevance recognition. With AI off (or no key), categories are built from the data + your campaign keywords — still fully controllable.
-          </p>
-
           <div className="flex justify-between gap-2">
-            <button className="btn-ghost" onClick={() => setStep("upload")}>
-              <ArrowLeft size={16} /> Back
-            </button>
+            <button className="btn-ghost" onClick={() => setStep("upload")}><ArrowLeft size={16} /> Back</button>
             <button className="btn-primary" onClick={runAnalysis} disabled={busy}>
               {busy ? "Analyzing…" : useAI ? `Analyze with ${provider === "claude" ? "Claude" : "OpenAI"}` : "Build report"} <Sparkles size={16} />
             </button>
@@ -495,37 +464,41 @@ export function ImportWizard({
 
           {insights.length ? (
             <Card className="p-4">
-              <p className="mb-2 flex items-center gap-2 text-sm font-bold">
-                <Lightbulb size={15} /> What to know before targeting
-              </p>
+              <p className="mb-2 flex items-center gap-2 text-sm font-bold"><Lightbulb size={15} /> What to know before targeting</p>
               <ul className="space-y-1 text-sm">
-                {insights.map((s, i) => (
-                  <li key={i} className="flex gap-2">
-                    <span className="text-pink-dark">•</span>
-                    {s}
-                  </li>
-                ))}
+                {insights.map((s, i) => (<li key={i} className="flex gap-2"><span className="text-pink-dark">•</span>{s}</li>))}
               </ul>
             </Card>
           ) : null}
 
-          {/* Relevance buckets */}
+          {/* Quick presets — the simple path */}
+          <Card className="p-3">
+            <p className="mb-2 text-xs font-bold uppercase text-muted">Choose what to import</p>
+            <div className="flex flex-wrap gap-2">
+              <button className="btn-primary btn-sm" onClick={() => setKeepTo(indicesWhere((v) => v.relevance === "relevant"))}>
+                Relevant only ({relCounts.relevant})
+              </button>
+              <button className="btn-ghost btn-sm" onClick={() => setKeepTo(indicesWhere((v) => v.relevance !== "unrelated"))}>
+                Relevant + Review ({relCounts.relevant + relCounts.review})
+              </button>
+              <button className="btn-ghost btn-sm" onClick={() => setKeepTo(leads.map((_, i) => i))}>All ({leads.length})</button>
+              <button className="btn-ghost btn-sm" onClick={() => setKeep(new Set())}>None</button>
+            </div>
+          </Card>
+
+          {/* Relevance groups — click to add/remove the whole group */}
           <div className="grid grid-cols-3 gap-3">
-            {(["relevant", "review", "unrelated"] as const).map((r) => {
-              const count = verdicts.filter((v) => v.relevance === r).length;
+            {(["relevant", "review", "unrelated"] as Relevance[]).map((r) => {
               const meta = RELEVANCE_META[r];
+              const fullyKept = relCounts[r] > 0 && relKept[r] === relCounts[r];
               return (
-                <button
-                  key={r}
-                  onClick={() => setBuckets((b) => ({ ...b, [r]: !b[r] }))}
-                  className={cn("rounded-xl border-2 border-ink p-3 text-left transition-all", buckets[r] ? "shadow-hard-sm" : "opacity-50")}
-                >
+                <button key={r} onClick={() => toggleRelevanceGroup(r)} className={cn("rounded-xl border-2 border-ink p-3 text-left transition-all", fullyKept ? "shadow-hard-sm" : "")}>
                   <div className="flex items-center justify-between">
                     <Badge tone={meta.tone as "mint"}>{meta.icon} {meta.label}</Badge>
-                    {buckets[r] ? <Check size={14} /> : null}
+                    {fullyKept ? <Check size={14} /> : null}
                   </div>
-                  <p className="mt-2 text-2xl font-extrabold">{count}</p>
-                  <p className="text-xs text-muted">{buckets[r] ? "importing" : "discarding"}</p>
+                  <p className="mt-2 text-2xl font-extrabold">{relCounts[r]}</p>
+                  <p className="text-xs text-muted">{relKept[r]} of {relCounts[r]} kept · click to toggle</p>
                 </button>
               );
             })}
@@ -546,33 +519,27 @@ export function ImportWizard({
             </div>
           </Card>
 
-          {/* Category controls */}
+          {/* Categories — keep/discard a whole bucket */}
           <Card className="overflow-hidden p-0">
-            <div className="border-b-2 border-ink p-3">
-              <p className="text-sm font-bold">Categories — set keep / review / discard to weed in bulk</p>
-            </div>
+            <div className="border-b-2 border-ink p-3"><p className="text-sm font-bold">Categories — keep or discard a whole group</p></div>
             <div className="max-h-48 overflow-auto">
               <table className="w-full text-left text-sm">
                 <tbody>
-                  {categories.map((c) => {
-                    const row = categoryRows.find((r) => r.label === c.label);
-                    return (
-                      <tr key={c.key} className="border-b border-ink/10">
-                        <td className="px-3 py-2">
-                          <p className="font-bold">{c.label}</p>
-                          <p className="truncate text-xs text-muted">{c.description}</p>
-                        </td>
-                        <td className="px-3 py-2 text-right font-bold">{row?.count ?? 0}</td>
-                        <td className="px-3 py-2 text-right">
-                          <select className="input w-28 cursor-pointer py-1 text-xs" value={c.action} onChange={(e) => setCategoryAction(c.key, e.target.value as CatAction)}>
-                            <option value="keep">Keep</option>
-                            <option value="review">Review</option>
-                            <option value="discard">Discard</option>
-                          </select>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {categoryRows.map((c) => (
+                    <tr key={c.label} className="border-b border-ink/10">
+                      <td className="px-3 py-2">
+                        <p className="font-bold">{c.label}</p>
+                        <p className="truncate text-xs text-muted">{c.companies.join(", ")}</p>
+                      </td>
+                      <td className="px-3 py-2 text-right text-xs text-muted">{c.kept}/{c.count} kept</td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex justify-end gap-1">
+                          <button className="btn-ghost btn-sm" onClick={() => setCategoryKeep(c.label, true)}>Keep</button>
+                          <button className="btn-ghost btn-sm" onClick={() => setCategoryKeep(c.label, false)}>Discard</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
@@ -591,8 +558,8 @@ export function ImportWizard({
                 <option value="review">Review</option>
                 <option value="unrelated">Unrelated</option>
               </select>
-              <button className="btn-ghost btn-sm" onClick={() => bulkPage(true)}>Keep shown</button>
-              <button className="btn-ghost btn-sm" onClick={() => bulkPage(false)}>Discard shown</button>
+              <button className="btn-ghost btn-sm" onClick={() => addRemove(filteredIdx, true)}>Keep shown</button>
+              <button className="btn-ghost btn-sm" onClick={() => addRemove(filteredIdx, false)}>Discard shown</button>
             </div>
             <div className="max-h-72 overflow-auto">
               <table className="w-full table-fixed border-collapse text-left text-sm">
@@ -610,11 +577,11 @@ export function ImportWizard({
                   {pageIdx.map((i) => {
                     const l = leads[i];
                     const v = verdicts[i];
-                    const keep = effectiveKeep(i);
+                    const kept = keep.has(i);
                     return (
-                      <tr key={i} className={cn("border-b border-ink/10", !keep && "bg-coral/10")}>
+                      <tr key={i} className={cn("border-b border-ink/10", !kept && "bg-coral/10")}>
                         <td className="px-2 py-2">
-                          <input type="checkbox" checked={keep} onChange={(e) => setOverrides((m) => new Map(m).set(i, e.target.checked))} />
+                          <input type="checkbox" checked={kept} onChange={(e) => addRemove([i], e.target.checked)} />
                         </td>
                         <td className="px-2 py-2">
                           <p className="truncate font-bold" title={l.company}>{l.company || l.email}</p>
@@ -622,9 +589,7 @@ export function ImportWizard({
                         </td>
                         <td className="truncate px-2 py-2" title={v?.category}>{v?.category}</td>
                         <td className="truncate px-2 py-2 text-xs text-muted" title={v?.reason}>{v?.reason || "—"}</td>
-                        <td className="px-2 py-2">
-                          <Badge tone={RELEVANCE_META[v?.relevance ?? "review"].tone as "mint"}>{RELEVANCE_META[v?.relevance ?? "review"].label}</Badge>
-                        </td>
+                        <td className="px-2 py-2"><Badge tone={RELEVANCE_META[v?.relevance ?? "review"].tone as "mint"}>{RELEVANCE_META[v?.relevance ?? "review"].label}</Badge></td>
                         <td className="px-2 py-2 text-right font-bold">{v?.score}</td>
                       </tr>
                     );
@@ -649,19 +614,20 @@ export function ImportWizard({
               <input className="input w-56 py-1.5 text-sm" value={listName} onChange={(e) => setListName(e.target.value)} />
             </div>
             <div className="flex items-center gap-3 text-sm font-bold">
-              <span className="flex items-center gap-1 text-mint"><Check size={14} /> Import {tally.keep}</span>
-              <span className="flex items-center gap-1 text-coral"><Trash2 size={14} /> Discard {tally.discard}</span>
+              <span className="flex items-center gap-1 text-mint"><Check size={14} /> Import {keep.size}</span>
+              <span className="flex items-center gap-1 text-coral"><Trash2 size={14} /> Discard {leads.length - keep.size}</span>
             </div>
           </div>
 
           <div className="flex justify-between gap-2">
-            <button className="btn-ghost" onClick={() => setStep("campaign")}>
-              <ArrowLeft size={16} /> Back
-            </button>
-            <button className="btn-primary" onClick={finalize} disabled={busy || tally.keep + tally.discard === 0}>
-              {busy ? "Importing…" : `Import ${tally.keep} → "${listName}"`}
+            <button className="btn-ghost" onClick={() => setStep("campaign")}><ArrowLeft size={16} /> Back</button>
+            <button className="btn-primary" onClick={finalize} disabled={busy || leads.length === 0}>
+              {busy ? "Importing…" : `Import ${keep.size} → "${listName}"`}
             </button>
           </div>
+          <p className="text-center text-xs text-muted">
+            Discarded leads aren't deleted — they go to the Discarded folder where you can restore them anytime.
+          </p>
         </div>
       ) : null}
     </Modal>
