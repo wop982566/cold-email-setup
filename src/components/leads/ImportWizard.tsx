@@ -117,7 +117,11 @@ export function ImportWizard({
   const [instMap, setInstMap] = useState<Map<string, InstantlyLead>>(new Map());
   const [instScanned, setInstScanned] = useState(0);
   const [instTruncated, setInstTruncated] = useState(false);
-  const [excludeInst, setExcludeInst] = useState(true);
+  // What to do with leads that already exist in Instantly:
+  //  - "exclude": don't import them at all (default)
+  //  - "used":    import them but flagged status "used" so they won't be re-sent
+  //  - "keep":    import them like any other lead
+  const [instAction, setInstAction] = useState<"exclude" | "used" | "keep">("exclude");
   const [showInstDetail, setShowInstDetail] = useState(false);
   const [instCampaigns, setInstCampaigns] = useState<Record<string, string>>({});
 
@@ -155,13 +159,20 @@ export function ImportWizard({
     [instMatches],
   );
 
-  // The set that actually flows into analysis + import.
+  // The set that actually flows into analysis + import (Instantly matches are
+  // dropped only when the operator chose to exclude them).
   const leads = useMemo<ParsedLead[]>(
     () =>
-      excludeInst && instChecked
+      instChecked && instAction === "exclude"
         ? allLeads.filter((l) => !instMatchEmails.has(l.email.trim().toLowerCase()))
         : allLeads,
-    [allLeads, excludeInst, instChecked, instMatchEmails],
+    [allLeads, instChecked, instAction, instMatchEmails],
+  );
+
+  // Emails to import but flag as "used" (the "import & mark used" choice).
+  const instUsedEmails = useMemo(
+    () => (instChecked && instAction === "used" ? instMatchEmails : new Set<string>()),
+    [instChecked, instAction, instMatchEmails],
   );
 
   // campaign
@@ -356,9 +367,21 @@ export function ImportWizard({
     }
   }
 
+  // Flag a lead as already-used when it matched Instantly and the operator
+  // chose "import & mark used".
+  function applyInstUsed(l: ParsedLead): ParsedLead {
+    if (!instUsedEmails.has(l.email.trim().toLowerCase())) return l;
+    return {
+      ...l,
+      status: "used",
+      used_at: new Date().toISOString(),
+      tags: l.tags.includes("in-instantly") ? l.tags : [...l.tags, "in-instantly"],
+    };
+  }
+
   function quickImport() {
     if (leads.length === 0) return;
-    doComplete(leads.map((l) => ({ ...l, discarded: false })), []);
+    doComplete(leads.map((l) => applyInstUsed({ ...l, discarded: false })), []);
   }
 
   function setFitShown(rel: Relevance) {
@@ -476,13 +499,13 @@ export function ImportWizard({
     const discarded: ParsedLead[] = [];
     leads.forEach((l, i) => {
       const v = verdicts[i];
-      const enriched: ParsedLead = {
+      const enriched: ParsedLead = applyInstUsed({
         ...l,
         category: v?.category ?? "",
         relevance: v?.relevance ?? "",
         score: v?.score ?? l.score,
         enrichment: { ...(l.enrichment as Record<string, unknown>), reason: v?.reason ?? "" },
-      };
+      });
       if (keep.has(i)) kept.push({ ...enriched, discarded: false });
       else discarded.push({ ...enriched, discarded: true, discarded_at: new Date().toISOString() });
     });
@@ -667,10 +690,37 @@ export function ImportWizard({
                     </div>
 
                     {instMatches.length ? (
-                      <label className="mt-2 flex cursor-pointer items-center gap-2 rounded-lg border-2 border-ink bg-sun/40 p-2 text-sm font-bold">
-                        <input type="checkbox" checked={excludeInst} onChange={(e) => setExcludeInst(e.target.checked)} />
-                        Exclude these {instMatches.length} from the import (recommended)
-                      </label>
+                      <div className="mt-2 rounded-lg border-2 border-ink bg-sun/30 p-2">
+                        <p className="mb-1.5 px-1 text-[11px] font-bold uppercase tracking-wide text-muted">
+                          What to do with these {instMatches.length} Instantly duplicates
+                        </p>
+                        <div className="grid grid-cols-1 gap-1 sm:grid-cols-3">
+                          {([
+                            { v: "exclude", t: "Exclude from import", d: "Don't add them (recommended)" },
+                            { v: "used", t: "Import & mark used", d: "Add them, flagged “used”" },
+                            { v: "keep", t: "Import normally", d: "Add them like any lead" },
+                          ] as const).map((o) => (
+                            <label
+                              key={o.v}
+                              className={cn(
+                                "flex cursor-pointer items-start gap-2 rounded-lg border-2 p-2 text-sm",
+                                instAction === o.v ? "border-ink bg-paper" : "border-transparent hover:bg-paper/60",
+                              )}
+                            >
+                              <input
+                                type="radio"
+                                className="mt-0.5"
+                                checked={instAction === o.v}
+                                onChange={() => setInstAction(o.v)}
+                              />
+                              <span>
+                                <span className="block font-bold">{o.t}</span>
+                                <span className="block text-xs text-muted">{o.d}</span>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
                     ) : (
                       <p className="mt-2 flex items-center gap-2 text-sm font-bold text-mint">
                         <CheckCircle2 size={15} /> None of these leads are
@@ -725,7 +775,17 @@ export function ImportWizard({
 
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs text-muted">
-              {report ? `${leads.length} will import${excludeInst && instChecked && instMatches.length ? ` · ${instMatches.length} Instantly dupes excluded` : ""}` : ""}
+              {report
+                ? `${leads.length} will import${
+                    instChecked && instMatches.length
+                      ? instAction === "exclude"
+                        ? ` · ${instMatches.length} Instantly dupes excluded`
+                        : instAction === "used"
+                          ? ` · ${instMatches.length} Instantly dupes imported as “used”`
+                          : ` · ${instMatches.length} Instantly dupes imported`
+                      : ""
+                  }`
+                : ""}
             </span>
             <div className="flex gap-2">
               <button className="btn-ghost" onClick={onClose}>Cancel</button>
