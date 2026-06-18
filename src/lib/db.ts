@@ -29,6 +29,13 @@ export type Row = { id: string; [key: string]: unknown };
 // signature), so the public API constrains on this looser shape.
 export type WithId = { id: string };
 
+// Split an array into chunks (Supabase .in() URLs and upsert bodies have limits).
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 function seedFor(table: TableName): Row[] {
   switch (table) {
     case TABLES.campaigns:
@@ -58,6 +65,8 @@ export interface Repo {
   insert<T extends WithId>(table: TableName, row: Partial<T>): Promise<T>;
   insertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<T[]>;
   update<T extends WithId>(table: TableName, id: string, patch: Partial<T>): Promise<T>;
+  updateMany<T extends WithId>(table: TableName, ids: string[], patch: Partial<T>): Promise<void>;
+  upsertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<void>;
   remove(table: TableName, id: string): Promise<void>;
   removeMany(table: TableName, ids: string[]): Promise<void>;
   getSettings(): Promise<AppSettings>;
@@ -143,6 +152,29 @@ const localRepo: Repo = {
     lsWrite(table, rows);
     return rows[idx];
   },
+  async updateMany<T extends WithId>(table: TableName, ids: string[], patch: Partial<T>): Promise<void> {
+    ensureSeeded();
+    if (ids.length === 0) return;
+    const set = new Set(ids);
+    const ts = new Date().toISOString();
+    const rows = lsRead(table);
+    for (let i = 0; i < rows.length; i++) {
+      if (set.has(rows[i].id)) rows[i] = { ...rows[i], ...patch, updated_at: ts };
+    }
+    lsWrite(table, rows);
+  },
+  async upsertMany<T extends WithId>(table: TableName, newRows: Partial<T>[]): Promise<void> {
+    ensureSeeded();
+    if (newRows.length === 0) return;
+    const ts = new Date().toISOString();
+    const byId = new Map<string, Row>(lsRead(table).map((r) => [r.id, r] as const));
+    for (const r of newRows) {
+      const id = r.id as string;
+      const existing = byId.get(id);
+      byId.set(id, existing ? { ...existing, ...r, updated_at: ts } : ({ created_at: ts, ...r } as Row));
+    }
+    lsWrite(table, Array.from(byId.values()));
+  },
   async remove(table: TableName, id: string): Promise<void> {
     ensureSeeded();
     lsWrite(
@@ -211,13 +243,33 @@ const supabaseRepo: Repo = {
     if (error) throw error;
     return data as T;
   },
+  async updateMany<T extends WithId>(table: TableName, ids: string[], patch: Partial<T>): Promise<void> {
+    // Chunk ids — a single .in() with thousands of ids overflows the URL.
+    for (const batch of chunk(ids, 200)) {
+      const { error } = await supabase!
+        .from(table)
+        .update(patch as Record<string, unknown>)
+        .in("id", batch);
+      if (error) throw error;
+    }
+  },
+  async upsertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<void> {
+    for (const batch of chunk(rows, 500)) {
+      const { error } = await supabase!
+        .from(table)
+        .upsert(batch as Record<string, unknown>[], { onConflict: "id" });
+      if (error) throw error;
+    }
+  },
   async remove(table: TableName, id: string): Promise<void> {
     const { error } = await supabase!.from(table).delete().eq("id", id);
     if (error) throw error;
   },
   async removeMany(table: TableName, ids: string[]): Promise<void> {
-    const { error } = await supabase!.from(table).delete().in("id", ids);
-    if (error) throw error;
+    for (const batch of chunk(ids, 200)) {
+      const { error } = await supabase!.from(table).delete().in("id", batch);
+      if (error) throw error;
+    }
   },
   async getSettings(): Promise<AppSettings> {
     const { data, error } = await supabase!

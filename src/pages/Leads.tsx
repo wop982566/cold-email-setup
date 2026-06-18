@@ -27,6 +27,8 @@ import {
   useInsert,
   useInsertMany,
   useUpdate,
+  useUpdateMany,
+  useUpsertMany,
   useRemove,
   useRemoveMany,
 } from "../lib/hooks";
@@ -111,6 +113,8 @@ export default function Leads() {
   const insertLead = useInsert<Lead>(TABLES.leads);
   const insertManyLeads = useInsertMany<Lead>(TABLES.leads);
   const updateLead = useUpdate<Lead>(TABLES.leads);
+  const updateManyLeads = useUpdateMany<Lead>(TABLES.leads);
+  const upsertManyLeads = useUpsertMany<Lead>(TABLES.leads);
   const removeLead = useRemove(TABLES.leads);
   const removeManyLeads = useRemoveMany(TABLES.leads);
   const insertList = useInsert<LeadList>(TABLES.leadLists);
@@ -213,45 +217,53 @@ export default function Leads() {
   }
 
   async function bulkSetStatus(status: LeadStatus, campaignId?: string) {
-    for (const l of selectedLeads) {
-      await updateLead.mutateAsync({
-        id: l.id,
-        patch: {
-          status,
-          used_in_campaign_id: status === "used" ? campaignId ?? l.used_in_campaign_id : l.used_in_campaign_id,
-          used_at: status === "used" ? new Date().toISOString() : l.used_at,
-        } as Partial<Lead>,
-      });
+    try {
+      const ids = selectedLeads.map((l) => l.id);
+      const patch: Partial<Lead> = { status };
+      if (status === "used") {
+        patch.used_at = new Date().toISOString();
+        if (campaignId) patch.used_in_campaign_id = campaignId;
+      }
+      await updateManyLeads.mutateAsync({ ids, patch });
+      toast.push(`Updated ${ids.length} leads`);
+      setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
     }
-    toast.push(`Updated ${selectedLeads.length} leads`);
-    setSelected(new Set());
   }
 
   async function bulkMove(listId: string) {
-    for (const l of selectedLeads) {
-      await updateLead.mutateAsync({ id: l.id, patch: { list_id: listId } as Partial<Lead> });
+    try {
+      const ids = selectedLeads.map((l) => l.id);
+      await updateManyLeads.mutateAsync({ ids, patch: { list_id: listId } as Partial<Lead> });
+      toast.push(`Moved ${ids.length} leads`);
+      setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
     }
-    toast.push(`Moved ${selectedLeads.length} leads`);
-    setSelected(new Set());
   }
 
   async function bulkTag(tag: string) {
-    for (const l of selectedLeads) {
-      if (l.tags.includes(tag)) continue;
-      await updateLead.mutateAsync({ id: l.id, patch: { tags: [...l.tags, tag] } as Partial<Lead> });
+    try {
+      const rows = selectedLeads.map((l) => ({
+        id: l.id,
+        tags: l.tags.includes(tag) ? l.tags : [...l.tags, tag],
+      }));
+      await upsertManyLeads.mutateAsync(rows);
+      toast.push(`Tagged ${rows.length} leads`);
+    } catch (e) {
+      toast.push(explainError(e), "error");
     }
-    toast.push(`Tagged ${selectedLeads.length} leads`);
   }
 
   async function discardSelected() {
     try {
-      for (const l of selectedLeads) {
-        await updateLead.mutateAsync({
-          id: l.id,
-          patch: { discarded: true, discarded_at: new Date().toISOString() } as Partial<Lead>,
-        });
-      }
-      toast.push(`Moved ${selectedLeads.length} leads to Discarded`);
+      const ids = selectedLeads.map((l) => l.id);
+      await updateManyLeads.mutateAsync({
+        ids,
+        patch: { discarded: true, discarded_at: new Date().toISOString() } as Partial<Lead>,
+      });
+      toast.push(`Moved ${ids.length} leads to Discarded`);
       setSelected(new Set());
     } catch (e) {
       toast.push(explainError(e), "error");
@@ -260,10 +272,9 @@ export default function Leads() {
 
   async function restoreSelected() {
     try {
-      for (const l of selectedLeads) {
-        await updateLead.mutateAsync({ id: l.id, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
-      }
-      toast.push(`Restored ${selectedLeads.length} leads`);
+      const ids = selectedLeads.map((l) => l.id);
+      await updateManyLeads.mutateAsync({ ids, patch: { discarded: false, discarded_at: null } as Partial<Lead> });
+      toast.push(`Restored ${ids.length} leads`);
       setSelected(new Set());
     } catch (e) {
       toast.push(explainError(e), "error");

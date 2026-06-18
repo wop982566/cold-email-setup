@@ -39,6 +39,23 @@ export function useUpdate<T extends WithId>(table: TableName) {
   });
 }
 
+export function useUpdateMany<T extends WithId>(table: TableName) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ ids, patch }: { ids: string[]; patch: Partial<T> }) =>
+      db.updateMany<T>(table, ids, patch),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [table] }),
+  });
+}
+
+export function useUpsertMany<T extends WithId>(table: TableName) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (rows: Partial<T>[]) => db.upsertMany<T>(table, rows),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [table] }),
+  });
+}
+
 export function useRemove(table: TableName) {
   const qc = useQueryClient();
   return useMutation({
