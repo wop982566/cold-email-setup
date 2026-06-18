@@ -48,6 +48,52 @@ export default async (req: Request): Promise<Response> => {
   const auth = { Authorization: `Bearer ${key}`, Accept: "application/json" };
 
   try {
+    // Pull every lead/contact in the workspace (optionally one campaign) and
+    // return a COMPACT projection — email + campaign + status only — for
+    // duplicate-checking against the tool's leads. Paginates the v2
+    // POST /leads/list endpoint within a time budget so the function returns
+    // promptly even on large workspaces (flags `truncated` if it stops early).
+    if (resource === "leads") {
+      const campaignId = url.searchParams.get("campaign_id") || undefined;
+      const out: { email: string; campaign?: string; status?: number }[] = [];
+      const seen = new Set<string>();
+      let startingAfter: string | undefined;
+      let truncated = false;
+      const started = Date.now();
+      const MAX_PAGES = 400; // up to ~40k leads
+      for (let i = 0; i < MAX_PAGES; i++) {
+        const body: Record<string, unknown> = { limit: 100 };
+        if (startingAfter) body.starting_after = startingAfter;
+        if (campaignId) body.campaign = campaignId;
+        const res = await fetch(`${BASE}/leads/list`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+        const items: Array<Record<string, unknown>> = Array.isArray(data?.items) ? data.items : [];
+        for (const it of items) {
+          const email = String(it.email ?? "").trim().toLowerCase();
+          if (!email || seen.has(email)) continue;
+          seen.add(email);
+          out.push({
+            email,
+            campaign: typeof it.campaign === "string" ? it.campaign : undefined,
+            status: typeof it.status === "number" ? it.status : undefined,
+          });
+        }
+        startingAfter = typeof data?.next_starting_after === "string" ? data.next_starting_after : undefined;
+        if (!startingAfter || items.length === 0) break;
+        if (Date.now() - started > 8000) {
+          truncated = true;
+          break;
+        }
+        if (i === MAX_PAGES - 1) truncated = true;
+      }
+      return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
     // Warmup analytics is a POST with a body of emails (1-100).
     if (resource === "warmup") {
       let emails: string[] = [];

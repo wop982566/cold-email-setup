@@ -48,9 +48,24 @@ export function asItems<T = Record<string, unknown>>(data: unknown): T[] {
   return [];
 }
 
+export interface InstantlyLead {
+  email: string;
+  campaign?: string;
+  status?: number;
+}
+export interface InstantlyLeadsData {
+  items: InstantlyLead[];
+  count: number;
+  truncated: boolean;
+}
+
 export const instantly = {
   accounts: () => call("accounts", { limit: "100" }),
   campaigns: () => call("campaigns", { limit: "100" }),
+  // All leads/contacts in the workspace (compact: email/campaign/status) for
+  // duplicate-checking. Optionally scope to one campaign.
+  workspaceLeads: (campaignId?: string) =>
+    call<InstantlyLeadsData>("leads", campaignId ? { campaign_id: campaignId } : {}),
   analyticsOverview: (range: DateRange) => call("analytics-overview", rangeParams(range)),
   campaignAnalytics: (range: DateRange) => call("analytics-campaigns", rangeParams(range)),
   warmup: async (emails: string[]): Promise<InstantlyResult> => {

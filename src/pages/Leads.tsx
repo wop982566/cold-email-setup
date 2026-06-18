@@ -19,6 +19,7 @@ import {
   Eye,
   ChevronRight,
   ChevronDown,
+  ShieldCheck,
 } from "lucide-react";
 import { Card, Badge, EmptyState } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
@@ -46,6 +47,7 @@ import { enrichLeads } from "../lib/functions";
 import { ImportWizard, type ImportResult } from "../components/leads/ImportWizard";
 import { LeadDetailModal, LeadFields } from "../components/leads/LeadDetailModal";
 import { ExportModal } from "../components/leads/ExportModal";
+import { InstantlyDupeModal } from "../components/leads/InstantlyDupeModal";
 import { dbMode } from "../lib/db";
 
 const STATUS_OPTIONS: { value: LeadStatus; label: string; tone: string }[] = [
@@ -138,6 +140,7 @@ export default function Leads() {
   const [showEnrich, setShowEnrich] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showDupes, setShowDupes] = useState(false);
   const [viewing, setViewing] = useState<Lead | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
@@ -245,6 +248,20 @@ export default function Leads() {
       await updateManyLeads.mutateAsync({ ids, patch });
       toast.push(`Updated ${ids.length} leads`);
       setSelected(new Set());
+    } catch (e) {
+      toast.push(explainError(e), "error");
+    }
+  }
+
+  // Mark an explicit set of leads as "used" — used by the Instantly
+  // duplicate cross-check to flag contacts already loaded into Instantly.
+  async function markUsedByIds(ids: string[], campaignId?: string) {
+    if (ids.length === 0) return;
+    try {
+      const patch: Partial<Lead> = { status: "used", used_at: new Date().toISOString() };
+      if (campaignId) patch.used_in_campaign_id = campaignId;
+      await updateManyLeads.mutateAsync({ ids, patch });
+      toast.push(`Marked ${ids.length} Instantly duplicate(s) as used`);
     } catch (e) {
       toast.push(explainError(e), "error");
     }
@@ -403,6 +420,7 @@ export default function Leads() {
       );
     }
     toast.push(`Imported ${kept.length} to "${listName}" · ${discarded.length} discarded`);
+    toast.push("Tip: use “Instantly dupes” to flag any of these already in Instantly", "info");
     setShowImport(false);
     setShowDiscarded(false);
     setActiveListId(list.id);
@@ -540,6 +558,15 @@ export default function Leads() {
           </button>
           <button className="btn-ghost btn-sm" onClick={removeDuplicates}>
             <Copy size={14} /> Dedupe
+          </button>
+          <button
+            className="btn-ghost btn-sm"
+            onClick={() =>
+              filtered.length ? setShowDupes(true) : toast.push("No leads in this view to check", "info")
+            }
+            title="Cross-check these leads against contacts already in your Instantly workspace"
+          >
+            <ShieldCheck size={14} /> Instantly dupes
           </button>
           <button
             className="btn-ghost btn-sm"
@@ -828,6 +855,24 @@ export default function Leads() {
       ) : null}
 
       {showExport ? <ExportModal leads={filtered} onClose={() => setShowExport(false)} /> : null}
+
+      {showDupes ? (
+        <InstantlyDupeModal
+          leads={filtered}
+          scopeLabel={
+            showDiscarded
+              ? "the Discarded folder"
+              : activeListId
+                ? `“${lists.find((l) => l.id === activeListId)?.name ?? "this list"}”`
+                : "all leads"
+          }
+          onClose={() => setShowDupes(false)}
+          onMarkUsed={async (ids) => {
+            await markUsedByIds(ids);
+            setSelected(new Set());
+          }}
+        />
+      ) : null}
 
       {viewing ? <LeadDetailModal lead={viewing} onClose={() => setViewing(null)} /> : null}
 
