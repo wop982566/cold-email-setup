@@ -217,9 +217,24 @@ const localRepo: Repo = {
 const supabaseRepo: Repo = {
   mode: "supabase",
   async list<T extends WithId>(table: TableName): Promise<T[]> {
-    const { data, error } = await supabase!.from(table).select("*");
-    if (error) throw error;
-    return (data ?? []) as T[];
+    // PostgREST caps a single select at ~1000 rows. Page through with the
+    // exact count so large tables (thousands of leads) load completely.
+    const PAGE = 1000;
+    const first = await supabase!.from(table).select("*", { count: "exact" }).range(0, PAGE - 1);
+    if (first.error) throw first.error;
+    const out = (first.data ?? []) as T[];
+    const total = first.count ?? out.length;
+    while (out.length < total) {
+      const { data, error } = await supabase!
+        .from(table)
+        .select("*")
+        .range(out.length, out.length + PAGE - 1);
+      if (error) throw error;
+      const batch = (data ?? []) as T[];
+      if (batch.length === 0) break; // safety: nothing more to fetch
+      out.push(...batch);
+    }
+    return out;
   },
   async insert<T extends WithId>(table: TableName, row: Partial<T>): Promise<T> {
     const payload = { id: (row.id as string) ?? uuid(), ...row };
