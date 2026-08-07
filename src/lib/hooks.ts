@@ -14,6 +14,21 @@ export function useCollection<T extends WithId>(table: TableName) {
   });
 }
 
+// Verifies the app can actually read from the configured backend. On Supabase
+// this surfaces paused-project / missing-migration / RLS / bad-key errors
+// instead of silently rendering empty data.
+export function useDbHealth() {
+  return useQuery({
+    queryKey: ["__db_health"],
+    queryFn: async () => {
+      await db.ping();
+      return true as const;
+    },
+    retry: false,
+    staleTime: 1000 * 60,
+  });
+}
+
 export function useInsert<T extends WithId>(table: TableName) {
   const qc = useQueryClient();
   return useMutation({

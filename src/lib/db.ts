@@ -71,6 +71,7 @@ export interface Repo {
   removeMany(table: TableName, ids: string[]): Promise<void>;
   getSettings(): Promise<AppSettings>;
   saveSettings(s: AppSettings): Promise<AppSettings>;
+  ping(): Promise<void>;
   resetLocal?(): void;
 }
 
@@ -202,6 +203,9 @@ const localRepo: Repo = {
     lsWrite(TABLES.settings, [{ id: "app", ...s }]);
     return s;
   },
+  async ping(): Promise<void> {
+    ensureSeeded();
+  },
   resetLocal() {
     for (const table of Object.values(TABLES)) {
       localStorage.removeItem(lsKey(table));
@@ -302,6 +306,11 @@ const supabaseRepo: Repo = {
       .upsert({ id: "app", value: s });
     if (error) throw error;
     return s;
+  },
+  async ping(): Promise<void> {
+    // Cheap round-trip that surfaces the real connection/schema/RLS error.
+    const { error } = await supabase!.from(TABLES.domains).select("id").limit(1);
+    if (error) throw error;
   },
 };
 

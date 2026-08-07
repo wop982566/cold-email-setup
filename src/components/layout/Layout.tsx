@@ -17,11 +17,12 @@ import {
   Database,
   HardDrive,
   LogOut,
+  AlertTriangle,
 } from "lucide-react";
 import { authEnabled, signOut } from "../../lib/auth";
 import { cn } from "../../lib/utils";
 import { dbMode } from "../../lib/db";
-import { useCollection, useSettings } from "../../lib/hooks";
+import { useCollection, useDbHealth, useSettings } from "../../lib/hooks";
 import { Domain, TABLES } from "../../lib/types";
 import { daysUntil } from "../../lib/format";
 
@@ -129,6 +130,59 @@ function ReminderBell() {
   );
 }
 
+// Turn a raw Supabase error into a likely cause + fix.
+function diagnoseDbError(msg: string): { cause: string; fix: string } {
+  const m = msg.toLowerCase();
+  if (/failed to fetch|networkerror|load failed|fetch/.test(m)) {
+    return {
+      cause: "Your app can't reach the Supabase project.",
+      fix: "Free-tier projects pause after inactivity — open your Supabase dashboard and resume it. Also confirm VITE_SUPABASE_URL is correct and redeploy.",
+    };
+  }
+  if (/does not exist|relation|could not find the table|schema cache/.test(m)) {
+    return {
+      cause: "The database tables aren't there yet.",
+      fix: "Run the SQL migrations (supabase/migrations 0001–0004) in the Supabase SQL editor, then reload.",
+    };
+  }
+  if (/permission denied|row-level security|rls/.test(m)) {
+    return {
+      cause: "Row-Level Security is blocking reads.",
+      fix: "Apply the anon access policy from migration 0001 (the `anon_all` policy), then reload.",
+    };
+  }
+  if (/jwt|api key|invalid|unauthorized|401|apikey/.test(m)) {
+    return {
+      cause: "The Supabase anon key is wrong or expired.",
+      fix: "Copy the current anon/public key from Supabase → Project Settings → API into VITE_SUPABASE_ANON_KEY and redeploy.",
+    };
+  }
+  return { cause: "The database returned an error.", fix: "Check the message below against your Supabase project settings." };
+}
+
+function DbHealthBanner() {
+  const { isError, error, isLoading } = useDbHealth();
+  if (dbMode !== "supabase" || isLoading || !isError) return null;
+  const msg = error instanceof Error ? error.message : String(error);
+  const { cause, fix } = diagnoseDbError(msg);
+  return (
+    <div className="mb-4 rounded-xl border-2 border-ink bg-danger/15 p-3 text-sm">
+      <p className="flex items-center gap-2 font-extrabold">
+        <AlertTriangle size={16} /> Can't read from your database — that's why everything shows 0.
+      </p>
+      <p className="mt-1">
+        <span className="font-bold">Likely cause:</span> {cause}
+      </p>
+      <p className="mt-0.5">
+        <span className="font-bold">Fix:</span> {fix}
+      </p>
+      <p className="mt-1 break-words rounded-lg border-2 border-ink/20 bg-white/60 px-2 py-1 font-mono text-xs">
+        {msg}
+      </p>
+    </div>
+  );
+}
+
 function PageTitle() {
   const { pathname } = useLocation();
   const item = NAV.find((n) => (n.end ? pathname === n.to : pathname.startsWith(n.to) && n.to !== "/"));
@@ -203,7 +257,10 @@ export function Layout({ children }: { children?: ReactNode }) {
             ) : null}
           </div>
         </header>
-        <main className="flex-1 p-4 lg:p-6">{children ?? <Outlet />}</main>
+        <main className="flex-1 p-4 lg:p-6">
+          <DbHealthBanner />
+          {children ?? <Outlet />}
+        </main>
       </div>
     </div>
   );
