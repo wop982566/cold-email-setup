@@ -24,6 +24,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { Card, ProgressBar, StatCard, Badge } from "../components/ui/primitives";
+import { SendingHealthCard } from "../components/dashboard/SendingHealthCard";
 import { useCollection, useSettings } from "../lib/hooks";
 import {
   Campaign,
@@ -154,6 +155,11 @@ export default function Dashboard() {
           tone="coral"
           icon={<Users size={18} />}
         />
+      </div>
+
+      {/* Live sending vs capacity — the "am I OK right now" answer, above the plan. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <SendingHealthCard cap={cap} settings={settings} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">

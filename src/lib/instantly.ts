@@ -29,13 +29,19 @@ async function call<T>(resource: string, params: Record<string, string> = {}): P
 
 export type DateRange = "7d" | "30d" | "90d" | "all";
 
-export function rangeParams(range: DateRange): Record<string, string> {
-  if (range === "all") return {};
-  const days = range === "7d" ? 7 : range === "30d" ? 30 : 90;
+// A UTC start/end window N days back from today. Instantly's date params are
+// plain YYYY-MM-DD; keeping this in one place means every caller (and the
+// day-bucket maths in sendingHealth) agrees on where a day boundary falls.
+export function daysParams(days: number): Record<string, string> {
   const end = new Date();
   const start = new Date(end.getTime() - days * 86400000);
   const fmt = (d: Date) => d.toISOString().slice(0, 10);
   return { start_date: fmt(start), end_date: fmt(end) };
+}
+
+export function rangeParams(range: DateRange): Record<string, string> {
+  if (range === "all") return {};
+  return daysParams(range === "7d" ? 7 : range === "30d" ? 30 : 90);
 }
 
 // Instantly list endpoints return { items: [...] }; analytics may return an
@@ -70,6 +76,10 @@ export const instantly = {
     call<InstantlyLeadsData>("leads", campaignId ? { campaign_id: campaignId } : {}),
   analyticsOverview: (range: DateRange) => call("analytics-overview", rangeParams(range)),
   campaignAnalytics: (range: DateRange) => call("analytics-campaigns", rangeParams(range)),
+  // Per-day send buckets across the whole workspace. Left untyped like its
+  // siblings — the payload may be a bare array or {items:[…]}, which asItems()
+  // absorbs.
+  analyticsDaily: (days = 30) => call("analytics-daily", daysParams(days)),
   warmup: async (emails: string[]): Promise<InstantlyResult> => {
     try {
       const res = await fetch("/.netlify/functions/instantly?resource=warmup", {

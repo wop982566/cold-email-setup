@@ -13,13 +13,14 @@ import {
   AlertTriangle,
   Trophy,
   ChevronDown,
-  Gauge,
 } from "lucide-react";
-import { Card, StatCard, Badge, Spinner, EmptyState, ProgressBar } from "../components/ui/primitives";
+import { Card, StatCard, Badge, Spinner, EmptyState } from "../components/ui/primitives";
 import { ProviderLogo } from "../components/ui/badges";
+import { SendingHealthCard, SENDING_HEALTH_DAYS } from "../components/dashboard/SendingHealthCard";
 import { useToast } from "../components/ui/toast";
-import { useCollection, useUpdate } from "../lib/hooks";
-import { CapacitySource, TABLES } from "../lib/types";
+import { useCollection, useSettings } from "../lib/hooks";
+import { CapacitySource, Domain, TABLES } from "../lib/types";
+import { computeCapacity } from "../lib/capacity";
 import { instantly, asItems, pick, type DateRange, type InstantlyResult } from "../lib/instantly";
 import { fmtNumber, fmtPercent, fmtMoney } from "../lib/format";
 import { cn } from "../lib/utils";
@@ -82,11 +83,24 @@ export default function Instantly() {
   const qc = useQueryClient();
   const [range, setRange] = useState<DateRange>("30d");
   const { data: capacity = [] } = useCollection<CapacitySource>(TABLES.capacity);
-  const updateCap = useUpdate<CapacitySource>(TABLES.capacity);
+  const { data: domains = [] } = useCollection<Domain>(TABLES.domains);
+  const { data: settings } = useSettings();
+
+  const cap = useMemo(
+    () => (settings ? computeCapacity(domains, capacity, settings) : null),
+    [domains, capacity, settings],
+  );
 
   const overviewQ = useQuery({ queryKey: ["inst", "overview", range], queryFn: () => instantly.analyticsOverview(range) });
   const campQ = useQuery({ queryKey: ["inst", "camp", range], queryFn: () => instantly.campaignAnalytics(range) });
   const acctQ = useQuery({ queryKey: ["inst", "acct"], queryFn: () => instantly.accounts() });
+  // Same keys as SendingHealthCard, so react-query serves these from one fetch.
+  // They exist here purely to expose the payloads in the raw-data explorer.
+  const campListQ = useQuery({ queryKey: ["inst", "camplist"], queryFn: () => instantly.campaigns() });
+  const dailyQ = useQuery({
+    queryKey: ["inst", "daily", SENDING_HEALTH_DAYS],
+    queryFn: () => instantly.analyticsDaily(SENDING_HEALTH_DAYS),
+  });
 
   const notConfigured =
     overviewQ.data?.configured === false ||
@@ -127,21 +141,6 @@ export default function Instantly() {
   const accounts = useMemo(() => asItems<Record<string, unknown>>(acctQ.data?.data), [acctQ.data]);
   const activeAccounts = accounts.filter((a) => Number(a.status) === 1 || a.status === "active").length;
   const warmupOn = accounts.filter((a) => Number(a.warmup_status) === 1).length;
-
-  // Tie to the capacity planner: Instantly monthly sending cap.
-  const instSource = capacity.find(
-    (c) => c.kind === "sending" && c.name.toLowerCase().includes("instant"),
-  );
-  const monthlyCap = instSource?.limit_amount ?? 0;
-
-  function syncToCapacity() {
-    if (!instSource) {
-      toast.push("No Instantly sending limit found on the Capacity page", "error");
-      return;
-    }
-    updateCap.mutate({ id: instSource.id, patch: { used_amount: sent } });
-    toast.push(`Synced ${fmtNumber(sent)} sends → Capacity (${range})`);
-  }
 
   function refresh() {
     qc.invalidateQueries({ queryKey: ["inst"] });
@@ -198,37 +197,13 @@ export default function Instantly() {
             <StatCard label="Bounce rate" value={`${rate(bounced, sent).toFixed(1)}%`} tone={rate(bounced, sent) > 3 ? "danger" : "white"} icon={<AlertTriangle size={18} />} />
           </div>
 
-          {/* Sending volume vs plan + account health */}
+          {/* Live sending vs mailbox + campaign limits */}
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
-            <Card className="p-5 lg:col-span-2">
-              <div className="mb-3 flex items-center justify-between">
-                <h3 className="flex items-center gap-2 text-lg">
-                  <Gauge size={18} /> Sending volume vs plan
-                </h3>
-                <button className="btn-ghost btn-sm" onClick={syncToCapacity}>
-                  Sync → Capacity
-                </button>
-              </div>
-              {monthlyCap > 0 ? (
-                <>
-                  <div className="mb-1 flex justify-between text-sm font-semibold">
-                    <span>
-                      {fmtNumber(sent)} sent ({range}) of {fmtNumber(monthlyCap)} / mo cap
-                    </span>
-                    <span>{fmtPercent(rate(sent, monthlyCap))}</span>
-                  </div>
-                  <ProgressBar value={sent} max={monthlyCap} color="#3F6BFF" height={18} />
-                  <p className="mt-2 text-sm text-muted">
-                    {rate(sent, monthlyCap) < 60
-                      ? "You have unused monthly capacity — add leads or sequences to use it."
-                      : "You're using most of your plan — watch the cap before it throttles sends."}
-                  </p>
-                </>
-              ) : (
-                <p className="text-sm text-muted">Add an "Instantly" sending limit on the Capacity page to track plan usage.</p>
-              )}
-            </Card>
+            <SendingHealthCard cap={cap} settings={settings} />
+          </div>
 
+          {/* Account health */}
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
             <Card className="p-5">
               <h3 className="mb-3 flex items-center gap-2 text-lg">
                 <Flame size={18} /> Mailbox health
@@ -346,7 +321,9 @@ export default function Instantly() {
                   [
                     ["Analytics overview", overviewQ.data],
                     ["Campaign analytics", campQ.data],
-                    ["Accounts", acctQ.data],
+                    ["Accounts (check daily_limit)", acctQ.data],
+                    ["Campaign list (check daily_limit)", campListQ.data],
+                    ["Daily sends (check date + sent keys)", dailyQ.data],
                   ] as [string, InstantlyResult | undefined][]
                 ).map(([label, res]) => (
                   <div key={label}>

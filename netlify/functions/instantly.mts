@@ -10,6 +10,10 @@ const GET_RESOURCES: Record<string, string> = {
   campaigns: "/campaigns",
   "analytics-overview": "/campaigns/analytics/overview",
   "analytics-campaigns": "/campaigns/analytics",
+  // Per-day send buckets — powers the sending-health metric. Deliberately kept
+  // out of the auto-limit branch below: a `limit` on a date-range endpoint
+  // would silently truncate the series.
+  "analytics-daily": "/campaigns/analytics/daily",
 };
 
 const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", "starting_after"];
