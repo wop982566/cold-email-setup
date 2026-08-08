@@ -46,6 +46,47 @@ export interface PlannerMailbox {
   groups: string[];
   shareCount: number; // active campaigns sharing this mailbox
   idle: boolean; // connected but attached to no active campaign
+  // Dropped because it falls outside the "inboxes I'm actually using" count,
+  // rather than being excluded by hand.
+  beyondCount: boolean;
+}
+
+/**
+ * Picks the N mailboxes most plausibly in use, when the operator has told us
+ * they only run campaigns from some of their connected inboxes. Ranking is
+ * deterministic: attached to an active campaign first, then the bigger daily
+ * limit, then alphabetical. Returns the set to KEEP.
+ */
+export function rankAndTrim<T extends { email: string; dailyLimit: number }>(
+  boxes: T[],
+  attached: Set<string>,
+  count: number,
+): Set<string> {
+  if (!count || count <= 0 || count >= boxes.length) {
+    return new Set(boxes.map((b) => b.email));
+  }
+  const ranked = [...boxes].sort((a, b) => {
+    const aA = attached.has(a.email) ? 1 : 0;
+    const bA = attached.has(b.email) ? 1 : 0;
+    if (aA !== bA) return bA - aA;
+    if (a.dailyLimit !== b.dailyLimit) return b.dailyLimit - a.dailyLimit;
+    return a.email.localeCompare(b.email);
+  });
+  return new Set(ranked.slice(0, count).map((b) => b.email));
+}
+
+/** Emails attached to at least one ACTIVE campaign, from `email_list`. */
+export function attachedEmails(campaignsData: unknown): Set<string> {
+  const out = new Set<string>();
+  for (const c of asItems<Obj>(campaignsData)) {
+    if (!isActiveCampaign(c)) continue;
+    const list = Array.isArray(c.email_list) ? (c.email_list as unknown[]) : [];
+    for (const e of list) {
+      const email = String(e ?? "").trim().toLowerCase();
+      if (email) out.add(email);
+    }
+  }
+  return out;
 }
 
 export interface PlannerCampaign {
@@ -116,6 +157,10 @@ export interface Plan {
   idleMailboxes: PlannerMailbox[];
   excludedCount: number;
   usableInboxes: number;
+  connectedInboxes: number; // active in Instantly, before any manual trimming
+  attachedInboxes: number; // attached to at least one active campaign
+  beyondCountInboxes: number; // dropped by the "inboxes I'm using" count
+  activeInboxCount: number; // the configured count (0 = use all)
   perBoxCap: number;
   totalDemand: number;
   totalSupply: number;
@@ -157,6 +202,11 @@ function mode(nums: number[]): number {
 
 function rate(n: number, d: number): number {
   return d > 0 ? (n / d) * 100 : 0;
+}
+
+/** A mailbox whose capacity actually counts towards supply. */
+function inUse(b: PlannerMailbox | undefined): b is PlannerMailbox {
+  return Boolean(b && b.active && !b.excluded && !b.beyondCount);
 }
 
 // "AEO - US SaaS" -> "AEO". Splits on the separators operators actually use in
@@ -225,8 +275,19 @@ export function computePlan({
       groups: [],
       shareCount: 0,
       idle: false,
+      beyondCount: false,
     });
   }
+
+  // "I only run campaigns from 12 of my 20 inboxes" — keep the N most clearly
+  // in-use mailboxes and ignore the rest. Explicit per-mailbox exclusions still
+  // win, so the count only ever trims what's left.
+  const candidates = Array.from(boxes.values()).filter((b) => b.active && !b.excluded);
+  const attached = attachedEmails(campaignsData);
+  const activeInboxCount = Math.max(0, Math.floor(settings.planner_active_inbox_count ?? 0));
+  const keep = rankAndTrim(candidates, attached, activeInboxCount);
+  for (const b of candidates) b.beyondCount = !keep.has(b.email);
+  const attachedInboxes = candidates.filter((b) => attached.has(b.email)).length;
 
   // --- Campaigns + linkage --------------------------------------------------
   const rawCampaigns = asItems<Obj>(campaignsData);
@@ -273,14 +334,14 @@ export function computePlan({
     if (!p.active) continue;
     for (const email of p.emails) {
       const box = boxes.get(email);
-      if (!box || box.excluded || !box.active) continue;
+      if (!inUse(box)) continue;
       box.campaignIds.push(p.id);
       if (!box.groups.includes(p.group)) box.groups.push(p.group);
       box.shareCount++;
     }
   }
   for (const box of boxes.values()) {
-    box.idle = box.active && !box.excluded && box.shareCount === 0;
+    box.idle = inUse(box) && box.shareCount === 0;
   }
 
   // --- Per-campaign figures -------------------------------------------------
@@ -288,7 +349,7 @@ export function computePlan({
     let supply = 0;
     for (const email of p.emails) {
       const box = boxes.get(email);
-      if (!box || box.excluded || !box.active) continue;
+      if (!inUse(box)) continue;
       // Fair share: a mailbox in 3 campaigns contributes a third to each.
       supply += box.shareCount > 0 ? box.dailyLimit / box.shareCount : box.dailyLimit;
     }
@@ -314,10 +375,7 @@ export function computePlan({
       dailyMaxLeads: p.dailyMaxLeads,
       prioritizeNewLeads: p.prioritizeNewLeads,
       emails: p.emails,
-      mailboxCount: p.emails.filter((e) => {
-        const b = boxes.get(e);
-        return b && b.active && !b.excluded;
-      }).length,
+      mailboxCount: p.emails.filter((e) => inUse(boxes.get(e))).length,
       supplyDaily: supply,
       gapDaily: Math.max(0, p.dailyLimit - supply),
       leadsTotal,
@@ -336,7 +394,7 @@ export function computePlan({
   });
 
   const mailboxes = Array.from(boxes.values());
-  const usable = mailboxes.filter((b) => b.active && !b.excluded);
+  const usable = mailboxes.filter((b) => inUse(b));
   const perBoxCap =
     mode(usable.map((b) => b.dailyLimit)) || Math.max(0, settings.per_mailbox_daily_limit);
 
@@ -357,7 +415,7 @@ export function computePlan({
     for (const c of activeList) for (const e of c.emails) emails.add(e);
     const groupBoxes = Array.from(emails)
       .map((e) => boxes.get(e))
-      .filter((b): b is PlannerMailbox => Boolean(b) && b!.active && !b!.excluded);
+      .filter((b): b is PlannerMailbox => inUse(b));
     const shared = groupBoxes.filter((b) => b.groups.length > 1).length;
     const gap = Math.max(0, demandDaily - supplyDaily);
     const inboxesNeeded = perBoxCap > 0 ? Math.ceil(gap / perBoxCap) : 0;
@@ -494,6 +552,10 @@ export function computePlan({
     idleMailboxes,
     excludedCount: excluded.size,
     usableInboxes: usable.length,
+    connectedInboxes: candidates.length,
+    attachedInboxes,
+    beyondCountInboxes: candidates.filter((b) => b.beyondCount).length,
+    activeInboxCount,
     perBoxCap,
     totalDemand,
     totalSupply,

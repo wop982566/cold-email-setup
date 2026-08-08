@@ -245,6 +245,10 @@ export interface AppSettings {
   accent: string;
   // --- Campaign planner ----------------------------------------------------
   excluded_mailboxes: string[]; // lowercased emails ignored by the planner + sending health
+  // How many inboxes you're ACTUALLY running campaigns from. 0 = use every
+  // connected mailbox. When set, the planner keeps the N most clearly in-use
+  // mailboxes (campaign-attached first) and ignores the rest.
+  planner_active_inbox_count: number;
   campaign_group_overrides: Record<string, string>; // instantly campaign id -> group key
   planner_goal_kind: "emails" | "leads";
   planner_goal_value: number;
@@ -263,6 +267,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ai_enabled: true,
   accent: "#FF90E8",
   excluded_mailboxes: [],
+  planner_active_inbox_count: 0,
   campaign_group_overrides: {},
   planner_goal_kind: "emails",
   planner_goal_value: 500,

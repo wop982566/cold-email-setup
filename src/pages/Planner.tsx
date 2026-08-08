@@ -217,6 +217,67 @@ export default function Planner() {
         />
       </div>
 
+      {/* How many inboxes are actually in play */}
+      <Card className="p-5">
+        <h3 className="mb-1 flex items-center gap-2 text-lg">
+          <Inbox size={18} /> Inboxes in use
+        </h3>
+        <p className="mb-3 text-xs text-muted">
+          Instantly has {p.connectedInboxes} active inbox{p.connectedInboxes === 1 ? "" : "es"}
+          {p.attachedInboxes > 0 ? `, ${p.attachedInboxes} attached to a running campaign` : ""}. If
+          you only send from some of them, set the number here and the planner will ignore the rest.
+        </p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <p className="label">Inboxes I'm using</p>
+            <input
+              type="number"
+              min={0}
+              max={p.connectedInboxes}
+              className="input w-28"
+              defaultValue={p.activeInboxCount || ""}
+              placeholder={`All (${p.connectedInboxes})`}
+              key={p.activeInboxCount}
+              onBlur={(e) =>
+                void patchSettings({ planner_active_inbox_count: Math.max(0, Number(e.target.value) || 0) })
+              }
+            />
+          </div>
+          <button
+            className="btn-ghost btn-sm"
+            onClick={() => void patchSettings({ planner_active_inbox_count: 0 })}
+          >
+            Use all {p.connectedInboxes}
+          </button>
+          {p.attachedInboxes > 0 && p.attachedInboxes < p.connectedInboxes ? (
+            <button
+              className="btn-ghost btn-sm"
+              onClick={() => void patchSettings({ planner_active_inbox_count: p.attachedInboxes })}
+            >
+              Only campaign-attached ({p.attachedInboxes})
+            </button>
+          ) : null}
+        </div>
+        <p className="mt-3 rounded-xl border-2 border-ink bg-canvas p-3 text-sm">
+          {p.activeInboxCount > 0 ? (
+            <>
+              Counting <span className="font-extrabold">{p.usableInboxes}</span> of{" "}
+              {p.connectedInboxes} inboxes
+              {p.beyondCountInboxes > 0 ? ` — ${p.beyondCountInboxes} ignored` : ""}
+              {p.excludedCount > 0 ? ` · ${p.excludedCount} excluded by hand` : ""}. Kept the ones
+              attached to running campaigns first.
+            </>
+          ) : (
+            <>
+              Counting all <span className="font-extrabold">{p.usableInboxes}</span> connected inbox
+              {p.usableInboxes === 1 ? "" : "es"}
+              {p.excludedCount > 0 ? ` (${p.excludedCount} excluded by hand)` : ""}.
+            </>
+          )}{" "}
+          Untick individual mailboxes below for exact control.
+        </p>
+      </Card>
+
       {/* Goal planner */}
       <Card className="p-5">
         <h3 className="mb-3 flex items-center gap-2 text-lg">
@@ -375,7 +436,10 @@ export default function Planner() {
               </thead>
               <tbody>
                 {p.mailboxes.map((b) => (
-                  <tr key={b.email} className={cn("border-b border-ink/10", b.excluded && "opacity-50")}>
+                  <tr
+                    key={b.email}
+                    className={cn("border-b border-ink/10", (b.excluded || b.beyondCount) && "opacity-50")}
+                  >
                     <td className="px-3 py-2">
                       <input
                         type="checkbox"
@@ -398,6 +462,8 @@ export default function Planner() {
                         <Badge tone="white">
                           <Ban size={11} /> excluded
                         </Badge>
+                      ) : b.beyondCount ? (
+                        <Badge tone="white">not in use</Badge>
                       ) : b.idle ? (
                         <Badge tone="sun">idle</Badge>
                       ) : b.warmingUp ? (

@@ -13,6 +13,7 @@
 import { AppSettings } from "./types";
 import { CapacityResult } from "./capacity";
 import { asItems, pick } from "./instantly";
+import { attachedEmails, rankAndTrim } from "./campaignPlan";
 
 // Instantly's payloads vary by workspace and endpoint version, so every read
 // goes through a candidate list (same approach as the Instantly page).
@@ -197,20 +198,37 @@ export function computeSendingHealth({
       !excluded.has(String(a.email ?? "").trim().toLowerCase()),
   );
 
-  let liveMailboxDaily = 0;
+  // Resolve each mailbox's effective limit first, so the "inboxes I'm actually
+  // using" count can rank by it.
   let mailboxesMissingLimit = 0;
   let mailboxesZeroLimit = 0;
-  const perBoxLimits: number[] = [];
-  for (const a of active) {
+  const resolved = active.map((a) => {
     const lim = limitOf(a, F.acctDailyLimit);
     if (lim === MISSING) mailboxesMissingLimit++;
     else if (lim === 0) mailboxesZeroLimit++;
-    const eff = lim === MISSING ? Math.max(0, settings.per_mailbox_daily_limit) : lim;
-    liveMailboxDaily += eff;
-    perBoxLimits.push(eff);
+    return {
+      email: String(a.email ?? "").trim().toLowerCase(),
+      dailyLimit: lim === MISSING ? Math.max(0, settings.per_mailbox_daily_limit) : lim,
+    };
+  });
+
+  // Same trimming rule as the planner, so the Dashboard card and the planner
+  // can never disagree on how many inboxes are in play.
+  const keep = rankAndTrim(
+    resolved,
+    attachedEmails(campaignsData),
+    Math.max(0, Math.floor(settings.planner_active_inbox_count ?? 0)),
+  );
+  const counted = resolved.filter((r) => keep.has(r.email));
+
+  let liveMailboxDaily = 0;
+  const perBoxLimits: number[] = [];
+  for (const r of counted) {
+    liveMailboxDaily += r.dailyLimit;
+    perBoxLimits.push(r.dailyLimit);
   }
 
-  const liveMailboxes = active.length;
+  const liveMailboxes = counted.length;
   const perMailboxLive = liveMailboxes > 0 ? liveMailboxDaily / liveMailboxes : 0;
   // Mode, not mean: one paused box at 0 would drag the mean down and fabricate
   // a deficit that doesn't exist.
