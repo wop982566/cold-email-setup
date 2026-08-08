@@ -100,12 +100,12 @@ export default function Dashboard() {
           <div className="flex items-center gap-3">
             <Sparkles size={20} />
             <p className="text-sm font-bold">
-              Running in local mode — data is saved in this browser and seeded with your 20 domains.
-              Connect Supabase to sync everywhere.
+              Running in local mode — data is saved in this browser only. Remove VITE_FORCE_LOCAL to use
+              the shared Netlify Blobs store instead.
             </p>
           </div>
           <Link to="/settings" className="btn-dark btn-sm shrink-0">
-            Connect Supabase
+            Settings
           </Link>
         </Card>
       ) : null}

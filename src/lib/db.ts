@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
 // Repository layer with two interchangeable backends:
-//   • Supabase  — used when VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY are set
-//   • Local     — browser localStorage, pre-seeded, used otherwise
+//   • Server — Netlify Blobs via the /data function (default; persists across
+//              devices, nothing to configure)
+//   • Local  — browser localStorage, pre-seeded (when VITE_FORCE_LOCAL=true)
 // Both expose the same async API so the rest of the app never branches on it.
 // ---------------------------------------------------------------------------
-import { isSupabaseConfigured, supabase } from "./supabase";
 import {
   AppSettings,
   DEFAULT_SETTINGS,
@@ -28,13 +28,6 @@ export type Row = { id: string; [key: string]: unknown };
 // Records used across the app have a string id but typed fields (no index
 // signature), so the public API constrains on this looser shape.
 export type WithId = { id: string };
-
-// Split an array into chunks (Supabase .in() URLs and upsert bodies have limits).
-function chunk<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
 
 function seedFor(table: TableName): Row[] {
   switch (table) {
@@ -60,7 +53,7 @@ function seedFor(table: TableName): Row[] {
 }
 
 export interface Repo {
-  mode: "supabase" | "local";
+  mode: "server" | "local";
   list<T extends WithId>(table: TableName): Promise<T[]>;
   insert<T extends WithId>(table: TableName, row: Partial<T>): Promise<T>;
   insertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<T[]>;
@@ -216,104 +209,128 @@ const localRepo: Repo = {
 };
 
 // --------------------------------------------------------------------------
-// Supabase adapter
+// Server adapter — Netlify Blobs via the /data function.
+// No external database, nothing to pause, persists across devices.
 // --------------------------------------------------------------------------
-const supabaseRepo: Repo = {
-  mode: "supabase",
-  async list<T extends WithId>(table: TableName): Promise<T[]> {
-    // PostgREST caps a single select at ~1000 rows. Page through with the
-    // exact count so large tables (thousands of leads) load completely.
-    const PAGE = 1000;
-    const first = await supabase!.from(table).select("*", { count: "exact" }).range(0, PAGE - 1);
-    if (first.error) throw first.error;
-    const out = (first.data ?? []) as T[];
-    const total = first.count ?? out.length;
-    while (out.length < total) {
-      const { data, error } = await supabase!
-        .from(table)
-        .select("*")
-        .range(out.length, out.length + PAGE - 1);
-      if (error) throw error;
-      const batch = (data ?? []) as T[];
-      if (batch.length === 0) break; // safety: nothing more to fetch
-      out.push(...batch);
+const FN = "/.netlify/functions/data";
+const APP_TOKEN = import.meta.env.VITE_APP_TOKEN as string | undefined;
+
+function apiHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (APP_TOKEN) h["x-app-token"] = APP_TOKEN;
+  return h;
+}
+
+async function api<T = unknown>(opts: { method: "GET" | "POST"; query?: string; body?: unknown }): Promise<T> {
+  const res = await fetch(FN + (opts.query ? `?${opts.query}` : ""), {
+    method: opts.method,
+    headers: apiHeaders(),
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  let data: unknown = null;
+  try {
+    data = await res.json();
+  } catch {
+    /* non-JSON (e.g. function missing) */
+  }
+  const d = data as { ok?: boolean; error?: string } | null;
+  if (!res.ok || (d && d.ok === false)) {
+    throw new Error(d?.error || `Data request failed (HTTP ${res.status})`);
+  }
+  return data as T;
+}
+
+// Seed the store once (first run) with the same starter data local mode uses.
+let seedPromise: Promise<void> | null = null;
+function ensureServerSeeded(): Promise<void> {
+  if (!seedPromise) {
+    // Seed the infrastructure tables (domains, capacity, costs, campaigns,
+    // playbooks) but NOT the leads area — the operator imports real leads, so
+    // starting with demo leads/lists would just get in the way.
+    const skipSeed: TableName[] = [TABLES.leads, TABLES.leadLists];
+    const tables: Record<string, Row[]> = {};
+    for (const table of Object.values(TABLES)) {
+      if (table === TABLES.settings || skipSeed.includes(table)) continue;
+      tables[table] = seedFor(table as TableName);
     }
-    return out;
+    seedPromise = api({ method: "POST", body: { op: "seedIfEmpty", tables, settings: seedSettings } })
+      .then(() => undefined)
+      .catch((e) => {
+        seedPromise = null; // don't cache a failed seed — allow retry
+        throw e;
+      });
+  }
+  return seedPromise;
+}
+
+const serverRepo: Repo = {
+  mode: "server",
+  async list<T extends WithId>(table: TableName): Promise<T[]> {
+    await ensureServerSeeded();
+    const { rows } = await api<{ rows: T[] }>({ method: "GET", query: `table=${encodeURIComponent(table)}` });
+    return rows ?? [];
   },
   async insert<T extends WithId>(table: TableName, row: Partial<T>): Promise<T> {
-    const payload = { id: (row.id as string) ?? uuid(), ...row };
-    const { data, error } = await supabase!.from(table).insert(payload).select().single();
-    if (error) throw error;
-    return data as T;
+    await ensureServerSeeded();
+    const payload = { id: (row.id as string) ?? uuid(), created_at: new Date().toISOString(), ...row };
+    const { row: saved } = await api<{ row: T }>({ method: "POST", body: { op: "insert", table, row: payload } });
+    return saved;
   },
   async insertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<T[]> {
-    const payload = rows.map((r) => ({ id: (r.id as string) ?? uuid(), ...r }));
-    const { data, error } = await supabase!.from(table).insert(payload).select();
-    if (error) throw error;
-    return (data ?? []) as T[];
+    await ensureServerSeeded();
+    const ts = new Date().toISOString();
+    const payload = rows.map((r) => ({ id: (r.id as string) ?? uuid(), created_at: ts, ...r }));
+    await api({ method: "POST", body: { op: "insertMany", table, rows: payload } });
+    return payload as unknown as T[];
   },
   async update<T extends WithId>(table: TableName, id: string, patch: Partial<T>): Promise<T> {
-    const { data, error } = await supabase!
-      .from(table)
-      .update(patch as Record<string, unknown>)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) throw error;
-    return data as T;
+    await ensureServerSeeded();
+    const { row } = await api<{ row: T }>({
+      method: "POST",
+      body: { op: "update", table, id, patch: { ...patch, updated_at: new Date().toISOString() } },
+    });
+    return row;
   },
   async updateMany<T extends WithId>(table: TableName, ids: string[], patch: Partial<T>): Promise<void> {
-    // Chunk ids — a single .in() with thousands of ids overflows the URL.
-    for (const batch of chunk(ids, 200)) {
-      const { error } = await supabase!
-        .from(table)
-        .update(patch as Record<string, unknown>)
-        .in("id", batch);
-      if (error) throw error;
-    }
+    await ensureServerSeeded();
+    await api({
+      method: "POST",
+      body: { op: "updateMany", table, ids, patch: { ...patch, updated_at: new Date().toISOString() } },
+    });
   },
   async upsertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<void> {
-    for (const batch of chunk(rows, 500)) {
-      const { error } = await supabase!
-        .from(table)
-        .upsert(batch as Record<string, unknown>[], { onConflict: "id" });
-      if (error) throw error;
-    }
+    await ensureServerSeeded();
+    await api({ method: "POST", body: { op: "upsertMany", table, rows } });
   },
   async remove(table: TableName, id: string): Promise<void> {
-    const { error } = await supabase!.from(table).delete().eq("id", id);
-    if (error) throw error;
+    await ensureServerSeeded();
+    await api({ method: "POST", body: { op: "remove", table, id } });
   },
   async removeMany(table: TableName, ids: string[]): Promise<void> {
-    for (const batch of chunk(ids, 200)) {
-      const { error } = await supabase!.from(table).delete().in("id", batch);
-      if (error) throw error;
-    }
+    await ensureServerSeeded();
+    await api({ method: "POST", body: { op: "removeMany", table, ids } });
   },
   async getSettings(): Promise<AppSettings> {
-    const { data, error } = await supabase!
-      .from(TABLES.settings)
-      .select("value")
-      .eq("id", "app")
-      .maybeSingle();
-    if (error) throw error;
-    const value = (data?.value as Partial<AppSettings>) ?? {};
-    return { ...DEFAULT_SETTINGS, ...value };
+    await ensureServerSeeded();
+    const { value } = await api<{ value: Partial<AppSettings> | null }>({
+      method: "POST",
+      body: { op: "getSettings" },
+    });
+    return { ...DEFAULT_SETTINGS, ...(value ?? {}) };
   },
   async saveSettings(s: AppSettings): Promise<AppSettings> {
-    const { error } = await supabase!
-      .from(TABLES.settings)
-      .upsert({ id: "app", value: s });
-    if (error) throw error;
+    await ensureServerSeeded();
+    await api({ method: "POST", body: { op: "saveSettings", value: s } });
     return s;
   },
   async ping(): Promise<void> {
-    // Cheap round-trip that surfaces the real connection/schema/RLS error.
-    const { error } = await supabase!.from(TABLES.domains).select("id").limit(1);
-    if (error) throw error;
+    await api({ method: "GET", query: "ping=1" });
   },
 };
 
-export const db: Repo = isSupabaseConfigured ? supabaseRepo : localRepo;
+// Default to the server (Netlify Blobs) backend. Set VITE_FORCE_LOCAL=true to
+// use browser localStorage instead (e.g. plain `vite dev` without functions).
+const forceLocal = (import.meta.env.VITE_FORCE_LOCAL as string | undefined) === "true";
+export const db: Repo = forceLocal ? localRepo : serverRepo;
 export const dbMode = db.mode;
 export { uuid };

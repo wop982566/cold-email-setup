@@ -33,7 +33,6 @@ import {
   TABLES,
 } from "../lib/types";
 import { db, dbMode } from "../lib/db";
-import { supabaseInfo } from "../lib/supabase";
 import { download, uuid, slugify } from "../lib/utils";
 
 const CURRENCIES = ["USD", "EUR", "GBP", "INR", "CAD", "AUD"];
@@ -108,32 +107,26 @@ export default function Settings() {
       {/* Database / connection */}
       <Card className="p-5">
         <h2 className="mb-2 flex items-center gap-2 text-lg">
-          {dbMode === "supabase" ? <Database size={18} /> : <HardDrive size={18} />} Database & connection
+          {dbMode === "server" ? <Database size={18} /> : <HardDrive size={18} />} Data storage
         </h2>
-        {dbMode === "supabase" ? (
+        {dbMode === "server" ? (
           <div className="space-y-2">
-            <Badge tone="mint">Connected to Supabase</Badge>
-            <p className="text-sm text-muted">Project URL: <code>{supabaseInfo.url}</code></p>
+            <Badge tone="mint">Netlify Blobs (server)</Badge>
+            <p className="text-sm text-muted">
+              Data is stored server-side in Netlify Blobs — no external database, nothing to pause, and it persists
+              across devices. Nothing to configure: it works automatically on any Git-based Netlify deploy.
+            </p>
+            <p className="text-xs text-muted">
+              Tip: a manual drag-and-drop zip deploy doesn't enable Blobs or Functions — deploy from Git.
+            </p>
           </div>
         ) : (
-          <div className="space-y-3">
+          <div className="space-y-2">
             <Badge tone="sun">Local mode</Badge>
             <p className="text-sm">
-              Data is stored in this browser only. To sync across devices and make it permanent, connect Supabase.
+              Data is stored in this browser only (VITE_FORCE_LOCAL is set). Remove that env var to use the shared
+              Netlify Blobs store.
             </p>
-            <div className="rounded-xl border-2 border-ink bg-canvas p-4">
-              <p className="mb-2 flex items-center gap-2 font-bold">
-                <KeyRound size={16} /> To connect Supabase, set these and redeploy:
-              </p>
-              <pre className="overflow-x-auto rounded-lg border-2 border-ink bg-white p-3 text-xs">
-{`VITE_SUPABASE_URL=https://<project-ref>.supabase.co
-VITE_SUPABASE_ANON_KEY=<anon public key>`}
-              </pre>
-              <p className="mt-2 text-xs text-muted">
-                Run the SQL in <code>supabase/migrations</code> first to create the tables and seed your 20 domains.
-                See the README for the full step-by-step.
-              </p>
-            </div>
           </div>
         )}
       </Card>
@@ -158,8 +151,6 @@ VITE_SUPABASE_ANON_KEY=<anon public key>`}
             </thead>
             <tbody>
               {[
-                ["VITE_SUPABASE_URL", "Build", "Supabase database (project URL)"],
-                ["VITE_SUPABASE_ANON_KEY", "Build", "Supabase database (anon public key)"],
                 ["ANTHROPIC_API_KEY", "Functions", "Claude — sequences + lead analysis/classification"],
                 ["ANTHROPIC_MODEL", "Functions", "Optional — defaults to claude-opus-4-8"],
                 ["INSTANTLY_API_KEY", "Functions", "Instantly v2 key (read scopes) — live insights"],

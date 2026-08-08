@@ -83,21 +83,18 @@ function NavItems({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function ModeBadge() {
-  const isSupabase = dbMode === "supabase";
+  const isServer = dbMode === "server";
   return (
     <span
-      className={cn(
-        "badge",
-        isSupabase ? "bg-mint text-white" : "bg-sun",
-      )}
+      className={cn("badge", isServer ? "bg-mint text-white" : "bg-sun")}
       title={
-        isSupabase
-          ? "Connected to Supabase"
-          : "Local mode — data lives in your browser until Supabase is connected"
+        isServer
+          ? "Data is stored server-side in Netlify Blobs (persists across devices)"
+          : "Local mode — data lives in this browser only"
       }
     >
-      {isSupabase ? <Database size={12} /> : <HardDrive size={12} />}
-      {isSupabase ? "Supabase" : "Local mode"}
+      {isServer ? <Database size={12} /> : <HardDrive size={12} />}
+      {isServer ? "Cloud" : "Local mode"}
     </span>
   );
 }
@@ -130,45 +127,39 @@ function ReminderBell() {
   );
 }
 
-// Turn a raw Supabase error into a likely cause + fix.
+// Turn a raw data-store error into a likely cause + fix.
 function diagnoseDbError(msg: string): { cause: string; fix: string } {
   const m = msg.toLowerCase();
-  if (/failed to fetch|networkerror|load failed|fetch/.test(m)) {
+  if (/failed to fetch|networkerror|load failed|http 404|not found|fetch/.test(m)) {
     return {
-      cause: "Your app can't reach the Supabase project.",
-      fix: "Free-tier projects pause after inactivity — open your Supabase dashboard and resume it. Also confirm VITE_SUPABASE_URL is correct and redeploy.",
+      cause: "The data function isn't reachable.",
+      fix: "On Netlify, check that the deploy succeeded and Functions are enabled. Running locally? Use `netlify dev` (plain `vite` has no functions), or set VITE_FORCE_LOCAL=true for browser storage.",
     };
   }
-  if (/does not exist|relation|could not find the table|schema cache/.test(m)) {
+  if (/blob|store|getstore/.test(m)) {
     return {
-      cause: "The database tables aren't there yet.",
-      fix: "Run the SQL migrations (supabase/migrations 0001–0004) in the Supabase SQL editor, then reload.",
+      cause: "Netlify Blobs isn't available for this deploy.",
+      fix: "Deploy from Git on Netlify (Blobs is automatic there). A manual drag-and-drop zip deploy doesn't enable Blobs or functions.",
     };
   }
-  if (/permission denied|row-level security|rls/.test(m)) {
+  if (/unauthorized|401|token/.test(m)) {
     return {
-      cause: "Row-Level Security is blocking reads.",
-      fix: "Apply the anon access policy from migration 0001 (the `anon_all` policy), then reload.",
+      cause: "The function rejected the request (token mismatch).",
+      fix: "If you set APP_FUNCTION_TOKEN, make sure VITE_APP_TOKEN matches it, then redeploy.",
     };
   }
-  if (/jwt|api key|invalid|unauthorized|401|apikey/.test(m)) {
-    return {
-      cause: "The Supabase anon key is wrong or expired.",
-      fix: "Copy the current anon/public key from Supabase → Project Settings → API into VITE_SUPABASE_ANON_KEY and redeploy.",
-    };
-  }
-  return { cause: "The database returned an error.", fix: "Check the message below against your Supabase project settings." };
+  return { cause: "The data store returned an error.", fix: "See the message below; check the Netlify function logs for detail." };
 }
 
 function DbHealthBanner() {
   const { isError, error, isLoading } = useDbHealth();
-  if (dbMode !== "supabase" || isLoading || !isError) return null;
+  if (dbMode !== "server" || isLoading || !isError) return null;
   const msg = error instanceof Error ? error.message : String(error);
   const { cause, fix } = diagnoseDbError(msg);
   return (
     <div className="mb-4 rounded-xl border-2 border-ink bg-danger/15 p-3 text-sm">
       <p className="flex items-center gap-2 font-extrabold">
-        <AlertTriangle size={16} /> Can't read from your database — that's why everything shows 0.
+        <AlertTriangle size={16} /> Can't reach your data store — that's why everything shows 0.
       </p>
       <p className="mt-1">
         <span className="font-bold">Likely cause:</span> {cause}

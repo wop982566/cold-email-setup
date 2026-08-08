@@ -110,13 +110,12 @@ function leadTitle(l: Lead): string {
   return l.title || customValue(l, ["title", "job title", "position", "role", "headline"]);
 }
 
-// Turn a mutation failure into a useful message — notably catching the case
-// where the Supabase project hasn't had migration 0004 applied yet.
+// Turn a mutation failure into a useful message.
 function explainError(e: unknown): string {
   const anyE = e as { message?: string };
   const msg = anyE?.message ?? (typeof e === "string" ? e : "Something went wrong");
-  if (/column/i.test(msg) && /(discarded|category|relevance)/i.test(msg)) {
-    return "Your database is missing the new lead columns. Run migration 0004 in Supabase (SQL editor), then retry.";
+  if (/failed to fetch|http 404|not found/i.test(msg)) {
+    return "Can't reach the data store. On Netlify, check the deploy/function logs; locally use `netlify dev`.";
   }
   return msg;
 }
@@ -456,7 +455,7 @@ export default function Leads() {
       const quota = /quota|exceeded/i.test(msg) || (e as { name?: string })?.name === "QuotaExceededError";
       throw new Error(
         quota
-          ? `Browser storage is full at this size. ${dbMode === "local" ? "Connect Supabase" : "Import a smaller batch"} for large lists.`
+          ? `Browser storage is full at this size. ${dbMode === "local" ? "Remove VITE_FORCE_LOCAL to use the server store" : "Import a smaller batch"} for large lists.`
           : msg,
       );
     }
