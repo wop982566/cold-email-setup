@@ -6,6 +6,7 @@ import { Spinner } from "./components/ui/primitives";
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Domains = lazy(() => import("./pages/Domains"));
 const Capacity = lazy(() => import("./pages/Capacity"));
+const Planner = lazy(() => import("./pages/Planner"));
 const Leads = lazy(() => import("./pages/Leads"));
 const Sequences = lazy(() => import("./pages/Sequences"));
 const Instantly = lazy(() => import("./pages/Instantly"));
@@ -47,6 +48,14 @@ export default function App() {
           element={
             <Suspense fallback={<Loading />}>
               <Capacity />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/planner"
+          element={
+            <Suspense fallback={<Loading />}>
+              <Planner />
             </Suspense>
           }
         />

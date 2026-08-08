@@ -80,6 +80,9 @@ export const instantly = {
   // siblings — the payload may be a bare array or {items:[…]}, which asItems()
   // absorbs.
   analyticsDaily: (days = 30) => call("analytics-daily", daysParams(days)),
+  // Single campaign — used only when the list payload omits email_list, which
+  // is the campaign -> mailbox linkage the planner is built on.
+  campaignDetail: (id: string) => call("campaign-detail", { id }),
   warmup: async (emails: string[]): Promise<InstantlyResult> => {
     try {
       const res = await fetch("/.netlify/functions/instantly?resource=warmup", {

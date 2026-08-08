@@ -112,6 +112,46 @@ export default async (req: Request): Promise<Response> => {
       return json({ ok: true, data: { items: out, count: out.length, truncated } });
     }
 
+    // Single campaign, by path id. Used as a fallback when the /campaigns list
+    // payload omits email_list (the campaign -> mailbox linkage).
+    if (resource === "campaign-detail") {
+      const id = url.searchParams.get("id");
+      if (!id) return json({ ok: false, error: "Missing id" }, 400);
+      const res = await fetch(`${BASE}/campaigns/${encodeURIComponent(id)}`, { headers: auth });
+      const data = await res.json();
+      if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+      return json({ ok: true, data });
+    }
+
+    // Accounts and campaigns paginate at 100/page. The planner counts mailboxes
+    // per campaign, so a silent truncation would tell the operator to buy
+    // inboxes they already own — page through the whole list instead.
+    if (resource === "accounts" || resource === "campaigns") {
+      const path = GET_RESOURCES[resource];
+      const out: unknown[] = [];
+      let startingAfter: string | undefined;
+      let truncated = false;
+      const started = Date.now();
+      const MAX_PAGES = 50; // 5k records
+      for (let i = 0; i < MAX_PAGES; i++) {
+        const qs = new URLSearchParams({ limit: "100" });
+        if (startingAfter) qs.set("starting_after", startingAfter);
+        const res = await fetch(`${BASE}${path}?${qs}`, { headers: auth });
+        const data = await res.json();
+        if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+        const items: unknown[] = Array.isArray(data) ? data : (data?.items ?? []);
+        out.push(...items);
+        startingAfter =
+          typeof data?.next_starting_after === "string" ? data.next_starting_after : undefined;
+        if (!startingAfter || items.length === 0) break;
+        if (Date.now() - started > 8000 || i === MAX_PAGES - 1) {
+          truncated = true;
+          break;
+        }
+      }
+      return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
     // Warmup analytics is a POST with a body of emails (1-100).
     if (resource === "warmup") {
       let emails: string[] = [];
@@ -139,9 +179,6 @@ export default async (req: Request): Promise<Response> => {
     for (const p of ALLOWED_PARAMS) {
       const v = url.searchParams.get(p);
       if (v) qs.set(p, v);
-    }
-    if ((resource === "accounts" || resource === "campaigns") && !qs.get("limit")) {
-      qs.set("limit", "100");
     }
 
     const res = await fetch(`${BASE}${path}${qs.toString() ? `?${qs}` : ""}`, { headers: auth });

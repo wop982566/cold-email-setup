@@ -18,6 +18,7 @@ for domain-expiry lookups and AI enrichment.
 | **Dashboard** | KPIs, sending-capacity utilisation, domains-by-campaign, expiry alerts, setup readiness. |
 | **Domains** | Every field from your sheet (emails, expiry, registrar, DNS, forwarding, hosting account, Gravatar, Gmail send-as, Instantly, warmup). Search/filter, CSV import/export, **auto-fetch expiry** (RDAP/WHOIS) with manual fallback, per-domain mailbox limits, custom fields. |
 | **Sending Capacity** | The real ceiling = **min(mailbox capacity, SES cap, Instantly cap)**. Per-mailbox daily limits (global + per-domain overrides), bottleneck breakdown, "how many domains to max out SES", leads/month throughput. Fully editable provider limits. |
+| **Campaign Planner** | Per-campaign-group demand vs mailbox supply from live Instantly data (contention-aware), lead runway, idle mailboxes, mailbox exclusions, and a goal planner: \"to send N emails/day you need X inboxes across Y domains\". |
 | **Leads** | Master list + nested **sub-lists**, advanced filters (status, industry, score, hide-already-used), **dedupe**, bulk move/tag/status, **make sub-list from selection**, CSV import (auto-dedupes on email), **AI enrichment (ChatGPT)** + **manual enrichment**. |
 | **Costs** | Track domains, SES, Instantly, hosting, AI, etc. Monthly/annual totals, cost-per-domain, cost-per-1k-emails, spend-by-category, upcoming renewals. |
 | **Setup Playbooks** | Named, dated, step-by-step record of how a setup was built — registrar → DNS → SES → forwarding → sites → Gmail send-as → Instantly → warmup, with platforms, accounts and links. Seeded with your current 2026 setup. |
@@ -116,7 +117,8 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   default). Defaults to `claude-opus-4-8`.
 - **`/.netlify/functions/instantly`** — read-only proxy for the **Instantly v2
   API**. Whitelisted resources: `accounts`, `campaigns`, `analytics-overview`,
-  `analytics-campaigns`, `warmup`. Powers the Instantly insights page (campaign
+  `analytics-campaigns`, `analytics-daily`, `campaign-detail`, `leads`, `warmup`
+  (accounts/campaigns/leads are paginated server-side). Powers the Instantly insights page (campaign
   analytics, mailbox/warmup health, sending volume vs plan) with the key kept
   server-side.
 

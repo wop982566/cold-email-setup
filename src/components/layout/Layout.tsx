@@ -18,6 +18,7 @@ import {
   HardDrive,
   LogOut,
   AlertTriangle,
+  Target,
 } from "lucide-react";
 import { authEnabled, signOut } from "../../lib/auth";
 import { cn } from "../../lib/utils";
@@ -30,6 +31,7 @@ const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/domains", label: "Domains", icon: Globe },
   { to: "/capacity", label: "Sending Capacity", icon: Gauge },
+  { to: "/planner", label: "Campaign Planner", icon: Target },
   { to: "/leads", label: "Leads", icon: Users },
   { to: "/sequences", label: "Sequences", icon: Mail },
   { to: "/instantly", label: "Instantly", icon: Plug },

@@ -82,6 +82,10 @@ export interface SendingHealth {
   inboxesNeeded: number;
   domainsNeeded: number;
   spareDaily: number;
+  // Signed: how many more (+) or fewer (−) emails/day of inbox capacity are
+  // needed to match what the campaigns are configured to send.
+  emailDelta: number;
+  excludedMailboxes: number;
   weeklyCapacity: number;
   weeklyActual: number;
   weeklyUtilizationPct: number;
@@ -178,10 +182,19 @@ export function computeSendingHealth({
     accounts.push(a);
   }
 
+  // Mailboxes the operator has explicitly excluded (warmup-only, parked,
+  // client-owned) must not count towards capacity anywhere in the planner.
+  const excluded = new Set(
+    (settings.excluded_mailboxes ?? []).map((e) => e.trim().toLowerCase()).filter(Boolean),
+  );
+
   // "setup_pending" mailboxes are connected but not sending yet — counting them
   // would inflate supply.
   const active = accounts.filter(
-    (a) => (Number(a.status) === 1 || a.status === "active") && a.setup_pending !== true,
+    (a) =>
+      (Number(a.status) === 1 || a.status === "active") &&
+      a.setup_pending !== true &&
+      !excluded.has(String(a.email ?? "").trim().toLowerCase()),
   );
 
   let liveMailboxDaily = 0;
@@ -359,6 +372,8 @@ export function computeSendingHealth({
     inboxesNeeded,
     domainsNeeded,
     spareDaily,
+    emailDelta: campaignLimitKnown ? campaignDailyLimit - liveMailboxDaily : 0,
+    excludedMailboxes: excluded.size,
     weeklyCapacity,
     weeklyActual,
     weeklyUtilizationPct,

@@ -267,17 +267,40 @@ export function SendingHealthCard({
             </>
           ) : h.inboxesNeeded > 0 ? (
             <>
-              Add <span className="font-extrabold">{h.inboxesNeeded} inboxes</span> (≈{" "}
-              {h.domainsNeeded} domain{h.domainsNeeded === 1 ? "" : "s"}) to match your{" "}
-              {fmtNumber(h.campaignDailyLimit)}/day campaign limits.
+              You need <span className="font-extrabold">{fmtNumber(h.emailDelta)} more emails/day</span> of
+              inbox capacity to match your {fmtNumber(h.campaignDailyLimit)}/day campaign limits —{" "}
+              <span className="font-extrabold">
+                add {h.inboxesNeeded} inboxes (≈ {h.domainsNeeded} domain
+                {h.domainsNeeded === 1 ? "" : "s"})
+              </span>
+              .
             </>
           ) : (
             <>
-              Your inboxes already cover your campaign limits
-              {h.spareDaily > 0 ? ` — ${fmtNumber(h.spareDaily)}/day spare.` : "."}
+              Your inboxes cover your campaign limits
+              {h.spareDaily > 0 ? (
+                <>
+                  {" "}
+                  with <span className="font-extrabold">{fmtNumber(h.spareDaily)}/day spare</span> — raise
+                  the campaign limits to use it.
+                </>
+              ) : (
+                "."
+              )}
             </>
           )}
         </div>
+
+        <Link to="/planner" className="btn-ghost btn-sm mt-3 w-full justify-center">
+          Plan by campaign <ArrowUpRight size={14} />
+        </Link>
+
+        {h.excludedMailboxes > 0 ? (
+          <p className="mt-2 text-[11px] text-muted">
+            {h.excludedMailboxes} mailbox{h.excludedMailboxes === 1 ? "" : "es"} excluded from these
+            numbers.
+          </p>
+        ) : null}
 
         {h.hasDrift ? (
           <div className="mt-3 rounded-xl border-2 border-ink bg-sun/30 p-3 text-xs">

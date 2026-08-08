@@ -243,6 +243,11 @@ export interface AppSettings {
   default_sends_per_lead: number; // steps in a sequence per lead
   ai_enabled: boolean;
   accent: string;
+  // --- Campaign planner ----------------------------------------------------
+  excluded_mailboxes: string[]; // lowercased emails ignored by the planner + sending health
+  campaign_group_overrides: Record<string, string>; // instantly campaign id -> group key
+  planner_goal_kind: "emails" | "leads";
+  planner_goal_value: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -257,6 +262,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   default_sends_per_lead: 3,
   ai_enabled: true,
   accent: "#FF90E8",
+  excluded_mailboxes: [],
+  campaign_group_overrides: {},
+  planner_goal_kind: "emails",
+  planner_goal_value: 500,
 };
 
 // Table name constants — single source of truth.
