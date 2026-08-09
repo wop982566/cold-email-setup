@@ -32,8 +32,15 @@ const MISSING = -1; // pick() returns 0 for absent keys, so limits need a sentin
 const UNGROUPED = "Ungrouped";
 const RUNWAY_WARN_DAYS = 7;
 const BOUNCE_WARN_PCT = 3;
+const WINDOW_DAYS = 30; // the analytics range the page requests
 
 type Obj = Record<string, unknown>;
+
+/** Project a date N calendar days out, as YYYY-MM-DD. */
+function addDays(from: Date, days: number): string {
+  const capped = Math.min(days, 3650); // don't render dates a century away
+  return new Date(from.getTime() + capped * 86400000).toISOString().slice(0, 10);
+}
 
 export interface PlannerMailbox {
   email: string;
@@ -105,8 +112,11 @@ export interface PlannerCampaign {
   leadsContacted: number;
   leadsRemaining: number;
   pctContacted: number;
-  newLeadsPerDay: number;
-  runwayDays: number | null;
+  newLeadsPerDay: number; // per SENDING day — what the operator recognises
+  newLeadsPerCalendarDay: number; // per calendar day — drives the ETA
+  newLeadRateObserved: boolean; // false = derived from config, not real sends
+  daysToFinish: number | null; // calendar days until every lead is contacted
+  finishDate: string | null; // YYYY-MM-DD projection
   replyRate: number;
   bounceRate: number;
   opportunities: number;
@@ -125,7 +135,9 @@ export interface PlannerGroup {
   inboxesNeeded: number;
   domainsNeeded: number;
   leadsRemaining: number;
-  runwayDays: number | null;
+  newLeadsPerDay: number; // per sending day, summed across the group
+  daysToFinish: number | null;
+  finishDate: string | null;
   replyRate: number;
 }
 
@@ -178,6 +190,7 @@ export interface PlanInput {
   cap: CapacityResult;
   settings: AppSettings;
   costs?: CostItem[];
+  today?: Date; // injected so completion dates stay deterministic in tests
 }
 
 function limitOf(o: Obj, keys: string[]): number {
@@ -245,7 +258,11 @@ export function computePlan({
   cap,
   settings,
   costs = [],
+  today,
 }: PlanInput): Plan {
+  // Weekends still pass on the calendar even though nothing sends, so ETAs are
+  // in calendar days while the displayed rate is per sending day.
+  const sendingDayFactor = Math.min(7, Math.max(1, settings.sending_days_per_week)) / 7;
   const excluded = new Set(
     (settings.excluded_mailboxes ?? []).map((e) => e.trim().toLowerCase()).filter(Boolean),
   );
@@ -359,12 +376,30 @@ export function computePlan({
     const leadsRemaining = Math.max(0, leadsTotal - leadsContacted);
     const sent = pick(s, F.sent, 0);
     const newContacted = pick(s, F.newContacted, 0);
-    // Prefer the observed new-lead rate; fall back to what the config allows.
-    const observed = newContacted > 0 ? newContacted / 30 : 0;
-    const newLeadsPerDay =
-      observed > 0
-        ? observed
-        : Math.min(p.dailyMaxLeads > 0 ? p.dailyMaxLeads : Infinity, supply) || 0;
+
+    // Two different rates, because they answer two different questions:
+    //  - per SENDING day is what the operator recognises ("I contact 14/day")
+    //  - per CALENDAR day is what an ETA has to be built from, since weekends
+    //    still pass on the calendar even though nothing sends.
+    const observedPerCalendarDay = newContacted > 0 ? newContacted / WINDOW_DAYS : 0;
+    const configuredPerSendingDay =
+      Math.min(p.dailyMaxLeads > 0 ? p.dailyMaxLeads : Infinity, supply) || 0;
+    // Only fall back to the configured rate when the campaign actually has a
+    // list — otherwise we'd report a confident rate for a campaign that has
+    // never contacted anyone and has nobody to contact.
+    const perCalendarDay =
+      observedPerCalendarDay > 0
+        ? observedPerCalendarDay
+        : leadsTotal > 0
+          ? configuredPerSendingDay * sendingDayFactor
+          : 0;
+    const perSendingDay = sendingDayFactor > 0 ? perCalendarDay / sendingDayFactor : perCalendarDay;
+    const daysToFinish =
+      perCalendarDay > 0 && Number.isFinite(perCalendarDay) && leadsRemaining > 0
+        ? leadsRemaining / perCalendarDay
+        : leadsRemaining === 0 && leadsTotal > 0
+          ? 0 // whole list already contacted
+          : null;
 
     return {
       id: p.id,
@@ -382,11 +417,11 @@ export function computePlan({
       leadsContacted,
       leadsRemaining,
       pctContacted: rate(leadsContacted, leadsTotal),
-      newLeadsPerDay: Number.isFinite(newLeadsPerDay) ? newLeadsPerDay : 0,
-      runwayDays:
-        newLeadsPerDay > 0 && Number.isFinite(newLeadsPerDay)
-          ? leadsRemaining / newLeadsPerDay
-          : null,
+      newLeadsPerDay: Number.isFinite(perSendingDay) ? perSendingDay : 0,
+      newLeadsPerCalendarDay: Number.isFinite(perCalendarDay) ? perCalendarDay : 0,
+      newLeadRateObserved: observedPerCalendarDay > 0,
+      daysToFinish,
+      finishDate: daysToFinish !== null ? addDays(today ?? new Date(), daysToFinish) : null,
       replyRate: rate(pick(s, F.replies, 0), sent),
       bounceRate: rate(pick(s, F.bounced, 0), sent),
       opportunities: pick(s, F.opps, 0),
@@ -420,7 +455,16 @@ export function computePlan({
     const gap = Math.max(0, demandDaily - supplyDaily);
     const inboxesNeeded = perBoxCap > 0 ? Math.ceil(gap / perBoxCap) : 0;
     const leadsRemaining = activeList.reduce((n, c) => n + c.leadsRemaining, 0);
-    const leadRate = activeList.reduce((n, c) => n + c.newLeadsPerDay, 0);
+    const leadRateCalendar = activeList.reduce((n, c) => n + c.newLeadsPerCalendarDay, 0);
+    const groupLeadsTotal = activeList.reduce((n, c) => n + c.leadsTotal, 0);
+    const groupDaysToFinish =
+      leadsRemaining > 0 && leadRateCalendar > 0
+        ? leadsRemaining / leadRateCalendar
+        : groupLeadsTotal > 0
+          ? 0 // list fully contacted
+          : null; // no list to finish
+    const groupFinishDate =
+      groupDaysToFinish !== null ? addDays(today ?? new Date(), groupDaysToFinish) : null;
     const totalSent = activeList.reduce((n, c) => n + c.leadsContacted, 0);
 
     return {
@@ -436,7 +480,9 @@ export function computePlan({
       inboxesNeeded,
       domainsNeeded: Math.ceil(inboxesNeeded / Math.max(1, settings.emails_per_domain)),
       leadsRemaining,
-      runwayDays: leadRate > 0 ? leadsRemaining / leadRate : null,
+      newLeadsPerDay: activeList.reduce((n, c) => n + c.newLeadsPerDay, 0),
+      daysToFinish: groupDaysToFinish,
+      finishDate: groupFinishDate,
       replyRate:
         totalSent > 0
           ? activeList.reduce((n, c) => n + c.replyRate * c.leadsContacted, 0) / totalSent
@@ -513,10 +559,10 @@ export function computePlan({
   }
   for (const c of campaigns) {
     if (!c.active) continue;
-    if (c.runwayDays !== null && c.runwayDays < RUNWAY_WARN_DAYS) {
+    if (c.daysToFinish !== null && c.daysToFinish > 0 && c.daysToFinish < RUNWAY_WARN_DAYS) {
       actions.push({
         severity: "high",
-        title: `${c.name}: ${Math.round(c.runwayDays)} days of leads left`,
+        title: `${c.name}: ${Math.round(c.daysToFinish)} days of leads left`,
         detail: `${Math.round(c.leadsRemaining)} uncontacted leads at ~${Math.round(c.newLeadsPerDay)}/day. Import more before it stalls.`,
       });
     }

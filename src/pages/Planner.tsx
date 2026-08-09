@@ -20,7 +20,7 @@ import { AppSettings, CapacitySource, CostItem, Domain, TABLES } from "../lib/ty
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup } from "../lib/campaignPlan";
 import { instantly } from "../lib/instantly";
-import { fmtNumber, fmtPercent, fmtMoney } from "../lib/format";
+import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
 import { cn } from "../lib/utils";
 
 const SEV_TONE: Record<string, "danger" | "sun" | "sky"> = {
@@ -514,14 +514,17 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
             {short
               ? `add ${g.inboxesNeeded} inbox${g.inboxesNeeded === 1 ? "" : "es"} (~${g.domainsNeeded} domain${g.domainsNeeded === 1 ? "" : "s"}) to reach ${fmtNumber(g.demandDaily)}/day`
               : "supply covers the configured limits"}
-            {g.runwayDays !== null ? ` · ${Math.round(g.runwayDays)} days of leads left` : ""}
+            {g.newLeadsPerDay > 0 ? ` · ${fmtNumber(g.newLeadsPerDay)} new leads/day` : ""}
+            {g.daysToFinish !== null && g.daysToFinish > 0
+              ? ` · list done in ${Math.round(g.daysToFinish)}d`
+              : ""}
           </p>
         </div>
       </button>
 
       {open ? (
         <div className="overflow-x-auto border-t-2 border-ink/10 px-4 pb-4">
-          <table className="w-full min-w-[760px] border-collapse text-left text-sm">
+          <table className="w-full min-w-[900px] border-collapse text-left text-sm">
             <thead>
               <tr className="text-xs uppercase text-muted">
                 <th className="py-2 pr-3">Campaign</th>
@@ -530,7 +533,8 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                 <th className="w-16 py-2 pr-3">Boxes</th>
                 <th className="w-32 py-2 pr-3">Priority</th>
                 <th className="w-44 py-2 pr-3">Leads contacted</th>
-                <th className="w-20 py-2">Runway</th>
+                <th className="w-24 py-2 pr-3">New leads/day</th>
+                <th className="w-32 py-2">Finishes in</th>
               </tr>
             </thead>
             <tbody>
@@ -567,13 +571,34 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                         {fmtNumber(c.leadsRemaining)} left · {fmtPercent(c.pctContacted)} done
                       </p>
                     </td>
-                    <td className="py-2 text-xs">
-                      {c.runwayDays === null ? (
-                        <span className="text-muted">—</span>
+                    <td className="py-2 pr-3">
+                      {c.newLeadsPerDay > 0 ? (
+                        <>
+                          <p className="font-bold">{fmtNumber(c.newLeadsPerDay)}</p>
+                          <p className="text-[11px] text-muted">
+                            {c.newLeadRateObserved ? "last 30d actual" : "from campaign settings"}
+                          </p>
+                        </>
                       ) : (
-                        <Badge tone={c.runwayDays < 7 ? "danger" : c.runwayDays < 21 ? "sun" : "white"}>
-                          {Math.round(c.runwayDays)}d
-                        </Badge>
+                        <span className="text-muted">—</span>
+                      )}
+                    </td>
+                    <td className="py-2 text-xs">
+                      {c.daysToFinish === null ? (
+                        <span className="text-muted">—</span>
+                      ) : c.daysToFinish === 0 ? (
+                        <Badge tone="mint">list done</Badge>
+                      ) : (
+                        <>
+                          <Badge
+                            tone={c.daysToFinish < 7 ? "danger" : c.daysToFinish < 21 ? "sun" : "white"}
+                          >
+                            {c.daysToFinish > 365 ? "1yr+" : `${Math.round(c.daysToFinish)}d`}
+                          </Badge>
+                          {c.finishDate && c.daysToFinish <= 365 ? (
+                            <p className="mt-0.5 text-[11px] text-muted">{fmtDateShort(c.finishDate)}</p>
+                          ) : null}
+                        </>
                       )}
                     </td>
                   </tr>
