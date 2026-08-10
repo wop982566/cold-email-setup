@@ -67,6 +67,62 @@ export interface InstantlyLeadsData {
   truncated: boolean;
 }
 
+// --- Writes ----------------------------------------------------------------
+// Every write goes through one POST endpoint with a fixed op whitelist, and is
+// gated server-side on INSTANTLY_WRITE_ENABLED. `dryRun` returns the exact
+// payload that would be sent without sending it — which is how the UI shows
+// you the change before it happens.
+
+export interface WriteResult<T = unknown> extends InstantlyResult<T> {
+  /** Set when the env flag is off, so the UI can explain rather than just fail. */
+  writesDisabled?: boolean;
+  dryRun?: boolean;
+  email?: string;
+  campaignId?: string;
+  before?: string[];
+  after?: string[];
+  verified?: string[] | null;
+  /** null = the confirming read failed, not that the write failed. */
+  applied?: boolean | null;
+  current?: string[];
+  payload?: unknown;
+}
+
+export interface NewAccount {
+  email: string;
+  first_name?: string;
+  last_name?: string;
+  provider_code?: number;
+  smtp_username?: string;
+  smtp_password: string;
+  smtp_host: string;
+  smtp_port?: number;
+  imap_username?: string;
+  imap_password: string;
+  imap_host: string;
+  imap_port?: number;
+  daily_limit?: number;
+  warmup_limit?: number;
+  warmup_increment?: number;
+  warmup_reply_rate?: number;
+  tracking_domain_name?: string;
+}
+
+async function write<T = unknown>(body: Record<string, unknown>): Promise<WriteResult<T>> {
+  try {
+    const res = await fetch("/.netlify/functions/instantly?resource=write", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json()) as WriteResult<T>;
+    if (!res.ok) return { ...data, ok: false, error: data.error ?? `HTTP ${res.status}` };
+    return data;
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Network error" };
+  }
+}
+
 export const instantly = {
   accounts: () => call("accounts", { limit: "100" }),
   campaigns: () => call("campaigns", { limit: "100" }),
@@ -97,6 +153,21 @@ export const instantly = {
       return { ok: false, error: e instanceof Error ? e.message : "Network error" };
     }
   },
+
+  createAccount: (account: NewAccount, dryRun = false) =>
+    write({ op: "create-account", account, dryRun }),
+
+  updateAccount: (
+    payload: { email: string; daily_limit?: number; warmup?: { limit: number; increment: number; reply_rate: number } },
+    dryRun = false,
+  ) => write({ op: "update-account", ...payload, dryRun }),
+
+  // `expectedList` is what the page believed the campaign held. The server
+  // aborts if reality disagrees, so a stale tab can't clobber a live campaign.
+  setCampaignEmails: (
+    payload: { campaignId: string; remove: string; add: string; expectedList?: string[] },
+    dryRun = false,
+  ) => write({ op: "set-campaign-emails", ...payload, dryRun }),
 };
 
 // Pull a numeric stat from a record trying several known Instantly field names.

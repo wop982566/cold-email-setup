@@ -18,6 +18,20 @@ function tokenOk(req: Request): boolean {
   return req.headers.get("x-app-token") === required;
 }
 
+// Tables holding live credentials. Everything else in this store is
+// operational data that's inconvenient to lose; these rows are SMTP and IMAP
+// passwords, and without APP_FUNCTION_TOKEN this endpoint answers to anyone
+// who learns the URL. So they are served only when the token is configured —
+// an unauthenticated deployment simply cannot read or write them.
+const SECRET_TABLES = new Set(["mail_profiles"]);
+
+function secretsAllowed(): boolean {
+  return Boolean(process.env.APP_FUNCTION_TOKEN);
+}
+
+const SECRETS_LOCKED_MESSAGE =
+  "Mailbox credentials are locked. Set APP_FUNCTION_TOKEN in your Netlify env vars (and VITE_APP_TOKEN to the same value) before saving SMTP/IMAP passwords — without it this endpoint is readable by anyone with the URL.";
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -43,6 +57,9 @@ export default async (req: Request): Promise<Response> => {
       if (url.searchParams.get("ping") != null) return json({ ok: true });
       const table = url.searchParams.get("table");
       if (!table) return json({ ok: false, error: "Missing table" }, 400);
+      if (SECRET_TABLES.has(table) && !secretsAllowed()) {
+        return json({ ok: false, locked: true, error: SECRETS_LOCKED_MESSAGE }, 403);
+      }
       return json({ ok: true, rows: await readTable(table) });
     }
 
@@ -62,6 +79,14 @@ export default async (req: Request): Promise<Response> => {
     };
     const op = body.op;
     const table = body.table ?? "";
+
+    // Applies to every mutation op, including the bulk `tables` import below.
+    const touchesSecrets =
+      SECRET_TABLES.has(table) ||
+      Object.keys(body.tables ?? {}).some((t) => SECRET_TABLES.has(t));
+    if (touchesSecrets && !secretsAllowed()) {
+      return json({ ok: false, locked: true, error: SECRETS_LOCKED_MESSAGE }, 403);
+    }
 
     switch (op) {
       case "getSettings": {

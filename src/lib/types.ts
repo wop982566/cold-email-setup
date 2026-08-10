@@ -219,6 +219,60 @@ export interface SequenceEmail extends BaseRow {
   notes: string;
 }
 
+// --- Mailbox recovery ------------------------------------------------------
+export type RecoveryStatus = "recovering" | "recovered" | "retired";
+
+/**
+ * A mailbox pulled out of a live campaign because it was hurting
+ * deliverability. Tracked so it isn't immediately proposed as a spare for the
+ * next campaign, and so you can see whether warmup is actually repairing it.
+ */
+export interface RecoveryEntry extends BaseRow {
+  email: string;
+  swapped_out_at: string; // ISO
+  score_at_swap: number | null;
+  inbox_rate_at_swap: number | null;
+  replaced_by: string; // the address that took over
+  campaign_ids: string[]; // where it was pulled from
+  campaign_names: string[];
+  status: RecoveryStatus;
+  released_at: string | null;
+  reason: string; // what triggered the swap, in the words the UI used
+  // Sampled whenever the planner loads, so the trend is real history rather
+  // than a single before/after pair.
+  history: { at: string; score: number | null; inbox_rate: number | null }[];
+}
+
+// --- Mailbox credential profiles -------------------------------------------
+/**
+ * A reusable SMTP/IMAP combination for creating mailboxes in bulk.
+ *
+ * Username fields accept {prefix} and {domain} placeholders so one profile
+ * covers a whole batch of domains.
+ *
+ * NOTE: these rows hold live credentials. The /data function refuses to serve
+ * the mail_profiles table unless APP_FUNCTION_TOKEN is set.
+ */
+export interface MailProfile extends BaseRow {
+  name: string;
+  iam_user_name: string; // the AWS IAM user the SMTP credential came from
+  smtp_username: string;
+  smtp_password: string;
+  smtp_host: string;
+  smtp_port: number;
+  imap_username: string;
+  imap_password: string;
+  imap_host: string;
+  imap_port: number;
+  provider_code: number; // Instantly provider id
+  daily_limit: number;
+  warmup_limit: number;
+  warmup_increment: number;
+  warmup_reply_rate: number;
+  tracking_domain_prefix: string; // e.g. "inst" -> inst.<domain>
+  notes: string;
+}
+
 export type FieldType = "text" | "number" | "date" | "boolean" | "select";
 
 export interface CustomField extends BaseRow {
@@ -295,7 +349,12 @@ export const TABLES = {
   customFields: "custom_fields",
   sequences: "sequences",
   sequenceEmails: "sequence_emails",
+  recovery: "mailbox_recovery",
+  mailProfiles: "mail_profiles",
   settings: "app_settings",
 } as const;
+
+/** Tables holding credentials — gated behind APP_FUNCTION_TOKEN server-side. */
+export const SECRET_TABLES: readonly string[] = [TABLES.mailProfiles];
 
 export type TableName = (typeof TABLES)[keyof typeof TABLES];

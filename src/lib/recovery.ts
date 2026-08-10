@@ -1,0 +1,150 @@
+// ---------------------------------------------------------------------------
+// Mailboxes pulled out of live campaigns, and whether they're actually getting
+// better.
+//
+// Two jobs:
+//   1. Keep a convalescing mailbox out of the spare pool. Without this, the
+//      inbox you just swapped out for a bad score is immediately eligible to be
+//      proposed as the replacement for the next campaign.
+//   2. Tell you whether warmup is repairing it or it's flat-lined, so "give it
+//      another week" is a decision rather than a hope.
+//
+// Sampling is one point per calendar day — the planner may load twenty times a
+// day, and twenty identical points are not a trend.
+//
+// Pure module — the page fetches and persists, this computes.
+// ---------------------------------------------------------------------------
+import { RecoveryEntry } from "./types";
+
+/** Samples kept per mailbox. Two months of daily points is plenty of history. */
+const MAX_HISTORY = 60;
+/** Consecutive good samples before we suggest returning a mailbox to service. */
+const CLEAR_SAMPLES = 3;
+
+export type Trend = "improving" | "declining" | "flat" | "unknown";
+
+export interface RecoveryView {
+  entry: RecoveryEntry;
+  daysOut: number;
+  scoreNow: number | null;
+  scoreAtSwap: number | null;
+  delta: number | null;
+  trend: Trend;
+  /** Cleared the bar for CLEAR_SAMPLES consecutive samples. */
+  eligible: boolean;
+  /** Out for a long time with no improvement — worth retiring. */
+  stalled: boolean;
+}
+
+function dayKey(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+function daysBetween(fromIso: string, to: Date): number {
+  const t = Date.parse(fromIso);
+  if (!Number.isFinite(t)) return 0;
+  return Math.max(0, Math.floor((to.getTime() - t) / 86400000));
+}
+
+/** Emails currently convalescing — never proposed as replacements. */
+export function recoveringEmails(entries: RecoveryEntry[]): Set<string> {
+  return new Set(
+    entries.filter((e) => e.status === "recovering").map((e) => e.email.trim().toLowerCase()),
+  );
+}
+
+/**
+ * Append today's reading, or replace today's if one already exists. Returns
+ * null when nothing changed, so callers can skip a pointless write.
+ */
+export function sampleFor(
+  entry: RecoveryEntry,
+  score: number | null,
+  inboxRate: number | null,
+  now = new Date(),
+): RecoveryEntry["history"] | null {
+  const history = Array.isArray(entry.history) ? entry.history : [];
+  const at = now.toISOString();
+  const today = dayKey(at);
+  const last = history[history.length - 1];
+
+  if (last && dayKey(last.at) === today) {
+    // Same day: only rewrite if the numbers actually moved.
+    if (last.score === score && last.inbox_rate === inboxRate) return null;
+    return [...history.slice(0, -1), { at, score, inbox_rate: inboxRate }];
+  }
+  return [...history, { at, score, inbox_rate: inboxRate }].slice(-MAX_HISTORY);
+}
+
+/** Latest known score, preferring live data over stored history. */
+function latestScore(entry: RecoveryEntry, live: number | null): number | null {
+  if (live !== null) return live;
+  const history = Array.isArray(entry.history) ? entry.history : [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].score !== null) return history[i].score;
+  }
+  return entry.score_at_swap;
+}
+
+function trendOf(entry: RecoveryEntry): Trend {
+  const points = (Array.isArray(entry.history) ? entry.history : [])
+    .map((h) => h.score)
+    .filter((s): s is number => s !== null);
+  if (points.length < 2) return "unknown";
+  // Compare the last third against the first third — resistant to one bad day.
+  const third = Math.max(1, Math.floor(points.length / 3));
+  const first = points.slice(0, third);
+  const last = points.slice(-third);
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const diff = mean(last) - mean(first);
+  if (diff >= 5) return "improving";
+  if (diff <= -5) return "declining";
+  return "flat";
+}
+
+export function viewFor(
+  entry: RecoveryEntry,
+  liveScore: number | null,
+  minScore: number,
+  now = new Date(),
+): RecoveryView {
+  const history = Array.isArray(entry.history) ? entry.history : [];
+  const scoreNow = latestScore(entry, liveScore);
+  const scoreAtSwap = entry.score_at_swap;
+
+  const recent = history.slice(-CLEAR_SAMPLES).map((h) => h.score);
+  const eligible =
+    entry.status === "recovering" &&
+    recent.length >= CLEAR_SAMPLES &&
+    recent.every((s) => s !== null && s >= minScore);
+
+  const daysOut = daysBetween(entry.swapped_out_at, now);
+  const trend = trendOf(entry);
+
+  return {
+    entry,
+    daysOut,
+    scoreNow,
+    scoreAtSwap,
+    delta: scoreNow !== null && scoreAtSwap !== null ? scoreNow - scoreAtSwap : null,
+    trend,
+    eligible,
+    // Three weeks out, not improving, still under the bar: warmup isn't
+    // fixing this one.
+    stalled:
+      entry.status === "recovering" &&
+      daysOut >= 21 &&
+      trend !== "improving" &&
+      (scoreNow === null || scoreNow < minScore),
+  };
+}
+
+export function summarise(views: RecoveryView[]) {
+  const active = views.filter((v) => v.entry.status === "recovering");
+  return {
+    recovering: active.length,
+    eligible: active.filter((v) => v.eligible).length,
+    stalled: active.filter((v) => v.stalled).length,
+    improving: active.filter((v) => v.trend === "improving").length,
+  };
+}

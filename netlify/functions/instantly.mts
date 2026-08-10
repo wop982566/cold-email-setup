@@ -18,10 +18,20 @@ const GET_RESOURCES: Record<string, string> = {
 
 const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", "starting_after"];
 
+// The only three mutations this function can perform. Deleting anything,
+// pausing or starting a campaign, and everything to do with leads are absent
+// on purpose — there is no code path to them.
+const WRITE_OPS = ["create-account", "update-account", "set-campaign-emails"] as const;
+type WriteOp = (typeof WRITE_OPS)[number];
+
 function tokenOk(req: Request): boolean {
   const required = process.env.APP_FUNCTION_TOKEN;
   if (!required) return true;
   return req.headers.get("x-app-token") === required;
+}
+
+function writesEnabled(): boolean {
+  return String(process.env.INSTANTLY_WRITE_ENABLED ?? "").toLowerCase() === "true";
 }
 
 function json(body: unknown, status = 200): Response {
@@ -29,6 +39,49 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
   });
+}
+
+/**
+ * Strip anything password-shaped before a payload is echoed back to the
+ * browser or into an error. Instantly's validation errors quote the offending
+ * request, so without this a rejected create would put SMTP credentials in a
+ * toast and in the browser's network log.
+ */
+function scrub(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(scrub);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = /pass|secret|token|credential/i.test(k) ? "***" : scrub(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function str(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+function int(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+function normEmail(v: unknown): string {
+  return str(v).toLowerCase();
+}
+
+/** The mailbox list attached to a campaign, normalised. */
+function emailListOf(campaign: unknown): string[] {
+  const list = (campaign as { email_list?: unknown })?.email_list;
+  if (!Array.isArray(list)) return [];
+  return list.map((e) => normEmail(e)).filter(Boolean);
+}
+
+function sameSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -150,6 +203,213 @@ export default async (req: Request): Promise<Response> => {
         }
       }
       return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
+    // ---------------------------------------------------------------------
+    // Writes. Gated twice: the env flag, and a fixed op whitelist.
+    // ---------------------------------------------------------------------
+    if (resource === "write") {
+      if (req.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
+
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body" }, 400);
+      }
+
+      const op = str(body.op) as WriteOp;
+      if (!WRITE_OPS.includes(op)) {
+        return json({ ok: false, error: `Unknown or forbidden write op: ${op || "(none)"}` }, 400);
+      }
+
+      const dryRun = body.dryRun === true;
+
+      if (!writesEnabled() && !dryRun) {
+        return json(
+          {
+            ok: false,
+            writesDisabled: true,
+            error:
+              "Writes to Instantly are turned off. Set INSTANTLY_WRITE_ENABLED=true in Netlify env vars to enable them.",
+          },
+          403,
+        );
+      }
+
+      const post = (path: string, payload: unknown, method = "POST") =>
+        fetch(`${BASE}${path}`, {
+          method,
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+      // --- create a mailbox ------------------------------------------------
+      if (op === "create-account") {
+        const a = (body.account ?? {}) as Record<string, unknown>;
+        const email = normEmail(a.email);
+        if (!email.includes("@")) return json({ ok: false, error: "A valid email is required" }, 400);
+
+        // Built field by field rather than spread, so nothing unexpected from
+        // the browser reaches Instantly.
+        const payload: Record<string, unknown> = {
+          email,
+          first_name: str(a.first_name),
+          last_name: str(a.last_name),
+          provider_code: int(a.provider_code, 2),
+          smtp_username: str(a.smtp_username) || email,
+          smtp_password: str(a.smtp_password),
+          smtp_host: str(a.smtp_host),
+          smtp_port: int(a.smtp_port, 587),
+          imap_username: str(a.imap_username) || email,
+          imap_password: str(a.imap_password),
+          imap_host: str(a.imap_host),
+          imap_port: int(a.imap_port, 993),
+          daily_limit: int(a.daily_limit, 30),
+          warmup: {
+            limit: int(a.warmup_limit, 20),
+            increment: int(a.warmup_increment, 1),
+            reply_rate: int(a.warmup_reply_rate, 30),
+          },
+        };
+        const tracking = str(a.tracking_domain_name);
+        if (tracking) payload.tracking_domain_name = tracking;
+
+        const missing = ["smtp_password", "smtp_host", "imap_password", "imap_host"].filter(
+          (k) => !payload[k],
+        );
+        if (missing.length) {
+          return json({ ok: false, error: `Missing required field(s): ${missing.join(", ")}` }, 400);
+        }
+
+        if (dryRun) return json({ ok: true, dryRun: true, email, payload: scrub(payload) });
+
+        const res = await post("/accounts", payload);
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          return json(
+            { ok: false, email, error: `Instantly ${res.status}`, data: scrub(data), sent: scrub(payload) },
+            res.status,
+          );
+        }
+        return json({ ok: true, email, data: scrub(data) });
+      }
+
+      // --- warmup / limit settings on an existing mailbox ------------------
+      if (op === "update-account") {
+        const email = normEmail(body.email);
+        if (!email) return json({ ok: false, error: "email is required" }, 400);
+
+        // Deliberately narrow: this op cannot rewrite credentials or identity.
+        const patch: Record<string, unknown> = {};
+        if (body.daily_limit != null) patch.daily_limit = int(body.daily_limit, 30);
+        const w = (body.warmup ?? null) as Record<string, unknown> | null;
+        if (w) {
+          patch.warmup = {
+            limit: int(w.limit, 20),
+            increment: int(w.increment, 1),
+            reply_rate: int(w.reply_rate, 30),
+          };
+        }
+        if (Object.keys(patch).length === 0) {
+          return json({ ok: false, error: "Nothing to update" }, 400);
+        }
+
+        if (dryRun) return json({ ok: true, dryRun: true, email, payload: patch });
+
+        const res = await post(`/accounts/${encodeURIComponent(email)}`, patch, "PATCH");
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          return json({ ok: false, email, error: `Instantly ${res.status}`, data: scrub(data) }, res.status);
+        }
+        return json({ ok: true, email, data: scrub(data) });
+      }
+
+      // --- swap a mailbox on a live campaign -------------------------------
+      // Read-modify-write with verification at both ends. A campaign that
+      // changed underneath us aborts rather than being overwritten blind —
+      // this is the one op that touches something actively sending.
+      if (op === "set-campaign-emails") {
+        const campaignId = str(body.campaignId);
+        const remove = normEmail(body.remove);
+        const add = normEmail(body.add);
+        if (!campaignId) return json({ ok: false, error: "campaignId is required" }, 400);
+        if (!remove || !add) return json({ ok: false, error: "remove and add are required" }, 400);
+        if (remove === add) return json({ ok: false, error: "remove and add are the same address" }, 400);
+
+        const readRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
+        const campaign = await readRes.json().catch(() => null);
+        if (!readRes.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${readRes.status} reading campaign`, data: scrub(campaign) },
+            readRes.status,
+          );
+        }
+
+        const current = emailListOf(campaign);
+        if (current.length === 0) {
+          return json(
+            { ok: false, campaignId, error: "Campaign returned no email_list — refusing to write one from scratch." },
+            409,
+          );
+        }
+        if (!current.includes(remove)) {
+          return json(
+            { ok: false, campaignId, error: `${remove} is not attached to this campaign any more.`, current },
+            409,
+          );
+        }
+        if (current.includes(add)) {
+          return json(
+            { ok: false, campaignId, error: `${add} is already attached to this campaign.`, current },
+            409,
+          );
+        }
+        // Optimistic concurrency: the UI sends what it believed the list was.
+        const expected = Array.isArray(body.expectedList)
+          ? (body.expectedList as unknown[]).map(normEmail).filter(Boolean)
+          : null;
+        if (expected && !sameSet(expected, current)) {
+          return json(
+            {
+              ok: false,
+              campaignId,
+              error: "This campaign's mailbox list changed since the page loaded. Refresh and try again.",
+              current,
+              expected,
+            },
+            409,
+          );
+        }
+
+        const next = current.map((e) => (e === remove ? add : e));
+
+        if (dryRun) return json({ ok: true, dryRun: true, campaignId, before: current, after: next });
+
+        const res = await post(`/campaigns/${encodeURIComponent(campaignId)}`, { email_list: next }, "PATCH");
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${res.status}`, data: scrub(data), before: current, attempted: next },
+            res.status,
+          );
+        }
+
+        // Confirm from the server rather than trusting the write's response.
+        const verifyRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
+        const verified = verifyRes.ok ? emailListOf(await verifyRes.json().catch(() => null)) : null;
+        const applied = verified ? verified.includes(add) && !verified.includes(remove) : null;
+
+        return json({
+          ok: true,
+          campaignId,
+          before: current,
+          after: next,
+          verified,
+          // null means the confirming read failed, not that the write failed.
+          applied,
+        });
+      }
     }
 
     // Warmup analytics is a POST with a body of emails (1-100).

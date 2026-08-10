@@ -1,14 +1,28 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { HeartPulse, ArrowRight, AlertTriangle, Copy, ChevronDown, ChevronRight, Check } from "lucide-react";
+import {
+  HeartPulse,
+  ArrowRight,
+  AlertTriangle,
+  Copy,
+  ChevronDown,
+  ChevronRight,
+  Check,
+  Zap,
+  Eye,
+} from "lucide-react";
 import { Card, StatCard, Badge, Spinner } from "../ui/primitives";
 import { useToast } from "../ui/toast";
 import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailboxHealth";
 import { Plan } from "../../lib/campaignPlan";
 import type { PlacementMap } from "../../lib/placement";
-import { AppSettings } from "../../lib/types";
+import { instantly } from "../../lib/instantly";
+import { recoveringEmails, sampleFor, summarise, viewFor, type RecoveryView } from "../../lib/recovery";
+import { useInsert, useUpdate } from "../../lib/hooks";
+import { AppSettings, RecoveryEntry, TABLES } from "../../lib/types";
 import { fmtNumber } from "../../lib/format";
 import { cn } from "../../lib/utils";
+import { RecoveryPanel } from "./RecoveryPanel";
 
 const SEV_TONE: Record<string, "danger" | "sun" | "sky"> = {
   critical: "danger",
@@ -42,6 +56,9 @@ export function CampaignMaintenance({
   placement,
   placementChecked,
   placementLoading,
+  recovery,
+  healthByEmail,
+  onApplied,
 }: {
   plan: Plan;
   // Computed once by the page and shared with the per-campaign breakdown, so
@@ -51,12 +68,49 @@ export function CampaignMaintenance({
   placement: PlacementMap | null;
   placementChecked: number;
   placementLoading: boolean;
+  recovery: RecoveryEntry[];
+  healthByEmail: Map<string, MailboxHealth>;
+  onApplied: () => void;
 }) {
   const toast = useToast();
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [altIdx, setAltIdx] = useState<Map<string, number>>(new Map());
+  const [applying, setApplying] = useState<string | null>(null);
+  const [preview, setPreview] = useState<Map<string, string>>(new Map());
+  const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
+
+  const insertRecovery = useInsert<RecoveryEntry>(TABLES.recovery);
+  const updateRecovery = useUpdate<RecoveryEntry>(TABLES.recovery);
 
   const m = maintenance;
+  const minScore =
+    (settings as unknown as Record<string, number>).maintenance_min_warmup_score ?? 80;
+
+  const recoveryViews: RecoveryView[] = useMemo(
+    () =>
+      recovery.map((e) =>
+        viewFor(e, healthByEmail.get(e.email)?.score ?? null, minScore),
+      ),
+    [recovery, healthByEmail, minScore],
+  );
+  const recoveryStats = useMemo(() => summarise(recoveryViews), [recoveryViews]);
+
+  // Take one score reading per recovering mailbox per day, so the trend is real
+  // history. sampleFor() returns null when today's point already exists and
+  // hasn't moved, which keeps a page refresh from writing anything.
+  const sampledRef = useRef(false);
+  useEffect(() => {
+    if (sampledRef.current || recovery.length === 0 || healthByEmail.size === 0) return;
+    sampledRef.current = true;
+    for (const e of recovery) {
+      if (e.status !== "recovering") continue;
+      const h = healthByEmail.get(e.email);
+      const history = sampleFor(e, h?.score ?? null, h?.inboxRate ?? null);
+      if (history) void updateRecovery.mutateAsync({ id: e.id, patch: { history } });
+    }
+    // updateRecovery is a stable mutation object; re-running on it would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recovery, healthByEmail]);
 
   function toggle(id: string) {
     setOpen((s) => {
@@ -74,6 +128,109 @@ export function CampaignMaintenance({
   function cycle(p: SwapProposal) {
     const max = p.alternatives.length;
     setAltIdx((s) => new Map(s).set(p.id, ((s.get(p.id) ?? 0) + 1) % (max + 1)));
+  }
+
+  /** Show exactly what would change, without changing anything. */
+  async function dryRun(p: SwapProposal, to: MailboxHealth) {
+    setApplying(p.id);
+    const lines: string[] = [];
+    for (const c of p.campaigns) {
+      const res = await instantly.setCampaignEmails(
+        { campaignId: c.id, remove: p.bad.box.email, add: to.box.email, expectedList: c.emailListNow },
+        true,
+      );
+      lines.push(
+        res.ok
+          ? `${c.name}: ${res.before?.length ?? 0} mailboxes → ${res.after?.length ?? 0} (${p.bad.box.email} out, ${to.box.email} in)`
+          : `${c.name}: ${res.error}`,
+      );
+    }
+    setPreview((s) => new Map(s).set(p.id, lines.join("\n")));
+    setApplying(null);
+  }
+
+  /**
+   * Apply the swap for real. Each campaign is a separate read-modify-write on
+   * the server, so a partial failure leaves the rest correct and is reported
+   * rather than hidden. The recovery entry is written only if at least one
+   * campaign actually changed.
+   */
+  async function applySwap(p: SwapProposal, to: MailboxHealth) {
+    const label = `${p.bad.box.email} → ${to.box.email}`;
+    const confirmed = window.confirm(
+      `Swap ${label} on ${p.campaigns.length} live campaign${p.campaigns.length === 1 ? "" : "s"}?\n\n` +
+        p.campaigns.map((c) => `• ${c.name}`).join("\n") +
+        `\n\nThis edits campaigns that are sending right now.`,
+    );
+    if (!confirmed) return;
+
+    setApplying(p.id);
+    const done: string[] = [];
+    const failed: string[] = [];
+
+    for (const c of p.campaigns) {
+      const res = await instantly.setCampaignEmails({
+        campaignId: c.id,
+        remove: p.bad.box.email,
+        add: to.box.email,
+        expectedList: c.emailListNow,
+      });
+      if (res.ok && res.applied !== false) done.push(c.name);
+      else failed.push(`${c.name}: ${res.error ?? "did not verify"}`);
+      if (res.writesDisabled) break; // no point retrying the rest
+    }
+
+    if (done.length > 0) {
+      const already = recoveringEmails(recovery).has(p.bad.box.email);
+      if (!already) {
+        await insertRecovery.mutateAsync({
+          email: p.bad.box.email,
+          swapped_out_at: new Date().toISOString(),
+          score_at_swap: p.bad.score,
+          inbox_rate_at_swap: p.bad.inboxRate,
+          replaced_by: to.box.email,
+          campaign_ids: p.campaigns.map((c) => c.id),
+          campaign_names: p.campaigns.map((c) => c.name),
+          status: "recovering",
+          released_at: null,
+          reason: p.bad.issues.filter((i) => i.triggersReplacement).map((i) => i.label).join("; "),
+          history: [],
+        } as Partial<RecoveryEntry>);
+      }
+      onApplied();
+    }
+
+    setApplying(null);
+    if (failed.length === 0) {
+      toast.push(`Swapped on ${done.length} campaign${done.length === 1 ? "" : "s"}`, "success");
+    } else if (done.length === 0) {
+      toast.push(failed[0], "error");
+    } else {
+      toast.push(`${done.length} applied, ${failed.length} failed — ${failed[0]}`, "error");
+    }
+  }
+
+  async function returnToService(v: RecoveryView) {
+    setBusyRecovery(v.entry.id);
+    await updateRecovery.mutateAsync({
+      id: v.entry.id,
+      patch: { status: "recovered", released_at: new Date().toISOString() },
+    });
+    setBusyRecovery(null);
+    toast.push(`${v.entry.email} is back in the spare pool`, "success");
+  }
+
+  async function retire(v: RecoveryView) {
+    if (!window.confirm(`Retire ${v.entry.email}? It will never be proposed as a replacement again.`)) {
+      return;
+    }
+    setBusyRecovery(v.entry.id);
+    await updateRecovery.mutateAsync({
+      id: v.entry.id,
+      patch: { status: "retired", released_at: new Date().toISOString() },
+    });
+    setBusyRecovery(null);
+    toast.push(`${v.entry.email} retired`, "info");
   }
 
   function copySteps(p: SwapProposal, to: MailboxHealth) {
@@ -140,7 +297,13 @@ export function CampaignMaintenance({
         <StatCard
           label="Shortfall"
           value={m.shortfall}
-          sublabel={m.shortfall > 0 ? "no spare available" : "all covered"}
+          sublabel={
+            m.shortfall > 0
+              ? recoveryStats.recovering > 0
+                ? `${recoveryStats.recovering} recovering, ${recoveryStats.eligible} ready to return`
+                : "no spare available"
+              : "all covered"
+          }
           tone={m.shortfall > 0 ? "danger" : "white"}
         />
         <StatCard label="Warming" value={m.stats.ramping} sublabel="low score, but still new" tone="lavender" />
@@ -183,10 +346,26 @@ export function CampaignMaintenance({
               </div>
               <div className="ml-auto flex shrink-0 flex-wrap gap-2">
                 {p.alternatives.length > 0 ? (
-                  <button className="btn-ghost btn-sm" onClick={() => cycle(p)}>
+                  <button className="btn-ghost btn-sm" onClick={() => cycle(p)} disabled={applying === p.id}>
                     Different inbox
                   </button>
                 ) : null}
+                <button
+                  className="btn-ghost btn-sm"
+                  onClick={() => void dryRun(p, to)}
+                  disabled={applying === p.id}
+                  title="Show exactly what would change, without changing it"
+                >
+                  <Eye size={14} /> Preview
+                </button>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => void applySwap(p, to)}
+                  disabled={applying === p.id}
+                  title="Edit these campaigns in Instantly now"
+                >
+                  {applying === p.id ? <Spinner /> : <Zap size={14} />} Apply swap
+                </button>
                 <button className="btn-ghost btn-sm" onClick={() => copySteps(p, to)}>
                   <Copy size={14} /> Copy steps
                 </button>
@@ -195,6 +374,12 @@ export function CampaignMaintenance({
                 </button>
               </div>
             </div>
+
+            {preview.has(p.id) ? (
+              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-canvas p-2 text-[11px]">
+                {preview.get(p.id)}
+              </pre>
+            ) : null}
 
             {p.warnings.length > 0 ? (
               <p className="mt-2 rounded-lg border-2 border-ink bg-sun/30 p-2 text-xs font-semibold">
@@ -226,6 +411,14 @@ export function CampaignMaintenance({
           </Card>
         );
       })}
+
+      <RecoveryPanel
+        views={recoveryViews}
+        minScore={minScore}
+        onReturn={(v) => void returnToService(v)}
+        onRetire={(v) => void retire(v)}
+        busy={busyRecovery}
+      />
 
       {m.unassigned.length > 0 ? (
         <Card className="bg-danger/10 p-4 text-sm">

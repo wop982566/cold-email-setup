@@ -17,7 +17,8 @@ import {
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
 import { useCollection, useSettings, useSaveSettings } from "../lib/hooks";
-import { AppSettings, CapacitySource, CostItem, Domain, TABLES } from "../lib/types";
+import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES } from "../lib/types";
+import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
 import { instantly, asItems } from "../lib/instantly";
@@ -74,6 +75,7 @@ export default function Planner() {
   const { data: capacity = [] } = useCollection<CapacitySource>(TABLES.capacity);
   const { data: domains = [] } = useCollection<Domain>(TABLES.domains);
   const { data: costs = [] } = useCollection<CostItem>(TABLES.costs);
+  const { data: recovery = [] } = useCollection<RecoveryEntry>(TABLES.recovery);
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
@@ -148,6 +150,10 @@ export default function Planner() {
     });
   }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs, placementHealthInput]);
 
+  // A mailbox pulled out to heal must not be proposed as the spare for the
+  // next campaign, so the recovery list gates the candidate pool.
+  const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
+
   // Computed once here and shared: the Maintenance tab and the per-campaign
   // mailbox breakdown must never disagree about an address.
   const maintenance = useMemo(() => {
@@ -157,8 +163,9 @@ export default function Planner() {
       domains,
       settings,
       placement: placementHealthInput,
+      recovering,
     });
-  }, [plan, domains, settings, placementHealthInput]);
+  }, [plan, domains, settings, placementHealthInput, recovering]);
 
   const healthByEmail = useMemo(() => {
     const m = new Map<string, MailboxHealth>();
@@ -309,6 +316,9 @@ export default function Planner() {
           placement={placement}
           placementChecked={placementChecked}
           placementLoading={placeQ.isLoading}
+          recovery={recovery}
+          healthByEmail={healthByEmail}
+          onApplied={refresh}
         />
       ) : (
       <>
