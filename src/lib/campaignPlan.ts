@@ -49,13 +49,23 @@ export interface PlannerMailbox {
   warmingUp: boolean;
   warmupScore: number;
   excluded: boolean;
-  campaignIds: string[];
+  campaignIds: string[]; // ACTIVE campaigns only
+  allCampaignIds: string[]; // every campaign, any status — what a swap must touch
   groups: string[];
   shareCount: number; // active campaigns sharing this mailbox
-  idle: boolean; // connected but attached to no active campaign
+  idle: boolean; // attached to no campaign at all
+  pausedOnly: boolean; // attached only to non-active campaigns — free to reuse
   // Dropped because it falls outside the "inboxes I'm actually using" count,
   // rather than being excluded by hand.
   beyondCount: boolean;
+  // --- raw health signals (consumed by mailboxHealth.ts) --------------------
+  warmupScoreKnown: boolean; // false => score absent, NOT a genuine zero
+  warmupOn: boolean;
+  setupPending: boolean;
+  statusRaw: number | string;
+  createdAt: string | null; // separates "new and ramping" from "mature and burned"
+  lastUsedAt: string | null;
+  providerCode: number | null;
 }
 
 /**
@@ -120,6 +130,7 @@ export interface PlannerCampaign {
   replyRate: number;
   bounceRate: number;
   opportunities: number;
+  health: HealthScore;
 }
 
 export interface PlannerGroup {
@@ -139,6 +150,7 @@ export interface PlannerGroup {
   daysToFinish: number | null;
   finishDate: string | null;
   replyRate: number;
+  health: HealthScore;
 }
 
 export interface GoalResult {
@@ -179,6 +191,7 @@ export interface Plan {
   totalGap: number;
   warmupAdjustedSupply: number;
   truncated: boolean;
+  health: HealthScore; // whole-workspace rollup
   goal: GoalResult;
   actions: PlannerAction[];
 }
@@ -220,6 +233,74 @@ function rate(n: number, d: number): number {
 /** A mailbox whose capacity actually counts towards supply. */
 function inUse(b: PlannerMailbox | undefined): b is PlannerMailbox {
   return Boolean(b && b.active && !b.excluded && !b.beyondCount);
+}
+
+export type HealthBand = "good" | "fair" | "at-risk" | "critical" | "unknown";
+
+export interface HealthScore {
+  score: number; // 0-100
+  band: HealthBand;
+  mailboxes: number;
+  scored: number; // how many contributed a known warmup score
+  unknown: number;
+  broken: number;
+  weakest: { email: string; score: number } | null;
+  note: string; // one line explaining what drove it
+}
+
+export function bandFor(score: number, scored: number): HealthBand {
+  if (scored === 0) return "unknown";
+  if (score >= 85) return "good";
+  if (score >= 70) return "fair";
+  if (score >= 50) return "at-risk";
+  return "critical";
+}
+
+/**
+ * Health of a set of mailboxes, 0-100.
+ *
+ * Weighted by daily limit rather than a flat mean, because a burned 50/day
+ * mailbox does far more damage than a burned 5/day one. Broken accounts score
+ * 0 outright — they send nothing — and mailboxes with no reported score are
+ * excluded from the mean but counted, so a campaign can't look healthy purely
+ * because its scores are missing.
+ */
+export function healthOf(boxes: PlannerMailbox[]): HealthScore {
+  const broken = boxes.filter((b) => !b.active || b.setupPending);
+  const unknown = boxes.filter((b) => b.active && !b.setupPending && !b.warmupScoreKnown);
+  const scored = boxes.filter((b) => b.active && !b.setupPending && b.warmupScoreKnown);
+
+  let weighted = 0;
+  let weight = 0;
+  for (const b of scored) {
+    const w = Math.max(1, b.dailyLimit);
+    weighted += b.warmupScore * w;
+    weight += w;
+  }
+  // Broken mailboxes drag the score down at their full weight, scoring zero.
+  for (const b of broken) weight += Math.max(1, b.dailyLimit);
+
+  const score = weight > 0 ? Math.round(weighted / weight) : 0;
+  const weakest = scored.reduce<{ email: string; score: number } | null>(
+    (min, b) => (min === null || b.warmupScore < min.score ? { email: b.email, score: b.warmupScore } : min),
+    null,
+  );
+
+  const parts: string[] = [];
+  if (broken.length) parts.push(`${broken.length} not sending`);
+  if (unknown.length) parts.push(`${unknown.length} with no score`);
+  if (weakest && weakest.score < 80) parts.push(`weakest ${weakest.score}`);
+
+  return {
+    score,
+    band: bandFor(score, scored.length),
+    mailboxes: boxes.length,
+    scored: scored.length,
+    unknown: unknown.length,
+    broken: broken.length,
+    weakest,
+    note: parts.length ? parts.join(" · ") : scored.length ? "all mailboxes healthy" : "no scores reported",
+  };
 }
 
 // "AEO - US SaaS" -> "AEO". Splits on the separators operators actually use in
@@ -278,7 +359,10 @@ export function computePlan({
     const email = String(a.email ?? "").trim().toLowerCase();
     if (!email || boxes.has(email)) continue;
     const lim = limitOf(a, F.acctDailyLimit);
-    const score = pick(a, F.warmupScore, 0);
+    const scoreRaw = limitOf(a, F.warmupScore); // MISSING when the field is absent
+    const scoreKnown = scoreRaw !== MISSING;
+    const score = scoreKnown ? scoreRaw : 0;
+    const str = (v: unknown) => (typeof v === "string" && v.trim() ? v : null);
     boxes.set(email, {
       email,
       dailyLimit: lim === MISSING ? Math.max(0, settings.per_mailbox_daily_limit) : lim,
@@ -289,10 +373,19 @@ export function computePlan({
       warmupScore: score,
       excluded: excluded.has(email),
       campaignIds: [],
+      allCampaignIds: [],
       groups: [],
       shareCount: 0,
       idle: false,
+      pausedOnly: false,
       beyondCount: false,
+      warmupScoreKnown: scoreKnown,
+      warmupOn: Number(a.warmup_status) === 1,
+      setupPending: a.setup_pending === true,
+      statusRaw: (a.status as number | string) ?? "",
+      createdAt: str(a.timestamp_created),
+      lastUsedAt: str(a.timestamp_last_used),
+      providerCode: typeof a.provider_code === "number" ? a.provider_code : null,
     });
   }
 
@@ -325,9 +418,12 @@ export function computePlan({
     const name = String(c.name ?? c.campaign_name ?? "Campaign");
     const list = Array.isArray(c.email_list) ? (c.email_list as unknown[]) : [];
     if (list.length > 0) sawEmailList = true;
-    const emails = list
-      .map((e) => String(e ?? "").trim().toLowerCase())
-      .filter((e) => e && !excluded.has(e));
+    // emailsRaw is the campaign's ACTUAL mailbox list. `emails` drops the ones
+    // the operator excluded, which is right for supply math but would silently
+    // detach them if it were ever written back to Instantly — so any write path
+    // must use emailsRaw.
+    const emailsRaw = list.map((e) => String(e ?? "").trim().toLowerCase()).filter(Boolean);
+    const emails = emailsRaw.filter((e) => !excluded.has(e));
     const active = isActiveCampaign(c);
     const lim = limitOf(c, F.campDailyLimit);
     const maxLeads = limitOf(c, F.campMaxLeads);
@@ -341,24 +437,35 @@ export function computePlan({
       prioritizeNewLeads:
         typeof c.prioritize_new_leads === "boolean" ? c.prioritize_new_leads : null,
       emails,
+      emailsRaw,
+      status: Number(c.status),
       raw: c,
     };
   });
 
-  // Attribute mailboxes to campaigns, counting how many ACTIVE campaigns share
-  // each one — this is what makes the fair-share split possible.
+  // Attribute mailboxes to campaigns. `shareCount` counts only ACTIVE campaigns
+  // (that's what the fair-share split needs), but `allCampaignIds` records every
+  // campaign regardless of status — without it a mailbox sitting in a paused
+  // campaign looks orphaned, and a swap has no way to know which campaigns to
+  // touch. Note this walks emailsRaw and skips the inUse() gate so that an
+  // excluded or disconnected mailbox still records its linkage; every consumer
+  // re-filters by inUse, so no arithmetic changes.
   for (const p of parsed) {
-    if (!p.active) continue;
-    for (const email of p.emails) {
+    for (const email of p.emailsRaw) {
       const box = boxes.get(email);
-      if (!inUse(box)) continue;
+      if (!box) continue;
+      if (!box.allCampaignIds.includes(p.id)) box.allCampaignIds.push(p.id);
+      if (!p.active) continue;
       box.campaignIds.push(p.id);
       if (!box.groups.includes(p.group)) box.groups.push(p.group);
       box.shareCount++;
     }
   }
   for (const box of boxes.values()) {
-    box.idle = inUse(box) && box.shareCount === 0;
+    box.idle = inUse(box) && box.allCampaignIds.length === 0;
+    // Attached, but only to campaigns that aren't sending — parked, not orphaned,
+    // and therefore free to reuse elsewhere.
+    box.pausedOnly = inUse(box) && box.shareCount === 0 && box.allCampaignIds.length > 0;
   }
 
   // --- Per-campaign figures -------------------------------------------------
@@ -425,6 +532,9 @@ export function computePlan({
       replyRate: rate(pick(s, F.replies, 0), sent),
       bounceRate: rate(pick(s, F.bounced, 0), sent),
       opportunities: pick(s, F.opps, 0),
+      // Scored over the campaign's REAL mailbox list, so an excluded-but-still-
+      // attached mailbox can't hide a deliverability problem.
+      health: healthOf(p.emailsRaw.map((e) => boxes.get(e)).filter((b): b is PlannerMailbox => !!b)),
     };
   });
 
@@ -483,6 +593,11 @@ export function computePlan({
       newLeadsPerDay: activeList.reduce((n, c) => n + c.newLeadsPerDay, 0),
       daysToFinish: groupDaysToFinish,
       finishDate: groupFinishDate,
+      health: healthOf(
+        Array.from(new Set(activeList.flatMap((c) => c.emails)))
+          .map((e) => boxes.get(e))
+          .filter((b): b is PlannerMailbox => !!b),
+      ),
       replyRate:
         totalSent > 0
           ? activeList.reduce((n, c) => n + c.replyRate * c.leadsContacted, 0) / totalSent
@@ -608,6 +723,7 @@ export function computePlan({
     totalGap: totalDemand - totalSupply,
     warmupAdjustedSupply,
     truncated: accountsTruncated || campaignsTruncated,
+    health: healthOf(usable),
     goal,
     actions,
   };

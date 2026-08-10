@@ -36,14 +36,17 @@ export function Modal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-ink/40 p-4 backdrop-blur-sm">
+    // The overlay itself must NOT scroll — otherwise a tall dialog scrolls its
+    // own header and footer out of view. Cap the card's height instead and let
+    // only the body scroll, so the title and actions stay reachable.
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-ink/40 p-4 backdrop-blur-sm">
       <div
         className={cn(
-          "card my-8 w-full animate-pop-in shadow-hard-lg",
+          "card flex max-h-[90vh] w-full animate-pop-in flex-col shadow-hard-lg",
           widths[size],
         )}
       >
-        <div className="flex items-center justify-between border-b-2 border-ink px-5 py-3">
+        <div className="flex shrink-0 items-center justify-between border-b-2 border-ink px-5 py-3">
           <h3 className="text-lg font-extrabold">{title}</h3>
           <button
             onClick={onClose}
@@ -52,9 +55,9 @@ export function Modal({
             <X size={16} />
           </button>
         </div>
-        <div className="px-5 py-4">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
         {footer ? (
-          <div className="flex items-center justify-end gap-2 border-t-2 border-ink px-5 py-3">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t-2 border-ink px-5 py-3">
             {footer}
           </div>
         ) : null}

@@ -12,6 +12,7 @@ import {
   Zap,
   Ban,
   Flame,
+  HeartPulse,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
@@ -22,6 +23,15 @@ import { computePlan, type PlannerGroup } from "../lib/campaignPlan";
 import { instantly } from "../lib/instantly";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
 import { cn } from "../lib/utils";
+
+// Health bands share the app's badge tones so a score reads the same everywhere.
+const HEALTH_TONE: Record<string, "mint" | "sky" | "sun" | "danger" | "white"> = {
+  good: "mint",
+  fair: "sky",
+  "at-risk": "sun",
+  critical: "danger",
+  unknown: "white",
+};
 
 const SEV_TONE: Record<string, "danger" | "sun" | "sky"> = {
   high: "danger",
@@ -189,7 +199,7 @@ export default function Planner() {
       ) : null}
 
       {/* Summary */}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
         <StatCard
           label="Campaign demand / day"
           value={fmtNumber(p.totalDemand)}
@@ -210,6 +220,13 @@ export default function Planner() {
           sublabel={p.totalGap > 0 ? "add inboxes to close it" : "room to raise limits"}
           tone={gapTone}
           icon={<Target size={18} />}
+        />
+        <StatCard
+          label="Campaign health"
+          value={p.health.band === "unknown" ? "—" : String(p.health.score)}
+          sublabel={p.health.note}
+          tone={HEALTH_TONE[p.health.band]}
+          icon={<HeartPulse size={18} />}
         />
         <StatCard
           label="Today's real supply"
@@ -454,14 +471,15 @@ export default function Planner() {
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>
                     <td className="px-3 py-2">{fmtNumber(b.dailyLimit)}</td>
                     <td className="px-3 py-2 text-xs text-muted">
-                      {b.campaignIds.length === 0 ? (
+                      {b.allCampaignIds.length === 0 ? (
                         <span className="text-muted">not in any campaign</span>
                       ) : (
                         <span
                           className="line-clamp-2"
-                          title={b.campaignIds.map((id) => campaignName.get(id) ?? id).join("\n")}
+                          title={b.allCampaignIds.map((id) => campaignName.get(id) ?? id).join("\n")}
                         >
-                          {b.campaignIds.map((id) => campaignName.get(id) ?? id).join(", ")}
+                          {b.allCampaignIds.map((id) => campaignName.get(id) ?? id).join(", ")}
+                          {b.pausedOnly ? " (paused)" : ""}
                         </span>
                       )}
                     </td>
@@ -474,6 +492,8 @@ export default function Planner() {
                         </Badge>
                       ) : b.beyondCount ? (
                         <Badge tone="white">not in use</Badge>
+                      ) : b.pausedOnly ? (
+                        <Badge tone="sky">parked</Badge>
                       ) : b.idle ? (
                         <Badge tone="sun">idle</Badge>
                       ) : b.warmingUp ? (
@@ -517,6 +537,9 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
             <Badge tone={short ? "danger" : "mint"}>
               {short ? `short ${fmtNumber(g.gapDaily)}/day` : `${fmtNumber(-g.gapDaily || 0)} spare`}
             </Badge>
+            {g.health.band !== "unknown" ? (
+              <Badge tone={HEALTH_TONE[g.health.band]}>health {g.health.score}</Badge>
+            ) : null}
             {g.sharedMailboxes > 0 ? (
               <Badge tone="sun">{g.sharedMailboxes} shared inbox{g.sharedMailboxes === 1 ? "" : "es"}</Badge>
             ) : null}
@@ -542,7 +565,7 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
 
       {open ? (
         <div className="overflow-x-auto border-t-2 border-ink/10 px-4 pb-4">
-          <table className="w-full min-w-[900px] border-collapse text-left text-sm">
+          <table className="w-full min-w-[1020px] border-collapse text-left text-sm">
             <thead>
               <tr className="text-xs uppercase text-muted">
                 <th className="py-2 pr-3">Campaign</th>
@@ -551,6 +574,7 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                 <th className="w-16 py-2 pr-3">Boxes</th>
                 <th className="w-32 py-2 pr-3">Priority</th>
                 <th className="w-44 py-2 pr-3">Leads contacted</th>
+                <th className="w-20 py-2 pr-3">Health</th>
                 <th className="w-24 py-2 pr-3">New leads/day</th>
                 <th className="w-32 py-2">Finishes in</th>
               </tr>
@@ -603,6 +627,16 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                       </p>
                     </td>
                     <td className="py-2 pr-3">
+                      {c.health.band === "unknown" ? (
+                        <span className="text-muted" title={c.health.note}>—</span>
+                      ) : (
+                        <Badge tone={HEALTH_TONE[c.health.band]}>
+                          {c.health.score}
+                        </Badge>
+                      )}
+                      <p className="mt-0.5 text-[11px] text-muted">{c.health.note}</p>
+                    </td>
+                    <td className="py-2 pr-3">
                       {c.newLeadsPerDay > 0 ? (
                         <>
                           <p className="font-bold">{fmtNumber(c.newLeadsPerDay)}</p>
@@ -635,7 +669,7 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                   </tr>
                   {openBoxes.has(c.id) ? (
                     <tr key={`${c.id}-boxes`} className="border-t border-ink/10 bg-canvas/70">
-                      <td colSpan={7} className="px-1 py-3">
+                      <td colSpan={8} className="px-1 py-3">
                         <p className="mb-1.5 text-xs font-bold uppercase text-muted">
                           Mailboxes sending this campaign ({c.emails.length})
                         </p>
