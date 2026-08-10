@@ -203,6 +203,9 @@ export interface PlanInput {
   cap: CapacityResult;
   settings: AppSettings;
   costs?: CostItem[];
+  // Inbox-vs-spam rates, when warmup analytics has been fetched. Optional
+  // throughout: without it health falls back to warmup score alone.
+  placement?: PlacementInput;
   today?: Date; // injected so completion dates stay deterministic in tests
 }
 
@@ -245,8 +248,13 @@ export interface HealthScore {
   unknown: number;
   broken: number;
   weakest: { email: string; score: number } | null;
+  placementChecked: number; // mailboxes with a measured inbox-vs-spam rate
+  worstPlacement: { email: string; inboxRate: number } | null;
   note: string; // one line explaining what drove it
 }
+
+/** Inbox-vs-spam rate per mailbox, as supplied by placement.ts. */
+export type PlacementInput = Map<string, { inboxRate: number | null }>;
 
 export function bandFor(score: number, scored: number): HealthBand {
   if (scored === 0) return "unknown";
@@ -264,17 +272,39 @@ export function bandFor(score: number, scored: number): HealthBand {
  * 0 outright — they send nothing — and mailboxes with no reported score are
  * excluded from the mean but counted, so a campaign can't look healthy purely
  * because its scores are missing.
+ *
+ * When placement data is supplied, each mailbox's contribution is scaled by the
+ * share of its warmup mail actually reaching the inbox. A 90-score mailbox that
+ * lands half its mail in spam contributes 45, because from the campaign's point
+ * of view that is what it is worth. Mailboxes with no measured rate are scaled
+ * by nothing — absent data must never read as a penalty.
  */
-export function healthOf(boxes: PlannerMailbox[]): HealthScore {
+export function healthOf(boxes: PlannerMailbox[], placement?: PlacementInput): HealthScore {
   const broken = boxes.filter((b) => !b.active || b.setupPending);
   const unknown = boxes.filter((b) => b.active && !b.setupPending && !b.warmupScoreKnown);
   const scored = boxes.filter((b) => b.active && !b.setupPending && b.warmupScoreKnown);
 
+  const rateFor = (email: string): number | null => {
+    const r = placement?.get(email)?.inboxRate;
+    return typeof r === "number" && Number.isFinite(r) ? Math.min(100, Math.max(0, r)) : null;
+  };
+
   let weighted = 0;
   let weight = 0;
+  let placementChecked = 0;
+  let worstPlacement: { email: string; inboxRate: number } | null = null;
+
   for (const b of scored) {
     const w = Math.max(1, b.dailyLimit);
-    weighted += b.warmupScore * w;
+    const rate = rateFor(b.email);
+    if (rate !== null) {
+      placementChecked++;
+      if (worstPlacement === null || rate < worstPlacement.inboxRate) {
+        worstPlacement = { email: b.email, inboxRate: rate };
+      }
+    }
+    const effective = rate === null ? b.warmupScore : b.warmupScore * (rate / 100);
+    weighted += effective * w;
     weight += w;
   }
   // Broken mailboxes drag the score down at their full weight, scoring zero.
@@ -290,6 +320,9 @@ export function healthOf(boxes: PlannerMailbox[]): HealthScore {
   if (broken.length) parts.push(`${broken.length} not sending`);
   if (unknown.length) parts.push(`${unknown.length} with no score`);
   if (weakest && weakest.score < 80) parts.push(`weakest ${weakest.score}`);
+  if (worstPlacement && worstPlacement.inboxRate < 80) {
+    parts.push(`${Math.round(worstPlacement.inboxRate)}% inbox on ${worstPlacement.email}`);
+  }
 
   return {
     score,
@@ -299,6 +332,8 @@ export function healthOf(boxes: PlannerMailbox[]): HealthScore {
     unknown: unknown.length,
     broken: broken.length,
     weakest,
+    placementChecked,
+    worstPlacement,
     note: parts.length ? parts.join(" · ") : scored.length ? "all mailboxes healthy" : "no scores reported",
   };
 }
@@ -339,6 +374,7 @@ export function computePlan({
   cap,
   settings,
   costs = [],
+  placement,
   today,
 }: PlanInput): Plan {
   // Weekends still pass on the calendar even though nothing sends, so ETAs are
@@ -534,7 +570,10 @@ export function computePlan({
       opportunities: pick(s, F.opps, 0),
       // Scored over the campaign's REAL mailbox list, so an excluded-but-still-
       // attached mailbox can't hide a deliverability problem.
-      health: healthOf(p.emailsRaw.map((e) => boxes.get(e)).filter((b): b is PlannerMailbox => !!b)),
+      health: healthOf(
+        p.emailsRaw.map((e) => boxes.get(e)).filter((b): b is PlannerMailbox => !!b),
+        placement,
+      ),
     };
   });
 
@@ -597,6 +636,7 @@ export function computePlan({
         Array.from(new Set(activeList.flatMap((c) => c.emails)))
           .map((e) => boxes.get(e))
           .filter((b): b is PlannerMailbox => !!b),
+        placement,
       ),
       replyRate:
         totalSent > 0
@@ -723,7 +763,7 @@ export function computePlan({
     totalGap: totalDemand - totalSupply,
     warmupAdjustedSupply,
     truncated: accountsTruncated || campaignsTruncated,
-    health: healthOf(usable),
+    health: healthOf(usable, placement),
     goal,
     actions,
   };

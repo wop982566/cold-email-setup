@@ -19,9 +19,18 @@ import { useToast } from "../components/ui/toast";
 import { useCollection, useSettings, useSaveSettings } from "../lib/hooks";
 import { AppSettings, CapacitySource, CostItem, Domain, TABLES } from "../lib/types";
 import { computeCapacity } from "../lib/capacity";
-import { computePlan, type PlannerGroup } from "../lib/campaignPlan";
-import { instantly } from "../lib/instantly";
+import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
+import { instantly, asItems } from "../lib/instantly";
+import {
+  batchEmails,
+  mergePlacement,
+  parseWarmupAnalytics,
+  toHealthInput,
+  type PlacementMap,
+} from "../lib/placement";
+import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
+import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
 import { cn } from "../lib/utils";
 
@@ -39,6 +48,23 @@ const SEV_TONE: Record<string, "danger" | "sun" | "sky"> = {
   medium: "sun",
   low: "sky",
 };
+
+/** What actually drove a health score, for the badge's tooltip. */
+function healthTitle(h: HealthScore): string {
+  const lines = [
+    `${h.score}/100 across ${h.mailboxes} mailbox${h.mailboxes === 1 ? "" : "es"}`,
+    h.broken ? `${h.broken} not sending (counted as 0)` : "",
+    h.unknown ? `${h.unknown} with no warmup score` : "",
+    h.weakest ? `weakest: ${h.weakest.email} at ${h.weakest.score}` : "",
+    h.worstPlacement
+      ? `lowest inbox rate: ${h.worstPlacement.email} at ${Math.round(h.worstPlacement.inboxRate)}%`
+      : "",
+    h.placementChecked
+      ? `placement measured on ${h.placementChecked}`
+      : "no placement data — warmup score only",
+  ];
+  return lines.filter(Boolean).join("\n");
+}
 
 export default function Planner() {
   const toast = useToast();
@@ -63,6 +89,47 @@ export default function Planner() {
     staleTime: 60_000,
   });
 
+  // Inbox-vs-spam placement. Derived from the ACCOUNTS payload rather than the
+  // plan, because the plan's own health now consumes placement — sourcing it
+  // from the plan would be circular.
+  const placementEmails = useMemo(() => {
+    if (!acctQ.data?.ok) return [] as string[];
+    return asItems<Record<string, unknown>>(acctQ.data.data)
+      .map((a) => String(a.email ?? "").trim().toLowerCase())
+      .filter(Boolean)
+      .sort();
+  }, [acctQ.data]);
+
+  const placeQ = useQuery({
+    // Keyed on the address list so adding a mailbox refetches, and the Refresh
+    // button's ["inst"] invalidation still covers it.
+    queryKey: ["inst", "placement", placementEmails],
+    enabled: placementEmails.length > 0,
+    staleTime: 5 * 60_000,
+    queryFn: async (): Promise<PlacementMap> => {
+      // The endpoint caps at 100 emails per call. Batches run in sequence to
+      // stay polite with the API — 100 mailboxes is one request.
+      const maps: PlacementMap[] = [];
+      for (const batch of batchEmails(placementEmails)) {
+        const res = await instantly.warmup(batch);
+        if (res.ok) maps.push(parseWarmupAnalytics(res.data));
+      }
+      return mergePlacement(maps);
+    },
+  });
+
+  const placement = placeQ.data ?? null;
+  const placementHealthInput = useMemo(
+    () => (placement ? toHealthInput(placement) : undefined),
+    [placement],
+  );
+  // Mailboxes with a genuinely measured rate — entries exist for addresses the
+  // endpoint returned nothing for, and those must not read as "checked".
+  const placementChecked = useMemo(
+    () => (placement ? [...placement.values()].filter((p) => p.inboxRate !== null).length : 0),
+    [placement],
+  );
+
   const cap = useMemo(
     () => (settings ? computeCapacity(domains, capacity, settings) : null),
     [domains, capacity, settings],
@@ -77,8 +144,27 @@ export default function Planner() {
       cap,
       settings,
       costs,
+      placement: placementHealthInput,
     });
-  }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs]);
+  }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs, placementHealthInput]);
+
+  // Computed once here and shared: the Maintenance tab and the per-campaign
+  // mailbox breakdown must never disagree about an address.
+  const maintenance = useMemo(() => {
+    if (!plan || !settings) return null;
+    return computeMaintenance({
+      plan,
+      domains,
+      settings,
+      placement: placementHealthInput,
+    });
+  }, [plan, domains, settings, placementHealthInput]);
+
+  const healthByEmail = useMemo(() => {
+    const m = new Map<string, MailboxHealth>();
+    for (const h of maintenance?.mailboxes ?? []) m.set(h.box.email, h);
+    return m;
+  }, [maintenance]);
 
   const queries = [acctQ, campQ, statsQ];
   const notConfigured = queries.some((q) => q.data?.configured === false);
@@ -216,7 +302,14 @@ export default function Planner() {
       </div>
 
       {tab === "maintenance" ? (
-        <CampaignMaintenance plan={p} domains={domains} settings={settings} />
+        <CampaignMaintenance
+          plan={p}
+          maintenance={maintenance}
+          settings={settings}
+          placement={placement}
+          placementChecked={placementChecked}
+          placementLoading={placeQ.isLoading}
+        />
       ) : (
       <>
 
@@ -443,6 +536,8 @@ export default function Planner() {
                 g={g}
                 open={openGroups.has(g.key)}
                 onToggle={() => toggleGroup(g.key)}
+                healthByEmail={healthByEmail}
+                placement={placement}
               />
             ))}
           </div>
@@ -537,7 +632,19 @@ export default function Planner() {
   );
 }
 
-function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onToggle: () => void }) {
+function GroupRow({
+  g,
+  open,
+  onToggle,
+  healthByEmail,
+  placement,
+}: {
+  g: PlannerGroup;
+  open: boolean;
+  onToggle: () => void;
+  healthByEmail: Map<string, MailboxHealth>;
+  placement: PlacementMap | null;
+}) {
   const short = g.gapDaily > 0;
   const max = Math.max(g.demandDaily, g.supplyDaily, 1);
   // Which campaigns have their attached mailbox addresses revealed.
@@ -562,7 +669,9 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
               {short ? `short ${fmtNumber(g.gapDaily)}/day` : `${fmtNumber(-g.gapDaily || 0)} spare`}
             </Badge>
             {g.health.band !== "unknown" ? (
-              <Badge tone={HEALTH_TONE[g.health.band]}>health {g.health.score}</Badge>
+              <span title={healthTitle(g.health)}>
+                <Badge tone={HEALTH_TONE[g.health.band]}>health {g.health.score}</Badge>
+              </span>
             ) : null}
             {g.sharedMailboxes > 0 ? (
               <Badge tone="sun">{g.sharedMailboxes} shared inbox{g.sharedMailboxes === 1 ? "" : "es"}</Badge>
@@ -654,9 +763,9 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                       {c.health.band === "unknown" ? (
                         <span className="text-muted" title={c.health.note}>—</span>
                       ) : (
-                        <Badge tone={HEALTH_TONE[c.health.band]}>
-                          {c.health.score}
-                        </Badge>
+                        <span title={healthTitle(c.health)}>
+                          <Badge tone={HEALTH_TONE[c.health.band]}>{c.health.score}</Badge>
+                        </span>
                       )}
                       <p className="mt-0.5 text-[11px] text-muted">{c.health.note}</p>
                     </td>
@@ -694,16 +803,12 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                   {openBoxes.has(c.id) ? (
                     <tr key={`${c.id}-boxes`} className="border-t border-ink/10 bg-canvas/70">
                       <td colSpan={8} className="px-1 py-3">
-                        <p className="mb-1.5 text-xs font-bold uppercase text-muted">
-                          Mailboxes sending this campaign ({c.emails.length})
-                        </p>
-                        <div className="flex flex-wrap gap-1.5">
-                          {c.emails.map((e) => (
-                            <span key={e} className="chip">
-                              {e}
-                            </span>
-                          ))}
-                        </div>
+                        <CampaignMailboxTable
+                          emails={c.emails}
+                          health={c.health}
+                          healthByEmail={healthByEmail}
+                          placement={placement}
+                        />
                       </td>
                     </tr>
                   ) : null}

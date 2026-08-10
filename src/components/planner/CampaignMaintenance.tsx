@@ -1,11 +1,12 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { HeartPulse, ArrowRight, AlertTriangle, Copy, ChevronDown, ChevronRight, Check } from "lucide-react";
-import { Card, StatCard, Badge } from "../ui/primitives";
+import { Card, StatCard, Badge, Spinner } from "../ui/primitives";
 import { useToast } from "../ui/toast";
-import { computeMaintenance, type MailboxHealth, type SwapProposal } from "../../lib/mailboxHealth";
+import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailboxHealth";
 import { Plan } from "../../lib/campaignPlan";
-import { AppSettings, Domain } from "../../lib/types";
+import type { PlacementMap } from "../../lib/placement";
+import { AppSettings } from "../../lib/types";
 import { fmtNumber } from "../../lib/format";
 import { cn } from "../../lib/utils";
 
@@ -21,23 +22,41 @@ function ScoreBadge({ m }: { m: MailboxHealth }) {
   return <Badge tone={tone}>{m.score}</Badge>;
 }
 
+/** Inbox-vs-spam rate. Renders nothing when unmeasured — silence beats a zero. */
+function PlaceBadge({ email, placement }: { email: string; placement: PlacementMap | null }) {
+  const p = placement?.get(email);
+  if (!p || p.inboxRate === null) return null;
+  const rate = Math.round(p.inboxRate);
+  const tone = rate >= 90 ? "mint" : rate >= 80 ? "sky" : rate >= 50 ? "sun" : "danger";
+  return (
+    <Badge tone={tone} className={undefined}>
+      {rate}% inbox
+    </Badge>
+  );
+}
+
 export function CampaignMaintenance({
   plan,
-  domains,
+  maintenance,
   settings,
+  placement,
+  placementChecked,
+  placementLoading,
 }: {
   plan: Plan;
-  domains: Domain[];
+  // Computed once by the page and shared with the per-campaign breakdown, so
+  // the two views can never disagree about an address.
+  maintenance: Maintenance | null;
   settings: AppSettings;
+  placement: PlacementMap | null;
+  placementChecked: number;
+  placementLoading: boolean;
 }) {
   const toast = useToast();
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [altIdx, setAltIdx] = useState<Map<string, number>>(new Map());
 
-  const m = useMemo(
-    () => computeMaintenance({ plan, domains, settings }),
-    [plan, domains, settings],
-  );
+  const m = maintenance;
 
   function toggle(id: string) {
     setOpen((s) => {
@@ -80,8 +99,35 @@ export function CampaignMaintenance({
     );
   }
 
+  if (!m) return null;
+
+  const totalBoxes = m.mailboxes.length;
+
   return (
     <div className="space-y-4">
+      {/* Placement coverage. Stated explicitly because partial coverage looks
+          identical to a clean bill of health if you don't say so. */}
+      <Card className="flex flex-wrap items-center gap-2 p-3 text-xs">
+        {placementLoading ? (
+          <>
+            <Spinner /> <span>Checking inbox-vs-spam placement…</span>
+          </>
+        ) : placementChecked === 0 ? (
+          <span className="text-muted">
+            No inbox-vs-spam data reported yet — mailboxes are scored on warmup score alone.
+            Placement appears once Instantly's warmup analytics has sent enough test mail.
+          </span>
+        ) : (
+          <span>
+            <b>Placement measured on {placementChecked}</b> of {totalBoxes} mailbox
+            {totalBoxes === 1 ? "" : "es"}.
+            {placementChecked < totalBoxes
+              ? " The rest have no warmup data yet and are scored on warmup score alone."
+              : ""}
+          </span>
+        )}
+      </Card>
+
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard
           label="Need replacing"
@@ -116,6 +162,7 @@ export function CampaignMaintenance({
                 <p className="truncate font-bold">{p.bad.box.email}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-1">
                   <ScoreBadge m={p.bad} />
+                  <PlaceBadge email={p.bad.box.email} placement={placement} />
                   {p.bad.issues
                     .filter((i) => i.triggersReplacement)
                     .map((i) => (
@@ -130,6 +177,7 @@ export function CampaignMaintenance({
                 <p className="truncate font-bold">{to.box.email}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-1">
                   <ScoreBadge m={to} />
+                  <PlaceBadge email={to.box.email} placement={placement} />
                   <span className="text-[11px] text-muted">{p.reasons.join(" · ")}</span>
                 </div>
               </div>
