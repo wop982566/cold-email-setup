@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, Fragment } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -162,6 +162,9 @@ export default function Planner() {
 
   const p = plan;
   const gapTone = p.totalGap > 0 ? "danger" : "mint";
+  // Instantly links campaigns to mailboxes by address (email_list); resolve the
+  // ids back to names so the mailbox table can name the campaigns it serves.
+  const campaignName = new Map(p.campaigns.map((c) => [c.id, c.name]));
 
   return (
     <div className="space-y-5">
@@ -451,9 +454,16 @@ export default function Planner() {
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>
                     <td className="px-3 py-2">{fmtNumber(b.dailyLimit)}</td>
                     <td className="px-3 py-2 text-xs text-muted">
-                      {b.shareCount === 0
-                        ? "—"
-                        : `${b.shareCount} campaign${b.shareCount === 1 ? "" : "s"} · ${b.groups.join(", ")}`}
+                      {b.campaignIds.length === 0 ? (
+                        <span className="text-muted">not in any campaign</span>
+                      ) : (
+                        <span
+                          className="line-clamp-2"
+                          title={b.campaignIds.map((id) => campaignName.get(id) ?? id).join("\n")}
+                        >
+                          {b.campaignIds.map((id) => campaignName.get(id) ?? id).join(", ")}
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-2">
                       {!b.active ? (
@@ -486,6 +496,14 @@ export default function Planner() {
 function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onToggle: () => void }) {
   const short = g.gapDaily > 0;
   const max = Math.max(g.demandDaily, g.supplyDaily, 1);
+  // Which campaigns have their attached mailbox addresses revealed.
+  const [openBoxes, setOpenBoxes] = useState<Set<string>>(new Set());
+  const toggleBoxes = (id: string) =>
+    setOpenBoxes((s) => {
+      const n = new Set(s);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
   return (
     <div className={cn(open && "bg-canvas/60")}>
       <button className="flex w-full items-start gap-3 p-4 text-left" onClick={onToggle}>
@@ -539,7 +557,8 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
             </thead>
             <tbody>
               {g.campaigns.map((c) => (
-                  <tr key={c.id} className="border-t border-ink/10">
+                <Fragment key={c.id}>
+                  <tr className="border-t border-ink/10">
                     <td className="py-2 pr-3">
                       <p className="font-bold">{c.name}</p>
                       {!c.active ? <span className="text-xs text-muted">not sending</span> : null}
@@ -548,7 +567,19 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                     <td className={cn("py-2 pr-3 font-bold", c.gapDaily > 0 && "text-danger")}>
                       {fmtNumber(c.supplyDaily)}
                     </td>
-                    <td className="py-2 pr-3">{c.mailboxCount}</td>
+                    <td className="py-2 pr-3">
+                      {c.emails.length === 0 ? (
+                        <span className="text-muted">0</span>
+                      ) : (
+                        <button
+                          className="font-bold underline decoration-dotted underline-offset-2"
+                          onClick={() => toggleBoxes(c.id)}
+                          title="Show the exact mailboxes attached to this campaign"
+                        >
+                          {c.mailboxCount}
+                        </button>
+                      )}
+                    </td>
                     <td className="py-2 pr-3">
                       {c.prioritizeNewLeads === null ? (
                         <span className="text-xs text-muted">—</span>
@@ -602,6 +633,23 @@ function GroupRow({ g, open, onToggle }: { g: PlannerGroup; open: boolean; onTog
                       )}
                     </td>
                   </tr>
+                  {openBoxes.has(c.id) ? (
+                    <tr key={`${c.id}-boxes`} className="border-t border-ink/10 bg-canvas/70">
+                      <td colSpan={7} className="px-1 py-3">
+                        <p className="mb-1.5 text-xs font-bold uppercase text-muted">
+                          Mailboxes sending this campaign ({c.emails.length})
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {c.emails.map((e) => (
+                            <span key={e} className="chip">
+                              {e}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
               ))}
             </tbody>
           </table>
