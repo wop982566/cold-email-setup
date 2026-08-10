@@ -5,6 +5,7 @@ import { Spinner } from "./components/ui/primitives";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Domains = lazy(() => import("./pages/Domains"));
+const SetupBatch = lazy(() => import("./pages/SetupBatch"));
 const Capacity = lazy(() => import("./pages/Capacity"));
 const Planner = lazy(() => import("./pages/Planner"));
 const Leads = lazy(() => import("./pages/Leads"));
@@ -40,6 +41,14 @@ export default function App() {
           element={
             <Suspense fallback={<Loading />}>
               <Domains />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/setup-batch"
+          element={
+            <Suspense fallback={<Loading />}>
+              <SetupBatch />
             </Suspense>
           }
         />

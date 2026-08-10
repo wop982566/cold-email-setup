@@ -19,6 +19,7 @@ import {
   LogOut,
   AlertTriangle,
   Target,
+  Layers,
 } from "lucide-react";
 import { authEnabled, signOut } from "../../lib/auth";
 import { cn } from "../../lib/utils";
@@ -30,6 +31,7 @@ import { daysUntil } from "../../lib/format";
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/domains", label: "Domains", icon: Globe },
+  { to: "/setup-batch", label: "Bulk Setup", icon: Layers },
   { to: "/capacity", label: "Sending Capacity", icon: Gauge },
   { to: "/planner", label: "Campaign Planner", icon: Target },
   { to: "/leads", label: "Leads", icon: Users },

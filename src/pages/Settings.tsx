@@ -30,9 +30,11 @@ import {
   Campaign,
   CustomField,
   FieldType,
+  SECRET_TABLES,
   TABLES,
 } from "../lib/types";
 import { db, dbMode } from "../lib/db";
+import { MailProfiles } from "../components/settings/MailProfiles";
 import { download, uuid, slugify } from "../lib/utils";
 
 const CURRENCIES = ["USD", "EUR", "GBP", "INR", "CAD", "AUD"];
@@ -55,6 +57,9 @@ export default function Settings() {
     const dump: Record<string, unknown> = { exported_at: new Date().toISOString() };
     for (const t of tables) {
       if (t === TABLES.settings) continue;
+      // Backups are downloaded, mailed around and pasted into chats. SMTP and
+      // IMAP passwords do not belong in one.
+      if (SECRET_TABLES.includes(t)) continue;
       dump[t] = await db.list(t);
     }
     dump.settings = await db.getSettings();
@@ -170,6 +175,9 @@ export default function Settings() {
           </table>
         </div>
       </Card>
+
+      {/* Mailbox credentials — used when creating inboxes in bulk */}
+      <MailProfiles />
 
       {/* Data tools */}
       <Card className="p-5">
