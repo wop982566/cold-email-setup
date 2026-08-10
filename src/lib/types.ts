@@ -252,6 +252,11 @@ export interface AppSettings {
   campaign_group_overrides: Record<string, string>; // instantly campaign id -> group key
   planner_goal_kind: "emails" | "leads";
   planner_goal_value: number;
+  // --- Campaign maintenance ------------------------------------------------
+  maintenance_min_warmup_score: number; // below this, a mature mailbox needs replacing
+  maintenance_critical_score: number; // below this, pull it now
+  maintenance_new_mailbox_days: number; // younger than this, a low score is just warmup
+  maintenance_min_inbox_rate: number; // inbox-vs-spam placement floor
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -271,6 +276,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   campaign_group_overrides: {},
   planner_goal_kind: "emails",
   planner_goal_value: 500,
+  maintenance_min_warmup_score: 80,
+  maintenance_critical_score: 50,
+  maintenance_new_mailbox_days: 21,
+  maintenance_min_inbox_rate: 80,
 };
 
 // Table name constants — single source of truth.

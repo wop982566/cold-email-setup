@@ -21,6 +21,7 @@ import { AppSettings, CapacitySource, CostItem, Domain, TABLES } from "../lib/ty
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup } from "../lib/campaignPlan";
 import { instantly } from "../lib/instantly";
+import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
 import { cn } from "../lib/utils";
 
@@ -50,6 +51,7 @@ export default function Planner() {
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
+  const [tab, setTab] = useState<"plan" | "maintenance">("plan");
 
   // Same keys as the Instantly page and the Sending Health card, so all three
   // share one fetch and the Instantly Refresh button invalidates them.
@@ -197,6 +199,26 @@ export default function Planner() {
           Instantly returned more records than could be paged in time — these totals are a floor.
         </Card>
       ) : null}
+
+      <div className="flex rounded-xl border-2 border-ink">
+        {([["plan", "Plan"], ["maintenance", "Maintenance"]] as const).map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setTab(k)}
+            className={cn(
+              "px-4 py-2 text-sm font-bold first:rounded-l-lg last:rounded-r-lg",
+              tab === k ? "bg-ink text-paper" : "bg-paper hover:bg-canvas",
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "maintenance" ? (
+        <CampaignMaintenance plan={p} domains={domains} settings={settings} />
+      ) : (
+      <>
 
       {/* Summary */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
@@ -509,6 +531,8 @@ export default function Planner() {
           </div>
         ) : null}
       </Card>
+      </>
+      )}
     </div>
   );
 }
