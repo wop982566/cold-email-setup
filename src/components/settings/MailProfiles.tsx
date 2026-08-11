@@ -74,7 +74,8 @@ function PasswordField({
 
 export function MailProfiles() {
   const toast = useToast();
-  const q = useCollection<MailProfile>(TABLES.mailProfiles);
+  // A locked table is a permanent 403, so don't spend three retries on it.
+  const q = useCollection<MailProfile>(TABLES.mailProfiles, { retry: false });
   const insert = useInsert<MailProfile>(TABLES.mailProfiles);
   const update = useUpdate<MailProfile>(TABLES.mailProfiles);
   const remove = useRemove(TABLES.mailProfiles);

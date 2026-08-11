@@ -6,11 +6,17 @@ import {
 import { db, WithId } from "./db";
 import { AppSettings, TableName } from "./types";
 
-export function useCollection<T extends WithId>(table: TableName) {
+export function useCollection<T extends WithId>(
+  table: TableName,
+  // Escape hatch for tables that can fail permanently — the credentials table
+  // 403s until APP_FUNCTION_TOKEN is set, and retrying that is pure delay.
+  options?: { retry?: boolean | number },
+) {
   return useQuery({
     queryKey: [table],
     queryFn: () => db.list<T>(table),
     staleTime: 1000 * 30,
+    ...options,
   });
 }
 

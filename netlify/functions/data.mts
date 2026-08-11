@@ -80,11 +80,11 @@ export default async (req: Request): Promise<Response> => {
     const op = body.op;
     const table = body.table ?? "";
 
-    // Applies to every mutation op, including the bulk `tables` import below.
-    const touchesSecrets =
-      SECRET_TABLES.has(table) ||
-      Object.keys(body.tables ?? {}).some((t) => SECRET_TABLES.has(t));
-    if (touchesSecrets && !secretsAllowed()) {
+    // Only ops that actually TARGET the credentials table are refused. A bulk
+    // payload that merely mentions it is filtered, not rejected: `seedIfEmpty`
+    // names every table, and failing it here took down every read in the app,
+    // since the client awaits that one call before any query.
+    if (SECRET_TABLES.has(table) && !secretsAllowed()) {
       return json({ ok: false, locked: true, error: SECRETS_LOCKED_MESSAGE }, 403);
     }
 
@@ -163,6 +163,9 @@ export default async (req: Request): Promise<Response> => {
         const seeded = await s.get("__seeded", { type: "text" });
         if (seeded === "true") return json({ ok: true, seeded: false });
         for (const [t, rows] of Object.entries(body.tables ?? {})) {
+          // Never seed a credentials table — there is nothing to seed it with,
+          // and an older frontend bundle still lists it in this payload.
+          if (SECRET_TABLES.has(t)) continue;
           const existing = await s.get(t, { type: "json" });
           if (existing == null) await s.setJSON(t, rows);
         }

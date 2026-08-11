@@ -8,6 +8,7 @@
 import {
   AppSettings,
   DEFAULT_SETTINGS,
+  SECRET_TABLES,
   TableName,
   TABLES,
 } from "./types";
@@ -251,6 +252,9 @@ function ensureServerSeeded(): Promise<void> {
     const tables: Record<string, Row[]> = {};
     for (const table of Object.values(TABLES)) {
       if (table === TABLES.settings || skipSeed.includes(table)) continue;
+      // Credential tables have no seed data and the server refuses to serve
+      // them without a token — naming them here once broke every read.
+      if (SECRET_TABLES.includes(table)) continue;
       tables[table] = seedFor(table as TableName);
     }
     seedPromise = api({ method: "POST", body: { op: "seedIfEmpty", tables, settings: seedSettings } })
