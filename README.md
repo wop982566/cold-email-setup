@@ -145,6 +145,18 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   "nothing to report" rather than "the cron died". Swaps it makes are ordinary
   archive entries, so you can undo any of them by hand.
 
+  **Testing it without waiting a day.** The same panel has two buttons.
+  *Test now (dry run)* runs the entire pipeline — settings, Instantly fetch,
+  health, the swap decision — and writes **nothing**, then shows exactly what it
+  would have swapped and what it skipped. *Send test email* pushes one message
+  through Resend and reports what the API actually said, so a missing key or an
+  unverified sending domain is named rather than swallowed. Both are gated on
+  `APP_FUNCTION_TOKEN` when it is set.
+
+  **Note on scheduling:** Netlify runs scheduled functions only on *production*
+  deploys. If the branch carrying this code is a branch deploy rather than the
+  production branch, the cron never fires however the env vars are set.
+
 ---
 
 ## 🧱 Tech & structure

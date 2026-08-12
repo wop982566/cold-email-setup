@@ -74,7 +74,26 @@ async function callInstantly(query: string, body?: unknown): Promise<Record<stri
   return (await res.json().catch(() => ({}))) as Record<string, unknown>;
 }
 
-export default async (): Promise<Response> => {
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+/**
+ * Manual invocation is gated on the app token, same as every other function
+ * here. An endpoint that edits live campaigns must not be reachable by anyone
+ * who guesses the URL. The scheduled invocation carries no token and is
+ * recognised by the absence of a mode query param.
+ */
+function manualAllowed(req: Request | undefined): boolean {
+  const required = process.env.APP_FUNCTION_TOKEN;
+  if (!required) return true;
+  return req?.headers.get("x-app-token") === required;
+}
+
+export default async (req?: Request): Promise<Response> => {
   const startedAt = new Date().toISOString();
   const lines: string[] = [];
   const log = (s: string) => {
@@ -82,8 +101,60 @@ export default async (): Promise<Response> => {
     console.log(`[auto-swap] ${s}`);
   };
 
+  // A manual call names what it wants; the daily schedule passes nothing.
+  let mode: "scheduled" | "dryRun" | "testEmail" = "scheduled";
+  if (req) {
+    const params = new URL(req.url).searchParams;
+    if (params.get("dryRun") != null) mode = "dryRun";
+    else if (params.get("testEmail") != null) mode = "testEmail";
+  }
+
+  if (mode !== "scheduled" && !manualAllowed(req)) {
+    return json({ ok: false, error: "Unauthorized" }, 401);
+  }
+
+  const settingsForEmail = await readSettings().catch(() => null);
+
+  // --- Does Resend work? Asked on its own, so a broken key is distinguishable
+  // from a swapper that had nothing to do. Sends one email, changes nothing.
+  if (mode === "testEmail") {
+    const to = String(settingsForEmail?.auto_swap_notify_email ?? "").trim();
+    const from = String(settingsForEmail?.auto_swap_from_email ?? "").trim();
+    const result = await notify({
+      to,
+      from,
+      subject: "Cold email planner: test email",
+      body: [
+        "This is a test from the Maintenance tab.",
+        "",
+        `If you're reading this, Resend is configured correctly and the daily`,
+        `swapper can reach you at ${to}.`,
+        "",
+        `Sender: ${from}`,
+        `Sent: ${startedAt}`,
+      ].join("\n"),
+    });
+    return json({
+      ok: result.sent,
+      mode: "testEmail",
+      to,
+      from,
+      detail: result.detail,
+      keyConfigured: Boolean(process.env.RESEND_API_KEY),
+    });
+  }
+
   if (!enabled()) {
     log("AUTO_SWAP_ENABLED is not true — nothing done");
+    // A dry run still deserves a real answer about why nothing would happen.
+    if (mode === "dryRun") {
+      return json({
+        ok: false,
+        mode,
+        error: "AUTO_SWAP_ENABLED is not set to true, so the daily run exits immediately",
+        writesEnabled: false,
+      });
+    }
     return new Response("disabled", { status: 200 });
   }
 
@@ -144,6 +215,48 @@ export default async (): Promise<Response> => {
         `skipping ${decision.skip.length}, ${decision.deferred} over the cap of ${policy.maxPerRun}`,
     );
     for (const s of decision.skip) log(`skipped ${s.email}: ${s.reason}`);
+
+    // Everything above is shared with the real run — the dry run reports the
+    // decision rather than recomputing it, so the two can't disagree about what
+    // would happen. Returning HERE means no write is even reachable.
+    if (mode === "dryRun") {
+      const caps = await callInstantly("resource=write", { op: "capabilities" });
+      return json({
+        ok: true,
+        mode: "dryRun",
+        ranAt: startedAt,
+        // The three ways "nothing to do" happens need different fixes, so they
+        // are reported apart rather than all looking like silence.
+        reachedInstantly: {
+          mailboxes: plan.mailboxes.length,
+          campaigns: plan.campaigns.length,
+          note:
+            plan.mailboxes.length === 0
+              ? "Instantly returned no mailboxes — check INSTANTLY_API_KEY"
+              : plan.campaigns.length === 0
+                ? "No campaigns returned — nothing can be swapped"
+                : "ok",
+        },
+        writesEnabled: caps.writesEnabled === true,
+        writesHint: caps.hint ?? null,
+        policy,
+        healthSummary: {
+          flagged: maintenance.flagged.length,
+          proposals: maintenance.proposals.length,
+          healthySpares: maintenance.candidates.length,
+          shortfall: maintenance.shortfall,
+        },
+        wouldSwap: decision.act.map((d) => ({
+          from: d.from,
+          to: d.to,
+          campaigns: d.proposal.campaigns.map((c) => c.name),
+          reason: d.reason,
+        })),
+        wouldSkip: decision.skip,
+        overCap: decision.deferred,
+        log: lines,
+      });
+    }
 
     const applied: { from: string; to: string; campaigns: string[] }[] = [];
     const failed: string[] = [];

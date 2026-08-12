@@ -137,6 +137,34 @@ async function write<T = unknown>(body: Record<string, unknown>): Promise<WriteR
   }
 }
 
+// --- The daily swapper, asked to prove it works ----------------------------
+// Both paths hit the scheduled function directly. dryRun computes a full
+// decision and writes nothing; testEmail sends one email and reports what
+// Resend actually said.
+async function autoSwapCall(mode: "dryRun" | "testEmail"): Promise<Record<string, unknown>> {
+  try {
+    const res = await fetch(`/.netlify/functions/auto-swap?${mode}=1`, {
+      method: "POST",
+      headers: headers(),
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+    if (!res.ok) return { ...body, ok: false, error: body.error ?? `HTTP ${res.status}` };
+    return body;
+  } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "Network error (functions only run on Netlify)",
+    };
+  }
+}
+
+export const autoSwap = {
+  /** Full pipeline, zero writes — what the cron would do right now. */
+  dryRun: () => autoSwapCall("dryRun"),
+  /** One email through Resend, with the raw result. */
+  testEmail: () => autoSwapCall("testEmail"),
+};
+
 export const instantly = {
   accounts: () => call("accounts", { limit: "100" }),
   campaigns: () => call("campaigns", { limit: "100" }),
