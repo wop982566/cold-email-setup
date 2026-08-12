@@ -859,7 +859,8 @@ function GroupRow({
                 <th className="w-44 py-2 pr-3">Leads contacted</th>
                 <th className="w-20 py-2 pr-3">Health</th>
                 <th className="w-24 py-2 pr-3">New leads/day</th>
-                <th className="w-32 py-2">Finishes in</th>
+                <th className="w-36 py-2 pr-3">At full capacity</th>
+                <th className="w-36 py-2">At current rate</th>
               </tr>
             </thead>
             <tbody>
@@ -946,6 +947,28 @@ function GroupRow({
                         <span className="text-muted">—</span>
                       )}
                     </td>
+                    {/* What these mailboxes COULD do, running flat out. This is
+                        the planning number: leads x sequence steps, divided by
+                        mailbox supply. */}
+                    <td className="py-2 pr-3 text-xs">
+                      {c.daysAtCapacityCalendar === null ? (
+                        <span className="text-muted">—</span>
+                      ) : (
+                        <>
+                          <Badge tone="mint">
+                            {fmtNumber(Math.round(c.daysAtCapacityCalendar))}d
+                          </Badge>
+                          {c.capacityFinishDate ? (
+                            <p className="mt-0.5 text-[11px] text-muted">
+                              {fmtDateShort(c.capacityFinishDate)}
+                            </p>
+                          ) : null}
+                          <p className="text-[11px] text-muted">
+                            {fmtNumber(c.emailsNeeded)} emails ÷ {fmtNumber(c.supplyDaily)}/day
+                          </p>
+                        </>
+                      )}
+                    </td>
                     <td className="py-2 text-xs">
                       {c.daysToFinish === null ? (
                         <span className="text-muted">—</span>
@@ -971,31 +994,49 @@ function GroupRow({
                   {/* The whole sum on one line, in the order it gets asked:
                       capacity, rate, what's left, how long, what date. */}
                   <tr className="bg-canvas/40">
-                    <td colSpan={10} className="px-1 pb-2 text-[11px] text-muted">
+                    <td colSpan={11} className="px-1 pb-2 text-[11px] text-muted">
+                      {/* The capacity sum, spelled out end to end. */}
                       <b>{fmtNumber(c.mailboxCount)}</b> inbox
                       {c.mailboxCount === 1 ? "" : "es"} ×{" "}
                       <b>{fmtNumber(perBoxCap)}</b>/day = <b>{fmtNumber(c.supplyDaily)}</b>{" "}
-                      emails/day
-                      {c.sentLast30 > 0 ? (
+                      emails/day · <b>{fmtNumber(c.leadsRemaining)}</b> leads ×{" "}
+                      <b>{fmtNumber(c.sequenceSteps)}</b> step
+                      {c.sequenceSteps === 1 ? "" : "s"}
+                      {!c.sequenceStepsKnown ? (
+                        <span title="Instantly didn't report the sequence length — using Settings › emails per lead">
+                          {" "}(assumed)
+                        </span>
+                      ) : null}{" "}
+                      = <b>{fmtNumber(c.emailsNeeded)}</b> emails
+                      {c.daysAtCapacityCalendar !== null ? (
                         <>
-                          {" "}· sending <b>{fmtNumber(c.sentPerDay)}</b>/day
+                          {" "}→ <b>{fmtNumber(Math.round(c.daysAtCapacityCalendar))} days</b> at
+                          full capacity
+                          {c.capacityFinishDate ? (
+                            <> (<b>{fmtDateShort(c.capacityFinishDate)}</b>)</>
+                          ) : null}
                         </>
                       ) : null}
-                      {c.newLeadsPerDay > 0 ? (
-                        <>
-                          {" "}· contacting <b>{fmtNumber(c.newLeadsPerDay)}</b> new leads/day
-                        </>
-                      ) : null}
-                      {" "}· <b>{fmtNumber(c.leadsRemaining)}</b> of{" "}
-                      {fmtNumber(c.leadsTotal)} leads left
+
+                      {/* And what's actually happening, when it differs. */}
                       {c.daysToFinish !== null && c.daysToFinish > 0 ? (
                         <>
-                          {" "}· <b>{fmtNumber(Math.round(c.daysToFinish))}</b> days
-                          {c.finishDate ? (
-                            <>
-                              {" "}· finishes <b>{fmtDateShort(c.finishDate)}</b>
-                            </>
-                          ) : null}
+                          {" · "}
+                          <span
+                            className={cn(
+                              c.daysAtCapacityCalendar !== null &&
+                                c.daysToFinish > c.daysAtCapacityCalendar * 1.5 &&
+                                "font-bold text-danger",
+                            )}
+                          >
+                            but contacting only <b>{fmtNumber(c.newLeadsPerDay)}</b> new leads/day
+                            {c.leadsPerDayAtCapacity !== null ? (
+                              <> instead of {fmtNumber(c.leadsPerDayAtCapacity)}</>
+                            ) : null}
+                            , so on track for{" "}
+                            <b>{fmtNumber(Math.round(c.daysToFinish))} days</b>
+                            {c.finishDate ? <> ({fmtDateShort(c.finishDate)})</> : null}
+                          </span>
                         </>
                       ) : c.daysToFinish === 0 ? (
                         <> · every lead contacted</>
@@ -1005,7 +1046,7 @@ function GroupRow({
 
                   {openBoxes.has(c.id) ? (
                     <tr key={`${c.id}-boxes`} className="border-t border-ink/10 bg-canvas/70">
-                      <td colSpan={10} className="px-1 py-3">
+                      <td colSpan={11} className="px-1 py-3">
                         <CampaignMailboxTable
                           emails={c.emails}
                           health={c.health}

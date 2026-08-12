@@ -29,6 +29,31 @@ const F = {
 };
 
 const MISSING = -1; // pick() returns 0 for absent keys, so limits need a sentinel
+
+/**
+ * How many emails one lead receives — the number of steps in the campaign's
+ * sequence. A lead runs through one sequence, so where a campaign carries
+ * several (A/B variants) the longest is what a lead can cost.
+ * Returns 0 when the payload doesn't describe steps, so the caller can fall
+ * back to the configured default and say that's what it did.
+ */
+export function sequenceStepsOf(c: Obj): number {
+  const seqs = Array.isArray(c.sequences) ? (c.sequences as unknown[]) : [];
+  let steps = 0;
+  for (const s of seqs) {
+    if (!s || typeof s !== "object") continue;
+    const list = (s as Obj).steps;
+    if (Array.isArray(list)) steps = Math.max(steps, list.length);
+  }
+  if (steps > 0) return steps;
+  // Some payloads expose a flat count instead of the step objects.
+  for (const k of ["sequence_steps", "steps_count", "step_count"]) {
+    const v = c[k];
+    if (typeof v === "number" && v > 0) return Math.trunc(v);
+    if (Array.isArray(v) && v.length > 0) return v.length;
+  }
+  return 0;
+}
 const UNGROUPED = "Ungrouped";
 const RUNWAY_WARN_DAYS = 7;
 const BOUNCE_WARN_PCT = 3;
@@ -127,6 +152,21 @@ export interface PlannerCampaign {
   // can show sending vs. capacity rather than only capacity.
   sentLast30: number;
   sentPerDay: number; // per sending day, to compare against supplyDaily
+
+  // --- Capacity-based completion -------------------------------------------
+  // The other completion question, and the one worth planning against: if these
+  // mailboxes ran flat out, when would the list be finished? Contacting a lead
+  // costs one email per sequence step, so the work is leads x steps, and the
+  // rate is the mailbox supply — nothing to do with how fast Instantly happens
+  // to be introducing leads today.
+  sequenceSteps: number;
+  sequenceStepsKnown: boolean; // false => fell back to the app-wide setting
+  emailsNeeded: number; // leadsRemaining x sequenceSteps
+  daysAtCapacity: number | null; // SENDING days at full mailbox supply
+  daysAtCapacityCalendar: number | null;
+  capacityFinishDate: string | null;
+  // New leads/day the campaign would have to introduce to run at capacity.
+  leadsPerDayAtCapacity: number | null;
   newLeadsPerDay: number; // per SENDING day — what the operator recognises
   newLeadsPerCalendarDay: number; // per calendar day — drives the ETA
   newLeadRateObserved: boolean; // false = derived from config, not real sends
@@ -475,6 +515,7 @@ export function computePlan({
       active,
       dailyLimit: lim === MISSING ? 0 : lim,
       dailyMaxLeads: maxLeads === MISSING ? 0 : maxLeads,
+      sequenceSteps: sequenceStepsOf(c),
       prioritizeNewLeads:
         typeof c.prioritize_new_leads === "boolean" ? c.prioritize_new_leads : null,
       emails,
@@ -549,6 +590,19 @@ export function computePlan({
           ? 0 // whole list already contacted
           : null;
 
+    // --- The capacity answer -------------------------------------------------
+    // "If these mailboxes ran flat out, when is this list finished?" Working
+    // the remaining leads through the sequence costs leads x steps emails, and
+    // the mailboxes deliver `supply` of them per sending day. Entirely
+    // independent of the observed intake rate above — that one says what WILL
+    // happen at today's pace, this says what COULD happen.
+    const steps =
+      p.sequenceSteps > 0 ? p.sequenceSteps : Math.max(1, settings.default_sends_per_lead || 1);
+    const emailsNeeded = leadsRemaining * steps;
+    const daysAtCapacity = supply > 0 && emailsNeeded > 0 ? emailsNeeded / supply : null;
+    const daysAtCapacityCalendar =
+      daysAtCapacity !== null && sendingDayFactor > 0 ? daysAtCapacity / sendingDayFactor : null;
+
     return {
       id: p.id,
       name: p.name,
@@ -569,6 +623,16 @@ export function computePlan({
       // Per SENDING day, so it lines up with supplyDaily rather than being
       // deflated by the weekends nothing goes out on.
       sentPerDay: sendingDayFactor > 0 ? sent / WINDOW_DAYS / sendingDayFactor : 0,
+
+      sequenceSteps: steps,
+      sequenceStepsKnown: p.sequenceSteps > 0,
+      emailsNeeded,
+      daysAtCapacity,
+      daysAtCapacityCalendar,
+      capacityFinishDate:
+        daysAtCapacityCalendar !== null ? addDays(today ?? new Date(), daysAtCapacityCalendar) : null,
+      leadsPerDayAtCapacity:
+        daysAtCapacity !== null && daysAtCapacity > 0 ? leadsRemaining / daysAtCapacity : null,
       newLeadsPerDay: Number.isFinite(perSendingDay) ? perSendingDay : 0,
       newLeadsPerCalendarDay: Number.isFinite(perCalendarDay) ? perCalendarDay : 0,
       newLeadRateObserved: observedPerCalendarDay > 0,
