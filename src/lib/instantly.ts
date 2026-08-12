@@ -1,5 +1,9 @@
 // Client for the Instantly proxy function. All calls go through
 // /.netlify/functions/instantly so the API key stays server-side.
+//
+// asItems/pick are re-exported from apiShape.ts, which is browser-free so
+// server code can use them without dragging import.meta.env in.
+export { asItems, pick } from "./apiShape";
 const APP_TOKEN = import.meta.env.VITE_APP_TOKEN as string | undefined;
 
 function headers(extra?: Record<string, string>): HeadersInit {
@@ -46,13 +50,6 @@ export function rangeParams(range: DateRange): Record<string, string> {
 
 // Instantly list endpoints return { items: [...] }; analytics may return an
 // array or an object — normalise to an array where appropriate.
-export function asItems<T = Record<string, unknown>>(data: unknown): T[] {
-  if (Array.isArray(data)) return data as T[];
-  if (data && typeof data === "object" && Array.isArray((data as { items?: T[] }).items)) {
-    return (data as { items: T[] }).items;
-  }
-  return [];
-}
 
 export interface InstantlyLead {
   email: string;
@@ -197,11 +194,3 @@ export const instantly = {
 };
 
 // Pull a numeric stat from a record trying several known Instantly field names.
-export function pick(obj: Record<string, unknown>, keys: string[], fallback = 0): number {
-  for (const k of keys) {
-    const v = obj[k];
-    if (typeof v === "number") return v;
-    if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
-  }
-  return fallback;
-}

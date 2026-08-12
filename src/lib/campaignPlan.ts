@@ -12,7 +12,7 @@
 import { AppSettings, CostItem } from "./types";
 import { CapacityResult } from "./capacity";
 import { monthlyCost } from "./costs";
-import { asItems, pick } from "./instantly";
+import { asItems, pick } from "./apiShape";
 
 const F = {
   acctDailyLimit: ["daily_limit", "daily_sending_limit", "sending_limit", "max_daily_limit"],

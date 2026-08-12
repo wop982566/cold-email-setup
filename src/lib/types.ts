@@ -219,6 +219,21 @@ export interface SequenceEmail extends BaseRow {
   notes: string;
 }
 
+/**
+ * One run of the daily scheduled swapper. Written by the cron, read-only in
+ * the UI — the record of what happened while nobody was watching.
+ */
+export interface AutoSwapRun extends BaseRow {
+  ran_at: string;
+  applied: { from: string; to: string; campaigns: string[] }[];
+  failed: string[];
+  skipped: { email: string; reason: string }[];
+  /** Eligible swaps left undone because the per-run cap was hit. */
+  deferred: number;
+  notification: string;
+  log: string[];
+}
+
 // --- Mailbox recovery ------------------------------------------------------
 // "recovered" and "restored" are deliberately separate: the first releases a
 // mailbox back into the spare pool for FUTURE swaps, the second puts it back
@@ -320,6 +335,14 @@ export interface AppSettings {
   maintenance_critical_score: number; // below this, pull it now
   maintenance_new_mailbox_days: number; // younger than this, a low score is just warmup
   maintenance_min_inbox_rate: number; // inbox-vs-spam placement floor
+  // --- Automatic swapping (daily scheduled function) -----------------------
+  // The env var AUTO_SWAP_ENABLED is the kill switch; these tune it.
+  auto_swap_max_per_run: number; // hard ceiling on swaps in one run
+  // Consecutive bad daily readings before a mailbox is pulled. 1 acts on the
+  // current reading — which is already a trailing window, not a single day.
+  auto_swap_min_bad_days: number;
+  auto_swap_notify_email: string; // where run summaries go
+  auto_swap_from_email: string; // verified Resend sender
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -343,6 +366,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maintenance_critical_score: 50,
   maintenance_new_mailbox_days: 21,
   maintenance_min_inbox_rate: 80,
+  auto_swap_max_per_run: 2,
+  auto_swap_min_bad_days: 1,
+  auto_swap_notify_email: "webofpicasso@gmail.com",
+  auto_swap_from_email: "info@webofpicasso.net",
 };
 
 // Table name constants — single source of truth.
@@ -359,6 +386,7 @@ export const TABLES = {
   sequences: "sequences",
   sequenceEmails: "sequence_emails",
   recovery: "mailbox_recovery",
+  autoSwapRuns: "auto_swap_runs",
   mailProfiles: "mail_profiles",
   settings: "app_settings",
 } as const;

@@ -7,8 +7,18 @@
 // a mailbox as available for FUTURE swaps, it never puts it back.
 // ---------------------------------------------------------------------------
 import { useState } from "react";
-import { Archive, ArrowRight, Undo2, Eye, ChevronDown, ChevronRight, AlertTriangle } from "lucide-react";
-import { Card, Badge, Spinner } from "../ui/primitives";
+import {
+  Archive,
+  ArrowRight,
+  Undo2,
+  Eye,
+  ChevronDown,
+  ChevronRight,
+  AlertTriangle,
+  Trash2,
+  Copy,
+} from "lucide-react";
+import { Card, Badge, Spinner, Details } from "../ui/primitives";
 import {
   archiveCounts,
   filterArchive,
@@ -61,6 +71,8 @@ export function SwapArchive({
   busy,
   preview,
   writesEnabled,
+  onClear,
+  clearing,
 }: {
   rows: ArchiveRow[];
   onUndo: (row: ArchiveRow) => void;
@@ -69,6 +81,8 @@ export function SwapArchive({
   /** Diagnostics from the last attempt, keyed by entry id. */
   preview: Map<string, string>;
   writesEnabled: boolean;
+  onClear: () => void;
+  clearing: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState<ArchiveFilter>("all");
@@ -76,7 +90,8 @@ export function SwapArchive({
   if (rows.length === 0) return null;
 
   const counts = archiveCounts(rows);
-  const shown = filterArchive(rows, filter);
+  const statuses = [...new Set(rows.map((r) => r.entry.status))];
+  const shown = filterArchive(rows, statuses.length > 1 ? filter : "all");
 
   return (
     <Card className="overflow-hidden p-0">
@@ -89,8 +104,8 @@ export function SwapArchive({
             <Archive size={16} /> Swap archive ({rows.length})
           </h3>
           <p className="text-xs text-muted">
-            Every mailbox you've swapped out, and what happened to it. Swap one back from
-            here — this is the only place that actually reverses a swap in Instantly.
+            Mailboxes currently swapped out. A swap-back that Instantly confirms clears its
+            row from here automatically.
           </p>
         </div>
         {open ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
@@ -98,16 +113,28 @@ export function SwapArchive({
 
       {open ? (
         <div className="border-t-2 border-ink/10 p-4">
-          <div className="mb-3 flex flex-wrap gap-1.5">
-            {FILTERS.filter((f) => f === "all" || counts[f] > 0).map((f) => (
-              <button
-                key={f}
-                className={cn("chip", filter === f && "bg-ink text-white")}
-                onClick={() => setFilter(f)}
-              >
-                {f === "all" ? "All" : STATUS_LABEL[f as RecoveryStatus]} ({counts[f]})
-              </button>
-            ))}
+          {/* Confirmed swap-backs delete their row, so the list is usually all
+              one status — five chips for one status is noise. */}
+          <div className="mb-3 flex flex-wrap items-center gap-1.5">
+            {statuses.length > 1
+              ? FILTERS.filter((f) => f === "all" || counts[f] > 0).map((f) => (
+                  <button
+                    key={f}
+                    className={cn("chip", filter === f && "bg-ink text-white")}
+                    onClick={() => setFilter(f)}
+                  >
+                    {f === "all" ? "All" : STATUS_LABEL[f as RecoveryStatus]} ({counts[f]})
+                  </button>
+                ))
+              : null}
+            <button
+              className="btn-ghost btn-sm ml-auto"
+              onClick={onClear}
+              disabled={clearing}
+              title="Delete the app's own swap records. Changes nothing in Instantly."
+            >
+              {clearing ? <Spinner /> : <Trash2 size={13} />} Clear archive
+            </button>
           </div>
 
           <div className="space-y-2">
@@ -156,23 +183,8 @@ export function SwapArchive({
                     </div>
                   </div>
 
-                  <p className="mt-1 text-[11px] text-muted">
-                    {e.campaign_names.length > 0
-                      ? `From ${e.campaign_names.join(", ")}`
-                      : `${e.campaign_ids.length} campaign${e.campaign_ids.length === 1 ? "" : "s"}`}
-                    {e.reason ? ` · pulled for: ${e.reason}` : ""}
-                    {/* Rows written before this feature existed have no
-                        restored_* fields, so every read tolerates their absence. */}
-                    {e.status === "restored" && e.restored_at
-                      ? ` · swapped back ${fmtDateShort(e.restored_at)}${
-                          (e.restored_campaigns ?? []).length < e.campaign_ids.length
-                            ? ` (${(e.restored_campaigns ?? []).length} of ${e.campaign_ids.length} campaigns)`
-                            : ""
-                        }`
-                      : ""}
-                  </p>
-
-                  {/* The reason it was pulled may still apply. Say so; don't block. */}
+                  {/* The reason it was pulled may still apply. Stays in the
+                      open — it's a reason not to click. */}
                   {row.canUndo && row.stillUnhealthy ? (
                     <p className="mt-1.5 flex items-start gap-1.5 rounded-lg border-2 border-ink bg-sun/30 p-2 text-[11px] font-semibold">
                       <AlertTriangle size={12} className="mt-0.5 shrink-0" />
@@ -181,21 +193,40 @@ export function SwapArchive({
                     </p>
                   ) : null}
 
-                  {/* Durable record of what was attempted and what Instantly
-                      answered — a toast disappears before it can be read. */}
-                  {preview.has(e.id) ? (
-                    <div className="mt-2">
-                      <button
-                        className="btn-ghost btn-sm mb-1"
-                        onClick={() => void navigator.clipboard?.writeText(preview.get(e.id) ?? "")}
-                      >
-                        Copy details
-                      </button>
-                      <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-white p-2 text-[11px]">
-                        {preview.get(e.id)}
-                      </pre>
-                    </div>
-                  ) : null}
+                  {/* Everything you only want once you've asked, in one place
+                      instead of three stacked blocks. */}
+                  <Details summary={preview.has(e.id) ? "Details · last attempt" : "Details"}>
+                    <p className="text-[11px] text-muted">
+                      {e.campaign_names.length > 0
+                        ? `From ${e.campaign_names.join(", ")}`
+                        : `${e.campaign_ids.length} campaign${e.campaign_ids.length === 1 ? "" : "s"}`}
+                      {e.reason ? ` · pulled for: ${e.reason}` : ""}
+                      {/* Rows written before this feature existed have no
+                          restored_* fields, so every read tolerates their absence. */}
+                      {e.status === "restored" && e.restored_at
+                        ? ` · swapped back ${fmtDateShort(e.restored_at)}${
+                            (e.restored_campaigns ?? []).length < e.campaign_ids.length
+                              ? ` (${(e.restored_campaigns ?? []).length} of ${e.campaign_ids.length} campaigns)`
+                              : ""
+                          }`
+                        : ""}
+                    </p>
+                    {preview.has(e.id) ? (
+                      <>
+                        <button
+                          className="btn-ghost btn-sm mb-1 mt-1.5"
+                          onClick={() =>
+                            void navigator.clipboard?.writeText(preview.get(e.id) ?? "")
+                          }
+                        >
+                          <Copy size={13} /> Copy
+                        </button>
+                        <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-white p-2 text-[11px]">
+                          {preview.get(e.id)}
+                        </pre>
+                      </>
+                    ) : null}
+                  </Details>
                 </div>
               );
             })}

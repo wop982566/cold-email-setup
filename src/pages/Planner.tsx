@@ -240,11 +240,37 @@ export default function Planner() {
     await saveSettings.mutateAsync({ ...settings, ...patch });
   }
 
-  function toggleExclude(email: string) {
-    if (!settings) return;
-    const cur = settings.excluded_mailboxes ?? [];
-    const next = cur.includes(email) ? cur.filter((e) => e !== email) : [...cur, email];
-    void patchSettings({ excluded_mailboxes: next });
+  /**
+   * Count a mailbox, or stop counting it everywhere in the planner.
+   *
+   * Normalises to lowercase because every reader does the same
+   * (campaignPlan.ts, sendingHealth.ts) — storing a mixed-case address here
+   * would write an entry that nothing ever matches, and the box would appear
+   * to do nothing.
+   */
+  async function toggleExclude(email: string) {
+    if (!settings) {
+      toast.push("Settings haven't loaded yet — try again in a moment", "error");
+      return;
+    }
+    const key = email.trim().toLowerCase();
+    const cur = (settings.excluded_mailboxes ?? []).map((e) => e.trim().toLowerCase());
+    const removing = cur.includes(key);
+    const next = removing ? cur.filter((e) => e !== key) : [...cur, key];
+    try {
+      await patchSettings({ excluded_mailboxes: next });
+      toast.push(
+        removing ? `${key} counted again` : `${key} excluded from all planning`,
+        "success",
+      );
+    } catch (err) {
+      // Previously this was fire-and-forget, so a failed save looked exactly
+      // like a checkbox that refuses to move.
+      toast.push(
+        `Couldn't save that: ${err instanceof Error ? err.message : "unknown error"}`,
+        "error",
+      );
+    }
   }
 
   function toggleGroup(key: string) {
@@ -371,6 +397,7 @@ export default function Planner() {
           recovery={recovery}
           healthByEmail={healthByEmail}
           onApplied={refresh}
+          onExclude={(email) => void toggleExclude(email)}
         />
       ) : (
       <>
@@ -690,17 +717,32 @@ export default function Planner() {
                 </tr>
               </thead>
               <tbody>
+                {/* Rows dim with text colour, not opacity: opacity creates a
+                    stacking context its children can't climb back out of, so
+                    the old row-level opacity-50 dragged the checkbox down with
+                    it and made a live control look permanently disabled. */}
                 {p.mailboxes.map((b) => (
                   <tr
                     key={b.email}
-                    className={cn("border-b border-ink/10", (b.excluded || b.beyondCount) && "opacity-50")}
+                    className={cn(
+                      "border-b border-ink/10",
+                      (b.excluded || b.beyondCount) && "text-ink/40",
+                    )}
                   >
                     <td className="px-3 py-2">
                       <input
                         type="checkbox"
+                        className="h-4 w-4 cursor-pointer accent-ink"
                         checked={!b.excluded}
-                        onChange={() => toggleExclude(b.email)}
-                        title={b.excluded ? "Excluded — click to count it" : "Counted — click to exclude"}
+                        disabled={!settings}
+                        onChange={() => void toggleExclude(b.email)}
+                        title={
+                          !settings
+                            ? "Waiting for settings to load…"
+                            : b.excluded
+                              ? "Excluded from all planning — click to count it again"
+                              : "Counted — click to exclude it everywhere"
+                        }
                       />
                     </td>
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>

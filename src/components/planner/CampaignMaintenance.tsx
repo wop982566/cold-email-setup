@@ -11,8 +11,9 @@ import {
   Zap,
   Eye,
   Lock,
+  Ban,
 } from "lucide-react";
-import { Card, StatCard, Badge, Spinner } from "../ui/primitives";
+import { Card, StatCard, Badge, Spinner, Details } from "../ui/primitives";
 import { useToast } from "../ui/toast";
 import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailboxHealth";
 import { Plan } from "../../lib/campaignPlan";
@@ -27,6 +28,8 @@ import {
 } from "../../lib/writeResult";
 import {
   archiveRows,
+  clearImpact,
+  fullyRestored,
   recoveringEmails,
   sampleFor,
   summarise,
@@ -36,8 +39,9 @@ import {
   type RecoveryView,
 } from "../../lib/recovery";
 import { SwapArchive } from "./SwapArchive";
-import { useInsert, useUpdate } from "../../lib/hooks";
-import { AppSettings, RecoveryEntry, TABLES } from "../../lib/types";
+import { AutoSwapLog } from "./AutoSwapLog";
+import { useCollection, useInsert, useRemove, useRemoveMany, useUpdate } from "../../lib/hooks";
+import { AppSettings, AutoSwapRun, RecoveryEntry, TABLES } from "../../lib/types";
 import { fmtNumber } from "../../lib/format";
 import { cn } from "../../lib/utils";
 import { RecoveryPanel } from "./RecoveryPanel";
@@ -77,6 +81,7 @@ export function CampaignMaintenance({
   recovery,
   healthByEmail,
   onApplied,
+  onExclude,
 }: {
   plan: Plan;
   // Computed once by the page and shared with the per-campaign breakdown, so
@@ -89,6 +94,8 @@ export function CampaignMaintenance({
   recovery: RecoveryEntry[];
   healthByEmail: Map<string, MailboxHealth>;
   onApplied: () => void;
+  /** Stop counting a mailbox anywhere in the planner. */
+  onExclude: (email: string) => void;
 }) {
   const toast = useToast();
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -96,6 +103,7 @@ export function CampaignMaintenance({
   const [applying, setApplying] = useState<string | null>(null);
   const [preview, setPreview] = useState<Map<string, string>>(new Map());
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   // Asked once, before any button is offered: are writes permitted at all?
   // Touches nothing in Instantly.
@@ -109,6 +117,17 @@ export function CampaignMaintenance({
 
   const insertRecovery = useInsert<RecoveryEntry>(TABLES.recovery);
   const updateRecovery = useUpdate<RecoveryEntry>(TABLES.recovery);
+  const removeRecovery = useRemove(TABLES.recovery);
+  const removeManyRecovery = useRemoveMany(TABLES.recovery);
+
+  // Written only by the scheduled function; the UI never mutates these.
+  const autoSwapRunsQ = useCollection<AutoSwapRun>(TABLES.autoSwapRuns);
+  const autoSwapRuns = autoSwapRunsQ.data ?? [];
+
+  const excludedList = useMemo(
+    () => (settings.excluded_mailboxes ?? []).map((e) => e.trim().toLowerCase()).filter(Boolean),
+    [settings.excluded_mailboxes],
+  );
 
   const m = maintenance;
   const minScore =
@@ -317,6 +336,22 @@ export function CampaignMaintenance({
 
     setPreview((s) => new Map(s).set(e.id, trace.join("\n\n")));
 
+    // Completely reversed: the record has served its purpose, so it goes.
+    // Partly reversed: the swap is still live somewhere, and deleting the row
+    // would leave nothing to find or finish it with.
+    if (fullyRestored(e, doneIds)) {
+      await removeRecovery.mutateAsync(e.id);
+      setPreview((s) => {
+        const next = new Map(s);
+        next.delete(e.id);
+        return next;
+      });
+      onApplied();
+      setBusyRecovery(null);
+      toast.push(`${e.email} swapped back and cleared from the archive`, "success");
+      return;
+    }
+
     if (doneIds.length > 0) {
       await updateRecovery.mutateAsync({
         id: e.id,
@@ -332,6 +367,31 @@ export function CampaignMaintenance({
     setBusyRecovery(null);
     const summary = summariseWrites(verdicts);
     toast.push(summary.message, summary.tone);
+  }
+
+  /** Wipe the archive, having said plainly what that destroys. */
+  async function clearArchive() {
+    const impact = clearImpact(archive);
+    if (impact.total === 0) return;
+    const healingNote = impact.healing
+      ? `\n\n${impact.healing} of them ${impact.healing === 1 ? "is a mailbox" : "are mailboxes"} still healing — ` +
+        `clearing ${impact.healing === 1 ? "it" : "those"} puts ${impact.healing === 1 ? "that address" : "those addresses"} ` +
+        `back in the spare pool, so ${impact.healing === 1 ? "it" : "they"} can be proposed as replacements again.`
+      : "";
+    if (
+      !window.confirm(
+        `Delete all ${impact.total} swap record${impact.total === 1 ? "" : "s"}?${healingNote}` +
+          `\n\nThis only clears the app's own records. It changes nothing in Instantly.`,
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    await removeManyRecovery.mutateAsync(impact.ids);
+    setPreview(new Map());
+    setClearing(false);
+    onApplied();
+    toast.push(`Cleared ${impact.total} swap record${impact.total === 1 ? "" : "s"}`, "success");
   }
 
   async function returnToService(v: RecoveryView) {
@@ -389,21 +449,23 @@ export function CampaignMaintenance({
       {/* Writes off is the single most common reason a swap silently does
           nothing, so it's stated up front rather than discovered by clicking. */}
       {!writesEnabled ? (
-        <Card className="flex items-start gap-2 border-danger bg-danger/10 p-4 text-sm">
-          <Lock size={16} className="mt-0.5 shrink-0" />
-          <div>
-            <p className="font-extrabold">Writes to Instantly are turned off</p>
-            <p className="mt-1 text-xs">
+        <Card className="border-danger bg-danger/10 p-3 text-sm">
+          <p className="flex items-center gap-2 font-extrabold">
+            <Lock size={15} className="shrink-0" /> Writes to Instantly are turned off —
+            Apply and Swap back will do nothing
+          </p>
+          <Details summary="How to turn them on">
+            <p className="text-xs">
               {writesHint ??
                 "Add INSTANTLY_WRITE_ENABLED=true to your Netlify environment variables."}
             </p>
             <p className="mt-1 text-xs">
               Netlify → Site configuration → Environment variables → add{" "}
               <code>INSTANTLY_WRITE_ENABLED</code> = <code>true</code>, scope{" "}
-              <b>Functions</b>, then redeploy. Until then Apply and Swap back do nothing —
-              Preview still works, since it writes nothing.
+              <b>Functions</b>, then redeploy. Preview keeps working meanwhile, since it
+              writes nothing.
             </p>
-          </div>
+          </Details>
         </Card>
       ) : null}
 
@@ -515,8 +577,15 @@ export function CampaignMaintenance({
                 >
                   {applying === p.id ? <Spinner /> : <Zap size={14} />} Apply swap
                 </button>
-                <button className="btn-ghost btn-sm" onClick={() => copySteps(p, to)}>
-                  <Copy size={14} /> Copy steps
+                {/* The replacement it picked isn't always one you want used.
+                    Excluding it here re-plans without it, instead of making
+                    you go and find it in the mailbox table. */}
+                <button
+                  className="btn-ghost btn-sm"
+                  onClick={() => onExclude(to.box.email)}
+                  title={`Never consider ${to.box.email} anywhere in the planner`}
+                >
+                  <Ban size={14} /> Don't use {to.box.email.split("@")[0]}
                 </button>
                 <button className="btn-ghost btn-sm" onClick={() => toggle(p.id)}>
                   {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} How
@@ -524,16 +593,25 @@ export function CampaignMaintenance({
               </div>
             </div>
 
-            {preview.has(p.id) ? (
-              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-canvas p-2 text-[11px]">
-                {preview.get(p.id)}
-              </pre>
-            ) : null}
-
+            {/* Warnings stay in the open — they're a reason not to click. */}
             {p.warnings.length > 0 ? (
               <p className="mt-2 rounded-lg border-2 border-ink bg-sun/30 p-2 text-xs font-semibold">
                 {p.warnings.join(" ")}
               </p>
+            ) : null}
+
+            {preview.has(p.id) ? (
+              <Details summary="What Instantly said">
+                <button
+                  className="btn-ghost btn-sm mb-1"
+                  onClick={() => void navigator.clipboard?.writeText(preview.get(p.id) ?? "")}
+                >
+                  <Copy size={13} /> Copy
+                </button>
+                <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-canvas p-2 text-[11px]">
+                  {preview.get(p.id)}
+                </pre>
+              </Details>
             ) : null}
 
             {isOpen ? (
@@ -555,6 +633,9 @@ export function CampaignMaintenance({
                   {fmtNumber(p.capacityDelta)}/day. Swapping protects deliverability — it doesn't add
                   capacity.
                 </p>
+                <button className="btn-ghost btn-sm mt-2" onClick={() => copySteps(p, to)}>
+                  <Copy size={13} /> Copy these steps
+                </button>
               </div>
             ) : null}
           </Card>
@@ -569,6 +650,31 @@ export function CampaignMaintenance({
         busy={busyRecovery}
       />
 
+      <AutoSwapLog runs={autoSwapRuns} />
+
+      {/* Excluded mailboxes are invisible everywhere else by design, which
+          makes them easy to forget about and hard to undo. */}
+      {excludedList.length > 0 ? (
+        <Card className="p-3 text-xs">
+          <p className="font-bold">
+            <Ban size={13} className="mr-1 inline" />
+            Excluded from all planning ({excludedList.length})
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {excludedList.map((email) => (
+              <button
+                key={email}
+                className="chip"
+                onClick={() => onExclude(email)}
+                title="Count this mailbox again"
+              >
+                {email} ✕
+              </button>
+            ))}
+          </div>
+        </Card>
+      ) : null}
+
       <SwapArchive
         rows={archive}
         onUndo={(r) => void undoSwap(r)}
@@ -576,6 +682,8 @@ export function CampaignMaintenance({
         busy={busyRecovery}
         preview={preview}
         writesEnabled={writesEnabled}
+        onClear={() => void clearArchive()}
+        clearing={clearing}
       />
 
       {m.unassigned.length > 0 ? (

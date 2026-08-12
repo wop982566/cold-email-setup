@@ -1,4 +1,5 @@
-import { ReactNode } from "react";
+import { ReactNode, useState } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 export function Card({
@@ -177,5 +178,37 @@ export function Toggle({
       </span>
       {label ? <span className="text-sm font-semibold">{label}</span> : null}
     </button>
+  );
+}
+
+/**
+ * Secondary detail, collapsed by default.
+ *
+ * Exists because the maintenance tab grew a habit of showing everything at
+ * once — diagnostics, campaign lists, copy buttons — until the thing you
+ * actually had to decide was buried. Anything that only matters once you've
+ * asked goes in here.
+ */
+export function Details({
+  summary,
+  children,
+  className,
+}: {
+  summary: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={cn("mt-1.5", className)}>
+      <button
+        className="flex items-center gap-1 text-[11px] font-semibold text-muted hover:text-ink"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        {summary}
+      </button>
+      {open ? <div className="mt-1.5">{children}</div> : null}
+    </div>
   );
 }

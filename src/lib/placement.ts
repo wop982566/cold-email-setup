@@ -13,7 +13,7 @@
 //
 // Pure module — the page fetches, this parses.
 // ---------------------------------------------------------------------------
-import { pick } from "./instantly";
+import { pick } from "./apiShape";
 
 export interface Placement {
   /** 0-100, or null when nothing was measured. */

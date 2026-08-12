@@ -13,7 +13,7 @@
 //
 // Pure module — the page fetches, this parses.
 // ---------------------------------------------------------------------------
-import { pick } from "./instantly";
+import { pick } from "./apiShape";
 
 export interface InboxSends {
   email: string;

@@ -94,6 +94,8 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
 | `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
 | `INSTANTLY_WRITE_ENABLED` | functions | **Required for any write.** Set to `true` to let the planner create mailboxes and swap them on campaigns. Unset, every write returns 403 and the Maintenance tab shows a banner saying so. Reads are unaffected. |
+| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. |
+| `RESEND_API_KEY` | functions | Resend key for run-summary emails. Without it the swapper still runs and still logs — it just can't email you. The sending domain must be verified in Resend or sends fail with 403. |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
 | `APP_FUNCTION_TOKEN` + `VITE_APP_TOKEN` | both | Shared secret so only your app can call the functions. Also **required** to read or write saved mailbox credentials (Settings → Mailbox credentials) — without it that table is refused outright, since it holds SMTP/IMAP passwords. Set `VITE_APP_TOKEN` to the same value, and do **not** mark it Secret in Netlify or the build can't read it. |
@@ -122,6 +124,26 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   (accounts/campaigns/leads are paginated server-side). Powers the Instantly insights page (campaign
   analytics, mailbox/warmup health, sending volume vs plan) with the key kept
   server-side.
+- **`/.netlify/functions/auto-swap`** — **scheduled daily** (`@daily`, UTC).
+  Replaces failing mailboxes in live campaigns without you having to watch for
+  them. It imports `computePlan`/`computeMaintenance` directly and calls the
+  `instantly` handler in-process, so it decides exactly what the Maintenance tab
+  would have shown you — there is no second implementation to drift.
+
+  **Guardrails.** Exits immediately unless `AUTO_SWAP_ENABLED=true`, and every
+  write still passes the `INSTANTLY_WRITE_ENABLED` gate. Per run it will swap at
+  most `auto_swap_max_per_run` mailboxes (default 2), worst-scoring first, so a
+  bad metrics day can't empty your campaigns. It never swaps in a mailbox that
+  is excluded, convalescing, immature or below your score floor — if no healthy
+  spare exists it leaves the bad one in place rather than swapping in something
+  worse. Each write is confirmed by reading the campaign back; an unconfirmed
+  write records nothing. Set `auto_swap_min_bad_days` above 1 to require that
+  many consecutive bad daily readings before it acts.
+
+  Every run is recorded — including quiet runs and crashes — and shown under
+  **Automatic swaps** on the Maintenance tab, so silence there always means
+  "nothing to report" rather than "the cron died". Swaps it makes are ordinary
+  archive entries, so you can undo any of them by hand.
 
 ---
 

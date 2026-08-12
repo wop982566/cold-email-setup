@@ -208,6 +208,36 @@ export function archiveRows(
     });
 }
 
+/**
+ * Is this swap completely reversed — every campaign it touched confirmed back?
+ *
+ * The gate on deleting the record. A partly-reversed swap is still live
+ * somewhere, and dropping its row would leave no way to find or finish it. Only
+ * ids the caller CONFIRMED are passed in; an unconfirmed write contributes
+ * nothing, so an undo we couldn't verify can never clear the row.
+ */
+export function fullyRestored(entry: RecoveryEntry, confirmedIds: string[]): boolean {
+  if (entry.campaign_ids.length === 0) return false;
+  const confirmed = new Set(confirmedIds);
+  return entry.campaign_ids.every((id) => confirmed.has(id));
+}
+
+/** What a "clear the archive" click would actually destroy. */
+export interface ClearImpact {
+  total: number;
+  /** Rows whose exclusion is doing live work — clearing frees them as spares. */
+  healing: number;
+  ids: string[];
+}
+
+export function clearImpact(rows: ArchiveRow[]): ClearImpact {
+  return {
+    total: rows.length,
+    healing: rows.filter((r) => r.entry.status === "recovering").length,
+    ids: rows.map((r) => r.entry.id),
+  };
+}
+
 export function filterArchive(rows: ArchiveRow[], filter: ArchiveFilter): ArchiveRow[] {
   return filter === "all" ? rows : rows.filter((r) => r.entry.status === filter);
 }

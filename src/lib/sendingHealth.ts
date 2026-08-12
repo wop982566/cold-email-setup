@@ -12,7 +12,7 @@
 // ---------------------------------------------------------------------------
 import { AppSettings } from "./types";
 import { CapacityResult } from "./capacity";
-import { asItems, pick } from "./instantly";
+import { asItems, pick } from "./apiShape";
 import { attachedEmails, rankAndTrim } from "./campaignPlan";
 
 // Instantly's payloads vary by workspace and endpoint version, so every read
