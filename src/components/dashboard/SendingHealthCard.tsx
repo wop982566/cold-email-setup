@@ -12,10 +12,12 @@ import {
   Tooltip,
   ReferenceLine,
 } from "recharts";
-import { Activity, ArrowUpRight, AlertTriangle, Plug } from "lucide-react";
+import { Activity, ArrowUpRight, AlertTriangle, Plug, Search } from "lucide-react";
 import { Card, Badge, ProgressBar, Spinner } from "../ui/primitives";
 import { instantly } from "../../lib/instantly";
 import { computeSendingHealth } from "../../lib/sendingHealth";
+import { computePlan } from "../../lib/campaignPlan";
+import { diagnoseSupply } from "../../lib/leadSupply";
 import { CapacityResult } from "../../lib/capacity";
 import { AppSettings } from "../../lib/types";
 import { fmtNumber, fmtPercent, fmtDateShort } from "../../lib/format";
@@ -54,12 +56,25 @@ function Header() {
 }
 
 // A tinted stat tile — the same pattern the Dashboard uses for its capacity row.
-function Tile({ label, value, sub }: { label: string; value: string; sub: string }) {
+// `sub2` carries a second window's figure, so a number can never sit next to a
+// chart covering a different period without saying so.
+function Tile({
+  label,
+  value,
+  sub,
+  sub2,
+}: {
+  label: string;
+  value: string;
+  sub: string;
+  sub2?: string;
+}) {
   return (
     <div className="rounded-xl border-2 border-ink bg-canvas p-3">
       <p className="text-xs font-bold uppercase text-muted">{label}</p>
       <p className="text-2xl font-extrabold">{value}</p>
       <p className="mt-0.5 text-[11px] font-semibold text-muted">{sub}</p>
+      {sub2 ? <p className="text-[11px] font-semibold text-ink/70">{sub2}</p> : null}
     </div>
   );
 }
@@ -93,6 +108,13 @@ export function SendingHealthCard({
     queryFn: () => instantly.analyticsDaily(DAYS),
     staleTime: 60_000,
   });
+  // Per-campaign analytics, for the lead-supply diagnosis. Same key the planner
+  // uses, so this shares that cache rather than firing a second request.
+  const statsQ = useQuery({
+    queryKey: ["inst", "camp", "30d"],
+    queryFn: () => instantly.campaignAnalytics("30d"),
+    staleTime: 60_000,
+  });
 
   const queries = [acctQ, campQ, dailyQ];
   const notConfigured = queries.some((q) => q.data?.configured === false);
@@ -109,8 +131,27 @@ export function SendingHealthCard({
       cap,
       settings,
       days: DAYS,
+      // One constant drives both the chart and the recent figure, so the two
+      // cannot drift into describing different periods again.
+      recentDays: CHART_DAYS,
     });
   }, [acctQ.data, campQ.data, dailyQ.data, cap, settings]);
+
+  // Why the gap exists. Deliberately not in `queries` above: if campaign
+  // analytics fails, the card still shows its core numbers and just omits the
+  // explanation. `costs` only feeds figures this card doesn't render.
+  const diagnosis = useMemo(() => {
+    if (!cap || !settings || !health) return null;
+    const plan = computePlan({
+      accountsData: acctQ.data?.ok ? acctQ.data.data : null,
+      campaignsData: campQ.data?.ok ? campQ.data.data : null,
+      analyticsData: statsQ.data?.ok ? statsQ.data.data : null,
+      cap,
+      settings,
+      costs: [],
+    });
+    return diagnoseSupply({ plan, health, settings });
+  }, [acctQ.data, campQ.data, statsQ.data, cap, settings, health]);
 
   if (!cap || !settings) return null;
 
@@ -156,9 +197,12 @@ export function SendingHealthCard({
     // spike is the deliverability risk, so name the day rather than the average.
     verdict = `You averaged ${fmtNumber(h.avgPerSendingDay)}/day, but ${fmtDateShort(h.peakDay?.date)} sent ${fmtNumber(h.peakDay?.sent ?? 0)} — over your ${fmtNumber(h.ceilingDaily)}/day ceiling. Spikes like that burn deliverability even when the average looks fine.`;
   } else if (h.status === "under") {
-    verdict = `Using ${fmtPercent(h.utilizationPct)} of your ${fmtNumber(h.ceilingDaily)}/day ceiling — ${fmtNumber(h.underBy)}/day unused, about ${fmtNumber(h.underBy * settings.sending_days_per_week)} emails a week you're paying for and not sending.`;
+    // Quote the recent window — it describes where the operation is now — and
+    // name the longer average rather than letting the two look contradictory.
+    const recentUnder = Math.max(0, Math.round(h.ceilingDaily - h.avgPerSendingDayRecent));
+    verdict = `Last ${h.recentDays} days you used ${fmtPercent(h.utilizationPctRecent)} of your ${fmtNumber(h.ceilingDaily)}/day ceiling — ${fmtNumber(recentUnder)}/day unused, about ${fmtNumber(recentUnder * settings.sending_days_per_week)} emails a week you're paying for and not sending. Over ${DAYS} days the average is ${fmtNumber(h.avgPerSendingDay)}/day.`;
   } else {
-    verdict = `Running at ${fmtPercent(h.utilizationPct)} of your ${fmtNumber(h.ceilingDaily)}/day ceiling. Bottleneck: ${h.bottleneck}.`;
+    verdict = `Running at ${fmtPercent(h.utilizationPctRecent)} of your ${fmtNumber(h.ceilingDaily)}/day ceiling over the last ${h.recentDays} days (${fmtPercent(h.utilizationPct)} across ${DAYS}). Bottleneck: ${h.bottleneck}.`;
   }
 
   return (
@@ -180,7 +224,18 @@ export function SendingHealthCard({
           <Tile
             label="Actually sending / day"
             value={fmtNumber(h.avgPerSendingDay)}
-            sub={`${fmtPercent(h.utilizationPct)} of ${fmtNumber(h.ceilingDaily)} ceiling`}
+            sub={`${DAYS}d avg · ${fmtPercent(h.utilizationPct)} of ${fmtNumber(h.ceilingDaily)} ceiling`}
+            sub2={
+              h.sendingDaysRecent > 0
+                ? `${h.recentDays}d: ${fmtNumber(h.avgPerSendingDayRecent)}/day (${fmtPercent(
+                    h.utilizationPctRecent,
+                  )})${
+                    h.trendPct !== null && Math.abs(h.trendPct) >= 5
+                      ? ` · ${h.trendPct > 0 ? "↑" : "↓"} ${fmtPercent(Math.abs(h.trendPct))}`
+                      : ""
+                  }`
+                : undefined
+            }
           />
         </div>
 
@@ -223,8 +278,10 @@ export function SendingHealthCard({
           </ResponsiveContainer>
         </div>
         <p className="mt-1 text-[11px] text-muted">
-          Last {CHART_DAYS} days. Today (lighter bar) is still in progress and is excluded from the
-          averages. Warmup email isn't counted — campaign sends only.
+          Chart shows the last {CHART_DAYS} days; the headline figure above averages {DAYS} days,
+          with the {CHART_DAYS}-day figure beneath it. Both ignore days with no sends, and today
+          (lighter bar) is still in progress so it counts towards neither. Warmup email isn't
+          included — campaign sends only.
         </p>
 
         <div
@@ -235,6 +292,49 @@ export function SendingHealthCard({
         >
           {verdict}
         </div>
+
+        {/* Why the gap exists. A capacity number without a cause just tells you
+            to buy more of something. */}
+        {diagnosis && diagnosis.reasons.length > 0 ? (
+          <div className="mt-3 rounded-xl border-2 border-ink bg-canvas p-3">
+            <p className="flex items-center gap-2 text-sm font-extrabold">
+              <Search size={15} />
+              Why you're at {fmtPercent(h.utilizationPctRecent)}
+            </p>
+            <p className="mt-1 text-sm">{diagnosis.summary}</p>
+
+            <ul className="mt-2 space-y-1.5">
+              {diagnosis.reasons.map((r) => (
+                <li key={r.code} className="flex items-start gap-2 text-xs">
+                  <Badge tone={r.severity === "high" ? "danger" : "sun"}>{r.headline}</Badge>
+                  <span className="flex-1 text-muted">{r.detail}</span>
+                </li>
+              ))}
+            </ul>
+
+            {diagnosis.leadCeilingDaily !== null ? (
+              <p className="mt-2 text-[11px] text-muted">
+                Estimate: {fmtNumber(diagnosis.newLeadsDaily)} new leads/day ×{" "}
+                {diagnosis.sendsPerLead} emails per lead ≈ {fmtNumber(diagnosis.leadCeilingDaily)}
+                /day.{" "}
+                {diagnosis.confidence === "observed"
+                  ? "Lead rate measured from actual sends."
+                  : diagnosis.confidence === "mixed"
+                    ? "Lead rate part measured, part from campaign settings."
+                    : "Lead rate taken from campaign settings — no send history yet."}{" "}
+                Emails per lead comes from Settings, so it's an assumption rather than a
+                measurement.
+              </p>
+            ) : null}
+
+            {diagnosis.estimateWarning ? (
+              <p className="mt-1.5 flex items-start gap-1.5 rounded-lg border-2 border-ink bg-sun/30 p-2 text-[11px] font-semibold">
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                {diagnosis.estimateWarning}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
       </Card>
 
       <Card className="p-5">
@@ -264,6 +364,28 @@ export function SendingHealthCard({
               </span>{" "}
               {h.campaignsWithoutLimit === 1 ? "has" : "have"} no daily limit set in Instantly — set
               one so this can size your inbox needs.
+            </>
+          ) : h.inboxesNeeded > 0 && diagnosis?.suppressInboxAdvice ? (
+            // Campaign limits exceed inbox capacity, so the arithmetic says "buy
+            // inboxes" — but the inboxes already owned are sitting idle. Sizing
+            // advice here would be an expensive mistake, so give the real
+            // constraint instead.
+            <>
+              <span className="font-extrabold">Don't add inboxes yet.</span> On paper you're{" "}
+              {fmtNumber(h.emailDelta)} emails/day short of your{" "}
+              {fmtNumber(h.campaignDailyLimit)}/day campaign limits, but you're only using{" "}
+              {fmtPercent(h.utilizationPctRecent)} of the capacity you already have.{" "}
+              {diagnosis.binding === "leads" && diagnosis.leadsNeededDaily > 0 ? (
+                <>
+                  Add about{" "}
+                  <span className="font-extrabold">
+                    {fmtNumber(diagnosis.leadsNeededDaily)} more new leads/day
+                  </span>{" "}
+                  first — that fills the inboxes you're already paying for.
+                </>
+              ) : (
+                "Fix what's throttling volume first — see the breakdown on the left."
+              )}
             </>
           ) : h.inboxesNeeded > 0 ? (
             <>

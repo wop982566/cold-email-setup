@@ -71,6 +71,19 @@ export interface SendingHealth {
   peakDay: DayPoint | null;
   skippedRows: number;
 
+  // --- Recent window --------------------------------------------------------
+  // The same maths over a shorter, more recent slice. The card plots this many
+  // days, so quoting a full-window average beside that chart reads as a
+  // contradiction when volume is ramping — both figures are shown, each named.
+  recentDays: number; // the slice actually used, after clamping
+  sentRecent: number;
+  sendingDaysRecent: number;
+  avgPerSendingDayRecent: number;
+  utilizationPctRecent: number;
+  // Signed % change of the recent average against the full window. null when
+  // either side has no sending days to compare.
+  trendPct: number | null;
+
   // Verdict
   ceilingDaily: number;
   bottleneck: string;
@@ -106,6 +119,9 @@ export interface SendingHealthInput {
   cap: CapacityResult;
   settings: AppSettings;
   days?: number;
+  // Shorter slice reported alongside the full window. Pass the same constant
+  // the chart plots, so the two can never describe different periods.
+  recentDays?: number;
   today?: Date; // injected so the maths stay deterministic
 }
 
@@ -168,6 +184,7 @@ export function computeSendingHealth({
   cap,
   settings,
   days: windowDays = 30,
+  recentDays: recentWindow = 14,
   today,
 }: SendingHealthInput): SendingHealth {
   // --- A. Accounts -> supply ------------------------------------------------
@@ -290,6 +307,15 @@ export function computeSendingHealth({
     null,
   );
 
+  // Recent slice — the same rules (today excluded, idle days excluded) applied
+  // to the tail of the window. Clamped so a caller asking for more days than
+  // exist gets the whole window rather than a silently short slice.
+  const recentDays = Math.max(1, Math.min(Math.floor(recentWindow), complete.length || 1));
+  const recent = complete.slice(-recentDays);
+  const sentRecent = recent.reduce((n, d) => n + d.sent, 0);
+  const sendingDaysRecent = recent.filter((d) => d.sent > 0).length;
+  const avgPerSendingDayRecent = sendingDaysRecent > 0 ? sentRecent / sendingDaysRecent : 0;
+
   // --- D. Ceiling and verdict ----------------------------------------------
   // Provider caps come from the already period-normalised capacity sources.
   // We deliberately do NOT fold in cap.effectiveDaily: it already contains the
@@ -314,6 +340,12 @@ export function computeSendingHealth({
   const bottleneck = tightest.label;
 
   const utilizationPct = ceilingDaily > 0 ? (avgPerSendingDay / ceilingDaily) * 100 : 0;
+  const utilizationPctRecent = ceilingDaily > 0 ? (avgPerSendingDayRecent / ceilingDaily) * 100 : 0;
+  // Only meaningful when both windows actually observed sending.
+  const trendPct =
+    avgPerSendingDay > 0 && sendingDaysRecent > 0
+      ? ((avgPerSendingDayRecent - avgPerSendingDay) / avgPerSendingDay) * 100
+      : null;
 
   let status: SendingHealth["status"];
   if (sendingDaysObserved === 0) {
@@ -379,6 +411,13 @@ export function computeSendingHealth({
     sendingDaysObserved,
     peakDay,
     skippedRows,
+
+    recentDays,
+    sentRecent,
+    sendingDaysRecent,
+    avgPerSendingDayRecent,
+    utilizationPctRecent,
+    trendPct,
 
     ceilingDaily,
     bottleneck,
