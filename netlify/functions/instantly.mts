@@ -16,6 +16,16 @@ const GET_RESOURCES: Record<string, string> = {
   "analytics-daily": "/campaigns/analytics/daily",
 };
 
+// Per-mailbox send counts. Instantly has moved this around between API
+// revisions and some workspaces don't expose it at all, so several documented
+// paths are tried in order and the caller is told plainly when none answers —
+// far better than inventing a per-inbox number by dividing campaign totals.
+const ACCOUNT_ANALYTICS_PATHS = [
+  "/accounts/analytics",
+  "/analytics/accounts",
+  "/accounts/campaign-mappings",
+];
+
 const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", "starting_after"];
 
 // The only three mutations this function can perform. Deleting anything,
@@ -163,6 +173,40 @@ export default async (req: Request): Promise<Response> => {
         if (i === MAX_PAGES - 1) truncated = true;
       }
       return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
+    // Per-mailbox sends, if this workspace reports them. Tries each known path
+    // and returns `supported: false` rather than an error when none does, so
+    // the UI can say "Instantly doesn't report this" instead of looking broken.
+    if (resource === "account-analytics") {
+      const qs = new URLSearchParams();
+      for (const p of ["start_date", "end_date"]) {
+        const v = url.searchParams.get(p);
+        if (v) qs.set(p, v);
+      }
+      const attempts: { path: string; status: number }[] = [];
+      for (const path of ACCOUNT_ANALYTICS_PATHS) {
+        try {
+          const res = await fetch(`${BASE}${path}${qs.toString() ? `?${qs}` : ""}`, { headers: auth });
+          attempts.push({ path, status: res.status });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const empty =
+            data == null ||
+            (Array.isArray(data) && data.length === 0) ||
+            (Array.isArray(data?.items) && data.items.length === 0);
+          if (empty) continue;
+          return json({ ok: true, supported: true, path, data });
+        } catch {
+          attempts.push({ path, status: 0 });
+        }
+      }
+      return json({
+        ok: true,
+        supported: false,
+        attempts,
+        data: null,
+      });
     }
 
     // Single campaign, by path id. Used as a fallback when the /campaigns list

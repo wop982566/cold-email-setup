@@ -2,6 +2,18 @@ import { useMemo, useState, Fragment } from "react";
 import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ResponsiveContainer,
+  BarChart,
+  // Aliased: this file already has its own `Bar` for the capacity meters.
+  Bar as RechartsBar,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ReferenceLine,
+} from "recharts";
+import {
   Target,
   RefreshCw,
   Plug,
@@ -13,6 +25,7 @@ import {
   Ban,
   Flame,
   HeartPulse,
+  Activity,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
@@ -30,6 +43,8 @@ import {
   type PlacementMap,
 } from "../lib/placement";
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
+import { computeSendingHealth } from "../lib/sendingHealth";
+import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
@@ -149,6 +164,43 @@ export default function Planner() {
       placement: placementHealthInput,
     });
   }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs, placementHealthInput]);
+
+  // Actual daily sends. Same query key as the Sending Health card, so this
+  // shares that cache instead of refetching the series.
+  const dailyQ = useQuery({
+    queryKey: ["inst", "daily", 30],
+    queryFn: () => instantly.analyticsDaily(30),
+    staleTime: 60_000,
+  });
+
+  // Per-mailbox sends, if this workspace's API reports them at all.
+  const inboxQ = useQuery({
+    queryKey: ["inst", "acct-analytics", 30],
+    queryFn: () => instantly.accountAnalytics(30),
+    staleTime: 5 * 60_000,
+  });
+
+  const sends = useMemo(() => {
+    if (!cap || !settings) return null;
+    return computeSendingHealth({
+      accountsData: acctQ.data?.ok ? acctQ.data.data : null,
+      campaignsData: campQ.data?.ok ? campQ.data.data : null,
+      dailyData: dailyQ.data?.ok ? dailyQ.data.data : null,
+      cap,
+      settings,
+      days: 30,
+      recentDays: 7,
+    });
+  }, [acctQ.data, campQ.data, dailyQ.data, cap, settings]);
+
+  const inboxSends: InboxSendsResult | null = useMemo(() => {
+    if (!inboxQ.data || !settings) return null;
+    return parseInboxSends(inboxQ.data.data, {
+      supported: inboxQ.data.supported,
+      windowDays: 30,
+      sendingDaysPerWeek: settings.sending_days_per_week,
+    });
+  }, [inboxQ.data, settings]);
 
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
@@ -548,11 +600,60 @@ export default function Planner() {
                 onToggle={() => toggleGroup(g.key)}
                 healthByEmail={healthByEmail}
                 placement={placement}
+                perBoxCap={p.perBoxCap}
               />
             ))}
           </div>
         )}
       </Card>
+
+      {/* What actually went out, against what the mailboxes could carry. */}
+      {sends ? (
+        <Card className="p-5">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="flex items-center gap-2 text-lg">
+              <Activity size={18} /> Actual sends — last 7 days
+            </h3>
+            <div className="flex flex-wrap gap-2 text-xs">
+              <Badge tone="white">{fmtNumber(sends.liveMailboxDaily)}/day capacity</Badge>
+              <Badge tone={sends.avgPerSendingDayRecent > 0 ? "sky" : "sun"}>
+                {fmtNumber(sends.avgPerSendingDayRecent)}/day actual
+              </Badge>
+              <Badge tone="lavender">{fmtNumber(sends.sentRecent)} sent in the window</Badge>
+            </div>
+          </div>
+          <p className="mb-3 text-xs text-muted">
+            Real campaign sends from Instantly — warmup email isn't counted. The dashed line is
+            total mailbox capacity ({fmtNumber(sends.liveMailboxDaily)}/day). Today is still in
+            progress, so it's excluded from the average.
+          </p>
+          <div className="h-52">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={sends.days.slice(-8).map((d) => ({ ...d, label: fmtDateShort(d.date) }))}
+              >
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 11, fontWeight: 700 }} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fontWeight: 700 }} width={44} />
+                <Tooltip formatter={(v: number) => [`${fmtNumber(v)} sent`, "Emails"]} />
+                {sends.liveMailboxDaily > 0 ? (
+                  <ReferenceLine
+                    y={sends.liveMailboxDaily}
+                    stroke="#E03131"
+                    strokeWidth={2}
+                    strokeDasharray="4 4"
+                  />
+                ) : null}
+                <RechartsBar dataKey="sent" radius={[6, 6, 0, 0]}>
+                  {sends.days.slice(-8).map((d) => (
+                    <Cell key={d.date} fill={d.isToday ? "#9DB4FF" : "#3F6BFF"} />
+                  ))}
+                </RechartsBar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </Card>
+      ) : null}
 
       {/* Mailboxes */}
       <Card className="overflow-hidden p-0">
@@ -571,12 +672,19 @@ export default function Planner() {
         </button>
         {showMailboxes ? (
           <div className="max-h-96 overflow-auto">
+            {inboxSends && !inboxSends.supported ? (
+              <p className="border-b border-ink/10 bg-sun/20 px-3 py-2 text-[11px]">
+                <b>Sending shows n/a:</b> {inboxSends.reason}
+              </p>
+            ) : null}
             <table className="w-full min-w-[720px] border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
                   <th className="w-12 px-3 py-2">Use</th>
                   <th className="px-3 py-2">Mailbox</th>
                   <th className="w-20 px-3 py-2">Limit</th>
+                  <th className="w-28 px-3 py-2">Sending</th>
+                  <th className="w-24 px-3 py-2">Last used</th>
                   <th className="px-3 py-2">Campaigns</th>
                   <th className="w-28 px-3 py-2">State</th>
                 </tr>
@@ -597,6 +705,34 @@ export default function Planner() {
                     </td>
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>
                     <td className="px-3 py-2">{fmtNumber(b.dailyLimit)}</td>
+                    {/* Real measured sends, or nothing. Never a share of a
+                        campaign total dressed up as a per-inbox figure. */}
+                    <td className="px-3 py-2">
+                      {inboxSends?.supported ? (
+                        (() => {
+                          const s = inboxSends.byEmail.get(b.email);
+                          if (!s || s.sentLast30 === 0) return <span className="text-muted">0</span>;
+                          const pct = b.dailyLimit > 0 ? (s.sentPerDay / b.dailyLimit) * 100 : 0;
+                          return (
+                            <>
+                              <span className="font-bold">{fmtNumber(s.sentPerDay)}/day</span>
+                              {b.dailyLimit > 0 ? (
+                                <p className={cn("text-[11px]", pct < 50 ? "text-danger" : "text-muted")}>
+                                  {fmtPercent(pct)} of limit
+                                </p>
+                              ) : null}
+                            </>
+                          );
+                        })()
+                      ) : (
+                        <span className="text-muted" title="Not reported by Instantly">
+                          n/a
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-xs text-muted">
+                      {b.lastUsedAt ? fmtDateShort(b.lastUsedAt) : "never"}
+                    </td>
                     <td className="px-3 py-2 text-xs text-muted">
                       {b.allCampaignIds.length === 0 ? (
                         <span className="text-muted">not in any campaign</span>
@@ -648,12 +784,15 @@ function GroupRow({
   onToggle,
   healthByEmail,
   placement,
+  perBoxCap,
 }: {
   g: PlannerGroup;
   open: boolean;
   onToggle: () => void;
   healthByEmail: Map<string, MailboxHealth>;
   placement: PlacementMap | null;
+  /** Most common per-mailbox daily limit — the "× 15/day" in the breakdown. */
+  perBoxCap: number;
 }) {
   const short = g.gapDaily > 0;
   const max = Math.max(g.demandDaily, g.supplyDaily, 1);
@@ -708,12 +847,13 @@ function GroupRow({
 
       {open ? (
         <div className="overflow-x-auto border-t-2 border-ink/10 px-4 pb-4">
-          <table className="w-full min-w-[1020px] border-collapse text-left text-sm">
+          <table className="w-full min-w-[1160px] border-collapse text-left text-sm">
             <thead>
               <tr className="text-xs uppercase text-muted">
                 <th className="py-2 pr-3">Campaign</th>
                 <th className="w-20 py-2 pr-3">Limit</th>
                 <th className="w-20 py-2 pr-3">Supply</th>
+                <th className="w-24 py-2 pr-3">Sending</th>
                 <th className="w-16 py-2 pr-3">Boxes</th>
                 <th className="w-32 py-2 pr-3">Priority</th>
                 <th className="w-44 py-2 pr-3">Leads contacted</th>
@@ -733,6 +873,21 @@ function GroupRow({
                     <td className="py-2 pr-3">{c.dailyLimit > 0 ? fmtNumber(c.dailyLimit) : "—"}</td>
                     <td className={cn("py-2 pr-3 font-bold", c.gapDaily > 0 && "text-danger")}>
                       {fmtNumber(c.supplyDaily)}
+                    </td>
+                    {/* Actual sends, against all the capacity to its left. */}
+                    <td className="py-2 pr-3">
+                      {c.sentLast30 > 0 ? (
+                        <>
+                          <p className="font-bold">{fmtNumber(c.sentPerDay)}/day</p>
+                          <p className="text-[11px] text-muted">
+                            {c.supplyDaily > 0
+                              ? `${fmtPercent((c.sentPerDay / c.supplyDaily) * 100)} of supply`
+                              : `${fmtNumber(c.sentLast30)} in 30d`}
+                          </p>
+                        </>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
                     </td>
                     <td className="py-2 pr-3">
                       {c.emails.length === 0 ? (
@@ -798,21 +953,59 @@ function GroupRow({
                         <Badge tone="mint">list done</Badge>
                       ) : (
                         <>
+                          {/* Always the real figure. "1yr+" hid the two numbers
+                              the column exists to give you, and hid them hardest
+                              on exactly the campaigns that need attention. */}
                           <Badge
                             tone={c.daysToFinish < 7 ? "danger" : c.daysToFinish < 21 ? "sun" : "white"}
                           >
-                            {c.daysToFinish > 365 ? "1yr+" : `${Math.round(c.daysToFinish)}d`}
+                            {fmtNumber(Math.round(c.daysToFinish))}d
                           </Badge>
-                          {c.finishDate && c.daysToFinish <= 365 ? (
+                          {c.finishDate ? (
                             <p className="mt-0.5 text-[11px] text-muted">{fmtDateShort(c.finishDate)}</p>
                           ) : null}
                         </>
                       )}
                     </td>
                   </tr>
+                  {/* The whole sum on one line, in the order it gets asked:
+                      capacity, rate, what's left, how long, what date. */}
+                  <tr className="bg-canvas/40">
+                    <td colSpan={10} className="px-1 pb-2 text-[11px] text-muted">
+                      <b>{fmtNumber(c.mailboxCount)}</b> inbox
+                      {c.mailboxCount === 1 ? "" : "es"} ×{" "}
+                      <b>{fmtNumber(perBoxCap)}</b>/day = <b>{fmtNumber(c.supplyDaily)}</b>{" "}
+                      emails/day
+                      {c.sentLast30 > 0 ? (
+                        <>
+                          {" "}· sending <b>{fmtNumber(c.sentPerDay)}</b>/day
+                        </>
+                      ) : null}
+                      {c.newLeadsPerDay > 0 ? (
+                        <>
+                          {" "}· contacting <b>{fmtNumber(c.newLeadsPerDay)}</b> new leads/day
+                        </>
+                      ) : null}
+                      {" "}· <b>{fmtNumber(c.leadsRemaining)}</b> of{" "}
+                      {fmtNumber(c.leadsTotal)} leads left
+                      {c.daysToFinish !== null && c.daysToFinish > 0 ? (
+                        <>
+                          {" "}· <b>{fmtNumber(Math.round(c.daysToFinish))}</b> days
+                          {c.finishDate ? (
+                            <>
+                              {" "}· finishes <b>{fmtDateShort(c.finishDate)}</b>
+                            </>
+                          ) : null}
+                        </>
+                      ) : c.daysToFinish === 0 ? (
+                        <> · every lead contacted</>
+                      ) : null}
+                    </td>
+                  </tr>
+
                   {openBoxes.has(c.id) ? (
                     <tr key={`${c.id}-boxes`} className="border-t border-ink/10 bg-canvas/70">
-                      <td colSpan={8} className="px-1 py-3">
+                      <td colSpan={10} className="px-1 py-3">
                         <CampaignMailboxTable
                           emails={c.emails}
                           health={c.health}

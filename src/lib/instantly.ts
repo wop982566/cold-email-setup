@@ -136,6 +136,12 @@ export const instantly = {
   // siblings — the payload may be a bare array or {items:[…]}, which asItems()
   // absorbs.
   analyticsDaily: (days = 30) => call("analytics-daily", daysParams(days)),
+  // Per-mailbox sends. Resolves with `supported: false` when this workspace's
+  // API doesn't report them — an answer, not a failure.
+  accountAnalytics: (days = 30) =>
+    call<unknown>("account-analytics", daysParams(days)) as Promise<
+      InstantlyResult<unknown> & { supported?: boolean }
+    >,
   // Single campaign — used only when the list payload omits email_list, which
   // is the campaign -> mailbox linkage the planner is built on.
   campaignDetail: (id: string) => call("campaign-detail", { id }),

@@ -122,6 +122,11 @@ export interface PlannerCampaign {
   leadsContacted: number;
   leadsRemaining: number;
   pctContacted: number;
+  // What this campaign ACTUALLY sent, against all the capacity figures above.
+  // Already read from analytics for the reply/bounce rates — surfaced so a row
+  // can show sending vs. capacity rather than only capacity.
+  sentLast30: number;
+  sentPerDay: number; // per sending day, to compare against supplyDaily
   newLeadsPerDay: number; // per SENDING day — what the operator recognises
   newLeadsPerCalendarDay: number; // per calendar day — drives the ETA
   newLeadRateObserved: boolean; // false = derived from config, not real sends
@@ -560,6 +565,10 @@ export function computePlan({
       leadsContacted,
       leadsRemaining,
       pctContacted: rate(leadsContacted, leadsTotal),
+      sentLast30: sent,
+      // Per SENDING day, so it lines up with supplyDaily rather than being
+      // deflated by the weekends nothing goes out on.
+      sentPerDay: sendingDayFactor > 0 ? sent / WINDOW_DAYS / sendingDayFactor : 0,
       newLeadsPerDay: Number.isFinite(perSendingDay) ? perSendingDay : 0,
       newLeadsPerCalendarDay: Number.isFinite(perCalendarDay) ? perCalendarDay : 0,
       newLeadRateObserved: observedPerCalendarDay > 0,
