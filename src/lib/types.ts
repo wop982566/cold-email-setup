@@ -220,7 +220,11 @@ export interface SequenceEmail extends BaseRow {
 }
 
 // --- Mailbox recovery ------------------------------------------------------
-export type RecoveryStatus = "recovering" | "recovered" | "retired";
+// "recovered" and "restored" are deliberately separate: the first releases a
+// mailbox back into the spare pool for FUTURE swaps, the second puts it back
+// into the campaign it was pulled from. Conflating them would make the archive
+// claim swaps were reversed when they weren't.
+export type RecoveryStatus = "recovering" | "recovered" | "restored" | "retired";
 
 /**
  * A mailbox pulled out of a live campaign because it was hurting
@@ -237,6 +241,11 @@ export interface RecoveryEntry extends BaseRow {
   campaign_names: string[];
   status: RecoveryStatus;
   released_at: string | null;
+  // When the swap was actually reversed in Instantly, and which campaigns took
+  // it — a multi-campaign undo can partly fail, and the archive must not imply
+  // otherwise.
+  restored_at: string | null;
+  restored_campaigns: string[];
   reason: string; // what triggered the swap, in the words the UI used
   // Sampled whenever the planner loads, so the trend is real history rather
   // than a single before/after pair.

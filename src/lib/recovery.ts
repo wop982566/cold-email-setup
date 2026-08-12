@@ -14,7 +14,7 @@
 //
 // Pure module — the page fetches and persists, this computes.
 // ---------------------------------------------------------------------------
-import { RecoveryEntry } from "./types";
+import { RecoveryEntry, RecoveryStatus } from "./types";
 
 /** Samples kept per mailbox. Two months of daily points is plenty of history. */
 const MAX_HISTORY = 60;
@@ -137,6 +137,91 @@ export function viewFor(
       trend !== "improving" &&
       (scoreNow === null || scoreNow < minScore),
   };
+}
+
+// --- Archive ---------------------------------------------------------------
+// Every swap ever applied, whatever became of it. Kept separate from
+// RecoveryView because that one only ever describes mailboxes still healing,
+// while this describes the historical record.
+
+export type ArchiveFilter = "all" | RecoveryStatus;
+
+export interface ArchiveRow {
+  entry: RecoveryEntry;
+  scoreAtSwap: number | null;
+  scoreNow: number | null;
+  inboxRateAtSwap: number | null;
+  inboxRateNow: number | null;
+  daysSince: number;
+  /** Whether reversing this swap is offered at all. */
+  canUndo: boolean;
+  undoBlockedReason: string | null;
+  /** Still below the bar it was pulled for — worth warning about, not blocking. */
+  stillUnhealthy: boolean;
+}
+
+export interface CurrentHealth {
+  score: number | null;
+  inboxRate: number | null;
+}
+
+/**
+ * Build the archive, newest swap first.
+ *
+ * `current` supplies live health per address so a row can show the score at
+ * swap time next to the score now — the comparison that makes an undo a
+ * decision rather than a guess.
+ */
+export function archiveRows(
+  entries: RecoveryEntry[],
+  current: Map<string, CurrentHealth>,
+  minScore: number,
+  now = new Date(),
+): ArchiveRow[] {
+  return [...entries]
+    .sort((a, b) => (b.swapped_out_at ?? "").localeCompare(a.swapped_out_at ?? ""))
+    .map((entry) => {
+      const live = current.get(entry.email.trim().toLowerCase()) ?? null;
+      const scoreNow = live?.score ?? null;
+
+      // Already put back, or nothing recorded to put back into.
+      const undoBlockedReason = entry.status === "restored"
+        ? "Already swapped back"
+        : !entry.replaced_by
+          ? "No replacement recorded, so there's nothing to reverse"
+          : entry.campaign_ids.length === 0
+            ? "No campaign recorded for this swap"
+            : null;
+
+      return {
+        entry,
+        scoreAtSwap: entry.score_at_swap,
+        scoreNow,
+        inboxRateAtSwap: entry.inbox_rate_at_swap,
+        inboxRateNow: live?.inboxRate ?? null,
+        daysSince: daysBetween(entry.swapped_out_at, now),
+        canUndo: undoBlockedReason === null,
+        undoBlockedReason,
+        // Unknown is not unhealthy — we only warn on a measured, still-low score.
+        stillUnhealthy: scoreNow !== null && scoreNow < minScore,
+      };
+    });
+}
+
+export function filterArchive(rows: ArchiveRow[], filter: ArchiveFilter): ArchiveRow[] {
+  return filter === "all" ? rows : rows.filter((r) => r.entry.status === filter);
+}
+
+export function archiveCounts(rows: ArchiveRow[]): Record<ArchiveFilter, number> {
+  const counts: Record<ArchiveFilter, number> = {
+    all: rows.length,
+    recovering: 0,
+    recovered: 0,
+    restored: 0,
+    retired: 0,
+  };
+  for (const r of rows) counts[r.entry.status]++;
+  return counts;
 }
 
 export function summarise(views: RecoveryView[]) {

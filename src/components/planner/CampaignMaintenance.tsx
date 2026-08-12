@@ -17,7 +17,17 @@ import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailbox
 import { Plan } from "../../lib/campaignPlan";
 import type { PlacementMap } from "../../lib/placement";
 import { instantly } from "../../lib/instantly";
-import { recoveringEmails, sampleFor, summarise, viewFor, type RecoveryView } from "../../lib/recovery";
+import {
+  archiveRows,
+  recoveringEmails,
+  sampleFor,
+  summarise,
+  viewFor,
+  type ArchiveRow,
+  type CurrentHealth,
+  type RecoveryView,
+} from "../../lib/recovery";
+import { SwapArchive } from "./SwapArchive";
 import { useInsert, useUpdate } from "../../lib/hooks";
 import { AppSettings, RecoveryEntry, TABLES } from "../../lib/types";
 import { fmtNumber } from "../../lib/format";
@@ -94,6 +104,16 @@ export function CampaignMaintenance({
     [recovery, healthByEmail, minScore],
   );
   const recoveryStats = useMemo(() => summarise(recoveryViews), [recoveryViews]);
+
+  // The archive spans every status, so it reads the same live health map the
+  // rest of the tab uses rather than a second source of truth.
+  const archive: ArchiveRow[] = useMemo(() => {
+    const current = new Map<string, CurrentHealth>();
+    for (const [email, h] of healthByEmail) {
+      current.set(email, { score: h.score, inboxRate: h.inboxRate });
+    }
+    return archiveRows(recovery, current, minScore);
+  }, [recovery, healthByEmail, minScore]);
 
   // Take one score reading per recovering mailbox per day, so the trend is real
   // history. sampleFor() returns null when today's point already exists and
@@ -193,6 +213,8 @@ export function CampaignMaintenance({
           campaign_names: p.campaigns.map((c) => c.name),
           status: "recovering",
           released_at: null,
+          restored_at: null,
+          restored_campaigns: [],
           reason: p.bad.issues.filter((i) => i.triggersReplacement).map((i) => i.label).join("; "),
           history: [],
         } as Partial<RecoveryEntry>);
@@ -207,6 +229,92 @@ export function CampaignMaintenance({
       toast.push(failed[0], "error");
     } else {
       toast.push(`${done.length} applied, ${failed.length} failed — ${failed[0]}`, "error");
+    }
+  }
+
+  /** Reverse a swap without touching anything — shows the exact before/after. */
+  async function previewUndo(row: ArchiveRow) {
+    const e = row.entry;
+    setBusyRecovery(e.id);
+    const lines: string[] = [];
+    for (let i = 0; i < e.campaign_ids.length; i++) {
+      const id = e.campaign_ids[i];
+      const label = e.campaign_names[i] ?? id;
+      const res = await instantly.setCampaignEmails(
+        { campaignId: id, remove: e.replaced_by, add: e.email },
+        true,
+      );
+      lines.push(
+        res.ok
+          ? `${label}: ${e.replaced_by} out, ${e.email} back in (${res.before?.length ?? 0} mailboxes)`
+          : `${label}: ${res.error}`,
+      );
+    }
+    setPreview((s) => new Map(s).set(e.id, lines.join("\n")));
+    setBusyRecovery(null);
+  }
+
+  /**
+   * Put a swapped-out mailbox back where it came from. This is the exact
+   * inverse of applySwap — same server op, `remove` and `add` reversed — so it
+   * inherits the same guards: it refuses if the replacement is no longer
+   * attached, or if the original is already back.
+   */
+  async function undoSwap(row: ArchiveRow) {
+    const e = row.entry;
+    const warning = row.stillUnhealthy
+      ? `\n\n⚠ ${e.email} is still at score ${row.scoreNow}, below the bar it was pulled for. Swapping it back puts the original problem into a live campaign.`
+      : "";
+    const confirmed = window.confirm(
+      `Swap ${e.email} back in place of ${e.replaced_by}?\n\n` +
+        `Campaigns: ${e.campaign_names.join(", ") || e.campaign_ids.join(", ")}\n` +
+        `Score at swap: ${row.scoreAtSwap ?? "unknown"} → now: ${row.scoreNow ?? "unknown"}\n` +
+        `Originally pulled for: ${e.reason || "no reason recorded"}` +
+        warning,
+    );
+    if (!confirmed) return;
+
+    setBusyRecovery(e.id);
+    const done: string[] = [];
+    const doneIds: string[] = [];
+    const failed: string[] = [];
+
+    for (let i = 0; i < e.campaign_ids.length; i++) {
+      const id = e.campaign_ids[i];
+      const label = e.campaign_names[i] ?? id;
+      const res = await instantly.setCampaignEmails({
+        campaignId: id,
+        remove: e.replaced_by,
+        add: e.email,
+      });
+      if (res.ok && res.applied !== false) {
+        done.push(label);
+        doneIds.push(id);
+      } else {
+        failed.push(`${label}: ${res.error ?? "did not verify"}`);
+      }
+      if (res.writesDisabled) break;
+    }
+
+    if (doneIds.length > 0) {
+      await updateRecovery.mutateAsync({
+        id: e.id,
+        patch: {
+          status: "restored",
+          restored_at: new Date().toISOString(),
+          restored_campaigns: doneIds,
+        },
+      });
+      onApplied();
+    }
+
+    setBusyRecovery(null);
+    if (failed.length === 0) {
+      toast.push(`${e.email} swapped back on ${done.length} campaign${done.length === 1 ? "" : "s"}`, "success");
+    } else if (done.length === 0) {
+      toast.push(failed[0], "error");
+    } else {
+      toast.push(`${done.length} restored, ${failed.length} failed — ${failed[0]}`, "error");
     }
   }
 
@@ -418,6 +526,14 @@ export function CampaignMaintenance({
         onReturn={(v) => void returnToService(v)}
         onRetire={(v) => void retire(v)}
         busy={busyRecovery}
+      />
+
+      <SwapArchive
+        rows={archive}
+        onUndo={(r) => void undoSwap(r)}
+        onPreview={(r) => void previewUndo(r)}
+        busy={busyRecovery}
+        preview={preview}
       />
 
       {m.unassigned.length > 0 ? (
