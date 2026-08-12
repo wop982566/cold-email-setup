@@ -262,6 +262,19 @@ export default async (req: Request): Promise<Response> => {
         return json({ ok: false, error: "Invalid JSON body" }, 400);
       }
 
+      // Cheapest possible question: are writes permitted at all? Answered
+      // without touching Instantly, so the UI can disable its buttons and
+      // explain why BEFORE anyone clicks one.
+      if (str(body.op) === "capabilities") {
+        return json({
+          ok: true,
+          writesEnabled: writesEnabled(),
+          hint: writesEnabled()
+            ? null
+            : "Writes to Instantly are turned off. Add INSTANTLY_WRITE_ENABLED=true to your Netlify environment variables (Functions scope) and redeploy.",
+        });
+      }
+
       const op = str(body.op) as WriteOp;
       if (!WRITE_OPS.includes(op)) {
         return json({ ok: false, error: `Unknown or forbidden write op: ${op || "(none)"}` }, 400);
@@ -427,22 +440,52 @@ export default async (req: Request): Promise<Response> => {
         }
 
         const next = current.map((e) => (e === remove ? add : e));
+        const path = `/campaigns/${encodeURIComponent(campaignId)}`;
 
-        if (dryRun) return json({ ok: true, dryRun: true, campaignId, before: current, after: next });
+        if (dryRun) {
+          return json({ ok: true, dryRun: true, campaignId, before: current, after: next });
+        }
 
-        const res = await post(`/campaigns/${encodeURIComponent(campaignId)}`, { email_list: next }, "PATCH");
-        const data = await res.json().catch(() => null);
+        // Every attempt is recorded and returned. The API contract here could
+        // not be verified against Instantly's docs when this was written, so
+        // the response has to carry enough for a human to see what happened
+        // rather than leaving it to a toast that vanishes.
+        const attempts: { method: string; path: string; status: number; body: unknown }[] = [];
+
+        const tryWrite = async (method: string) => {
+          const r = await post(path, { email_list: next }, method);
+          const body = await r.json().catch(() => null);
+          attempts.push({ method, path, status: r.status, body: scrub(body) });
+          return r;
+        };
+
+        let res = await tryWrite("PATCH");
+        // 404/405 mean specifically "wrong path or wrong method", so one retry
+        // with POST is principled. A 400/422 means the payload was rejected,
+        // where retrying a different verb would only add noise.
+        if (res.status === 404 || res.status === 405) {
+          res = await tryWrite("POST");
+        }
+
         if (!res.ok) {
           return json(
-            { ok: false, campaignId, error: `Instantly ${res.status}`, data: scrub(data), before: current, attempted: next },
+            {
+              ok: false,
+              campaignId,
+              error: `Instantly ${res.status}`,
+              attempts,
+              before: current,
+              attempted: next,
+            },
             res.status,
           );
         }
 
         // Confirm from the server rather than trusting the write's response.
-        const verifyRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
-        const verified = verifyRes.ok ? emailListOf(await verifyRes.json().catch(() => null)) : null;
-        const applied = verified ? verified.includes(add) && !verified.includes(remove) : null;
+        const verifyRes = await fetch(`${BASE}${path}`, { headers: auth });
+        const verifyOk = verifyRes.ok;
+        const verified = verifyOk ? emailListOf(await verifyRes.json().catch(() => null)) : null;
+        const applied = verified === null ? null : verified.includes(add) && !verified.includes(remove);
 
         return json({
           ok: true,
@@ -450,7 +493,11 @@ export default async (req: Request): Promise<Response> => {
           before: current,
           after: next,
           verified,
-          // null means the confirming read failed, not that the write failed.
+          verifyStatus: verifyRes.status,
+          attempts,
+          // true = confirmed applied. false = confirmed NOT applied.
+          // null = the confirming read failed, so we genuinely do not know —
+          // callers must not treat this as success.
           applied,
         });
       }

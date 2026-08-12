@@ -60,12 +60,15 @@ export function SwapArchive({
   onPreview,
   busy,
   preview,
+  writesEnabled,
 }: {
   rows: ArchiveRow[];
   onUndo: (row: ArchiveRow) => void;
   onPreview: (row: ArchiveRow) => void;
   busy: string | null;
+  /** Diagnostics from the last attempt, keyed by entry id. */
   preview: Map<string, string>;
+  writesEnabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState<ArchiveFilter>("all");
@@ -136,9 +139,13 @@ export function SwapArchive({
                           </button>
                           <button
                             className="btn-ghost btn-sm"
-                            disabled={isBusy}
+                            disabled={isBusy || !writesEnabled}
                             onClick={() => onUndo(row)}
-                            title={`Remove ${e.replaced_by} and put ${e.email} back`}
+                            title={
+                              writesEnabled
+                                ? `Remove ${e.replaced_by} and put ${e.email} back`
+                                : "Writes are disabled — set INSTANTLY_WRITE_ENABLED=true"
+                            }
                           >
                             {isBusy ? <Spinner /> : <Undo2 size={13} />} Swap back
                           </button>
@@ -174,10 +181,20 @@ export function SwapArchive({
                     </p>
                   ) : null}
 
+                  {/* Durable record of what was attempted and what Instantly
+                      answered — a toast disappears before it can be read. */}
                   {preview.has(e.id) ? (
-                    <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-white p-2 text-[11px]">
-                      {preview.get(e.id)}
-                    </pre>
+                    <div className="mt-2">
+                      <button
+                        className="btn-ghost btn-sm mb-1"
+                        onClick={() => void navigator.clipboard?.writeText(preview.get(e.id) ?? "")}
+                      >
+                        Copy details
+                      </button>
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded-lg border-2 border-ink bg-white p-2 text-[11px]">
+                        {preview.get(e.id)}
+                      </pre>
+                    </div>
                   ) : null}
                 </div>
               );

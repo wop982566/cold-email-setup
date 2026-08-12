@@ -93,9 +93,10 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `ANTHROPIC_API_KEY` | functions | Claude AI cold-email sequence generation |
 | `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
 | `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
+| `INSTANTLY_WRITE_ENABLED` | functions | **Required for any write.** Set to `true` to let the planner create mailboxes and swap them on campaigns. Unset, every write returns 403 and the Maintenance tab shows a banner saying so. Reads are unaffected. |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
-| `APP_FUNCTION_TOKEN` + `VITE_APP_TOKEN` | both | Optional shared secret so only your app can call the functions |
+| `APP_FUNCTION_TOKEN` + `VITE_APP_TOKEN` | both | Shared secret so only your app can call the functions. Also **required** to read or write saved mailbox credentials (Settings → Mailbox credentials) — without it that table is refused outright, since it holds SMTP/IMAP passwords. Set `VITE_APP_TOKEN` to the same value, and do **not** mark it Secret in Netlify or the build can't read it. |
 | `VITE_APP_USERNAME` + `VITE_APP_PASSWORD` | build | Optional login gate. Set the password to require sign-in. |
 
 ---

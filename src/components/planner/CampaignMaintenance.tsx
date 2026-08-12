@@ -10,13 +10,21 @@ import {
   Check,
   Zap,
   Eye,
+  Lock,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner } from "../ui/primitives";
 import { useToast } from "../ui/toast";
 import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailboxHealth";
 import { Plan } from "../../lib/campaignPlan";
 import type { PlacementMap } from "../../lib/placement";
+import { useQuery } from "@tanstack/react-query";
 import { instantly } from "../../lib/instantly";
+import {
+  classifyWrite,
+  formatAttempts,
+  summariseWrites,
+  type WriteVerdict,
+} from "../../lib/writeResult";
 import {
   archiveRows,
   recoveringEmails,
@@ -88,6 +96,16 @@ export function CampaignMaintenance({
   const [applying, setApplying] = useState<string | null>(null);
   const [preview, setPreview] = useState<Map<string, string>>(new Map());
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
+
+  // Asked once, before any button is offered: are writes permitted at all?
+  // Touches nothing in Instantly.
+  const capsQ = useQuery({
+    queryKey: ["inst", "write-caps"],
+    queryFn: () => instantly.writeCapabilities(),
+    staleTime: 5 * 60_000,
+  });
+  const writesEnabled = capsQ.data?.writesEnabled !== false;
+  const writesHint = capsQ.data?.hint ?? null;
 
   const insertRecovery = useInsert<RecoveryEntry>(TABLES.recovery);
   const updateRecovery = useUpdate<RecoveryEntry>(TABLES.recovery);
@@ -185,8 +203,9 @@ export function CampaignMaintenance({
     if (!confirmed) return;
 
     setApplying(p.id);
+    const verdicts: WriteVerdict[] = [];
+    const trace: string[] = [];
     const done: string[] = [];
-    const failed: string[] = [];
 
     for (const c of p.campaigns) {
       const res = await instantly.setCampaignEmails({
@@ -195,10 +214,15 @@ export function CampaignMaintenance({
         add: to.box.email,
         expectedList: c.emailListNow,
       });
-      if (res.ok && res.applied !== false) done.push(c.name);
-      else failed.push(`${c.name}: ${res.error ?? "did not verify"}`);
+      const verdict = classifyWrite(res, c.name);
+      verdicts.push(verdict);
+      trace.push(formatAttempts(res, c.name));
+      // ONLY a confirmed write counts. An unconfirmed one is not a success.
+      if (verdict.confirmed) done.push(c.name);
       if (res.writesDisabled) break; // no point retrying the rest
     }
+
+    setPreview((s) => new Map(s).set(p.id, trace.join("\n\n")));
 
     if (done.length > 0) {
       const already = recoveringEmails(recovery).has(p.bad.box.email);
@@ -223,13 +247,8 @@ export function CampaignMaintenance({
     }
 
     setApplying(null);
-    if (failed.length === 0) {
-      toast.push(`Swapped on ${done.length} campaign${done.length === 1 ? "" : "s"}`, "success");
-    } else if (done.length === 0) {
-      toast.push(failed[0], "error");
-    } else {
-      toast.push(`${done.length} applied, ${failed.length} failed — ${failed[0]}`, "error");
-    }
+    const summary = summariseWrites(verdicts);
+    toast.push(summary.message, summary.tone);
   }
 
   /** Reverse a swap without touching anything — shows the exact before/after. */
@@ -275,9 +294,9 @@ export function CampaignMaintenance({
     if (!confirmed) return;
 
     setBusyRecovery(e.id);
-    const done: string[] = [];
+    const verdicts: WriteVerdict[] = [];
+    const trace: string[] = [];
     const doneIds: string[] = [];
-    const failed: string[] = [];
 
     for (let i = 0; i < e.campaign_ids.length; i++) {
       const id = e.campaign_ids[i];
@@ -287,14 +306,16 @@ export function CampaignMaintenance({
         remove: e.replaced_by,
         add: e.email,
       });
-      if (res.ok && res.applied !== false) {
-        done.push(label);
-        doneIds.push(id);
-      } else {
-        failed.push(`${label}: ${res.error ?? "did not verify"}`);
-      }
+      const verdict = classifyWrite(res, label);
+      verdicts.push(verdict);
+      trace.push(formatAttempts(res, label));
+      // Only mark it restored when Instantly confirmed it. An unconfirmed
+      // write must not rewrite the archive to say the swap was reversed.
+      if (verdict.confirmed) doneIds.push(id);
       if (res.writesDisabled) break;
     }
+
+    setPreview((s) => new Map(s).set(e.id, trace.join("\n\n")));
 
     if (doneIds.length > 0) {
       await updateRecovery.mutateAsync({
@@ -309,13 +330,8 @@ export function CampaignMaintenance({
     }
 
     setBusyRecovery(null);
-    if (failed.length === 0) {
-      toast.push(`${e.email} swapped back on ${done.length} campaign${done.length === 1 ? "" : "s"}`, "success");
-    } else if (done.length === 0) {
-      toast.push(failed[0], "error");
-    } else {
-      toast.push(`${done.length} restored, ${failed.length} failed — ${failed[0]}`, "error");
-    }
+    const summary = summariseWrites(verdicts);
+    toast.push(summary.message, summary.tone);
   }
 
   async function returnToService(v: RecoveryView) {
@@ -370,6 +386,27 @@ export function CampaignMaintenance({
 
   return (
     <div className="space-y-4">
+      {/* Writes off is the single most common reason a swap silently does
+          nothing, so it's stated up front rather than discovered by clicking. */}
+      {!writesEnabled ? (
+        <Card className="flex items-start gap-2 border-danger bg-danger/10 p-4 text-sm">
+          <Lock size={16} className="mt-0.5 shrink-0" />
+          <div>
+            <p className="font-extrabold">Writes to Instantly are turned off</p>
+            <p className="mt-1 text-xs">
+              {writesHint ??
+                "Add INSTANTLY_WRITE_ENABLED=true to your Netlify environment variables."}
+            </p>
+            <p className="mt-1 text-xs">
+              Netlify → Site configuration → Environment variables → add{" "}
+              <code>INSTANTLY_WRITE_ENABLED</code> = <code>true</code>, scope{" "}
+              <b>Functions</b>, then redeploy. Until then Apply and Swap back do nothing —
+              Preview still works, since it writes nothing.
+            </p>
+          </div>
+        </Card>
+      ) : null}
+
       {/* Placement coverage. Stated explicitly because partial coverage looks
           identical to a clean bill of health if you don't say so. */}
       <Card className="flex flex-wrap items-center gap-2 p-3 text-xs">
@@ -469,8 +506,12 @@ export function CampaignMaintenance({
                 <button
                   className="btn btn-sm"
                   onClick={() => void applySwap(p, to)}
-                  disabled={applying === p.id}
-                  title="Edit these campaigns in Instantly now"
+                  disabled={applying === p.id || !writesEnabled}
+                  title={
+                    writesEnabled
+                      ? "Edit these campaigns in Instantly now"
+                      : "Writes are disabled — set INSTANTLY_WRITE_ENABLED=true"
+                  }
                 >
                   {applying === p.id ? <Spinner /> : <Zap size={14} />} Apply swap
                 </button>
@@ -534,6 +575,7 @@ export function CampaignMaintenance({
         onPreview={(r) => void previewUndo(r)}
         busy={busyRecovery}
         preview={preview}
+        writesEnabled={writesEnabled}
       />
 
       {m.unassigned.length > 0 ? (

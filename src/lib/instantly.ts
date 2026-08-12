@@ -73,6 +73,13 @@ export interface InstantlyLeadsData {
 // payload that would be sent without sending it — which is how the UI shows
 // you the change before it happens.
 
+export interface WriteAttempt {
+  method: string;
+  path: string;
+  status: number;
+  body: unknown;
+}
+
 export interface WriteResult<T = unknown> extends InstantlyResult<T> {
   /** Set when the env flag is off, so the UI can explain rather than just fail. */
   writesDisabled?: boolean;
@@ -82,10 +89,20 @@ export interface WriteResult<T = unknown> extends InstantlyResult<T> {
   before?: string[];
   after?: string[];
   verified?: string[] | null;
-  /** null = the confirming read failed, not that the write failed. */
+  verifyStatus?: number;
+  /** Every HTTP call made, for diagnosis when a write doesn't land. */
+  attempts?: WriteAttempt[];
+  /**
+   * true  = confirmed applied
+   * false = confirmed NOT applied
+   * null  = could not confirm — NEVER treat this as success.
+   */
   applied?: boolean | null;
   current?: string[];
   payload?: unknown;
+  // capabilities probe
+  writesEnabled?: boolean;
+  hint?: string | null;
 }
 
 export interface NewAccount {
@@ -159,6 +176,9 @@ export const instantly = {
       return { ok: false, error: e instanceof Error ? e.message : "Network error" };
     }
   },
+
+  // Are writes permitted? Touches nothing, so it's safe to call on page load.
+  writeCapabilities: () => write({ op: "capabilities" }),
 
   createAccount: (account: NewAccount, dryRun = false) =>
     write({ op: "create-account", account, dryRun }),
