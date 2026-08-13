@@ -159,6 +159,29 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 
 ---
 
+## 💾 Bulk setup batches
+
+The Bulk Setup page saves as you work. A batch is a stored record — domains,
+per-domain DKIM tokens, prefixes, tracking config and the chosen credential
+profile — kept in the `setup_batches` table, named, and listed at the top of the
+page so a run you started last week is still there.
+
+Saving is **server-side only**, on a ~700ms debounce, and also flushes when a
+field loses focus and again on `pagehide` using `fetch(keepalive: true)` so a
+refresh mid-edit still commits. The header shows *Saved / Saving / Unsaved*, and
+the browser warns before you leave with genuinely unsaved changes.
+
+It stores `profile_id` only — SMTP and IMAP credentials stay in `mail_profiles`,
+which is gated behind `APP_FUNCTION_TOKEN`.
+
+`created_emails` records the mailboxes Instantly **confirmed**, so an
+interrupted run resumes instead of re-attempting every address: creating again
+skips what exists and tells you how many it skipped. Dry runs and failed creates
+are never recorded — either would make the next run skip a mailbox that doesn't
+exist.
+
+---
+
 ## 🧱 Tech & structure
 
 ```

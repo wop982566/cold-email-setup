@@ -58,7 +58,12 @@ export interface Repo {
   list<T extends WithId>(table: TableName): Promise<T[]>;
   insert<T extends WithId>(table: TableName, row: Partial<T>): Promise<T>;
   insertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<T[]>;
-  update<T extends WithId>(table: TableName, id: string, patch: Partial<T>): Promise<T>;
+  update<T extends WithId>(
+    table: TableName,
+    id: string,
+    patch: Partial<T>,
+    opts?: { keepalive?: boolean },
+  ): Promise<T>;
   updateMany<T extends WithId>(table: TableName, ids: string[], patch: Partial<T>): Promise<void>;
   upsertMany<T extends WithId>(table: TableName, rows: Partial<T>[]): Promise<void>;
   remove(table: TableName, id: string): Promise<void>;
@@ -222,11 +227,23 @@ function apiHeaders(): Record<string, string> {
   return h;
 }
 
-async function api<T = unknown>(opts: { method: "GET" | "POST"; query?: string; body?: unknown }): Promise<T> {
+async function api<T = unknown>(opts: {
+  method: "GET" | "POST";
+  query?: string;
+  body?: unknown;
+  /**
+   * Let the request finish even if the page is unloading. Used by autosave's
+   * pagehide flush, so a refresh between the last keystroke and the debounced
+   * save still commits. Capped at 64KB by the browser, which a setup batch is
+   * comfortably under.
+   */
+  keepalive?: boolean;
+}): Promise<T> {
   const res = await fetch(FN + (opts.query ? `?${opts.query}` : ""), {
     method: opts.method,
     headers: apiHeaders(),
     body: opts.body ? JSON.stringify(opts.body) : undefined,
+    keepalive: opts.keepalive,
   });
   let data: unknown = null;
   try {
@@ -287,11 +304,17 @@ const serverRepo: Repo = {
     await api({ method: "POST", body: { op: "insertMany", table, rows: payload } });
     return payload as unknown as T[];
   },
-  async update<T extends WithId>(table: TableName, id: string, patch: Partial<T>): Promise<T> {
+  async update<T extends WithId>(
+    table: TableName,
+    id: string,
+    patch: Partial<T>,
+    opts?: { keepalive?: boolean },
+  ): Promise<T> {
     await ensureServerSeeded();
     const { row } = await api<{ row: T }>({
       method: "POST",
       body: { op: "update", table, id, patch: { ...patch, updated_at: new Date().toISOString() } },
+      keepalive: opts?.keepalive,
     });
     return row;
   },

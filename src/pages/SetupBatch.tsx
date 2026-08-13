@@ -7,7 +7,7 @@
 // only things this page cannot derive are the SES DKIM tokens and the Netlify
 // site per domain, so both are inputs and neither is ever guessed.
 // ---------------------------------------------------------------------------
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Layers,
@@ -25,8 +25,24 @@ import {
 import { Card, Badge, StatCard, Toggle, Spinner } from "../components/ui/primitives";
 import { Field, TextField, SelectField } from "../components/ui/Field";
 import { useToast } from "../components/ui/toast";
-import { useCollection, useInsertMany, useSettings } from "../lib/hooks";
-import { Domain, MailProfile, TABLES } from "../lib/types";
+import {
+  useCollection,
+  useDebouncedSave,
+  useInsert,
+  useInsertMany,
+  useRemove,
+  useSettings,
+  useUpdate,
+} from "../lib/hooks";
+import {
+  batchProgress,
+  draftOf,
+  isDirty,
+  pendingMailboxes,
+  suggestBatchName,
+  type BatchDraft,
+} from "../lib/setupBatch";
+import { Domain, MailProfile, SetupBatch as SetupBatchRow, TABLES } from "../lib/types";
 import {
   DKIM_TOKEN_COUNT,
   checklistFor,
@@ -77,6 +93,97 @@ export default function SetupBatch() {
   const [creating, setCreating] = useState(false);
   const [createLog, setCreateLog] = useState<string[]>([]);
 
+  // --- Persistence -------------------------------------------------------
+  // Everything above used to vanish on refresh, including the DKIM tokens.
+  const batchesQ = useCollection<SetupBatchRow>(TABLES.setupBatches);
+  const batches = batchesQ.data ?? [];
+  const insertBatch = useInsert<SetupBatchRow>(TABLES.setupBatches);
+  const updateBatch = useUpdate<SetupBatchRow>(TABLES.setupBatches);
+  const removeBatch = useRemove(TABLES.setupBatches);
+
+  const [batchId, setBatchId] = useState<string | null>(null);
+  const [batchName, setBatchName] = useState("");
+  const [createdEmails, setCreatedEmails] = useState<string[]>([]);
+  // The draft as last written to the server; the dirty check compares to it.
+  const [savedDraft, setSavedDraft] = useState<BatchDraft | null>(null);
+
+  const draft: BatchDraft = useMemo(
+    () => ({
+      name: batchName,
+      config: config as unknown as Record<string, unknown>,
+      domains_text: domainsText,
+      default_prefixes: defaultPrefixes,
+      overrides,
+      profile_id: profileId,
+    }),
+    [batchName, config, domainsText, defaultPrefixes, overrides, profileId],
+  );
+
+  const dirty = batchId !== null && isDirty(savedDraft, draft);
+
+  const saveDraft = useCallback(
+    async (d: BatchDraft) => {
+      if (!batchId) return;
+      await updateBatch.mutateAsync({
+        id: batchId,
+        patch: { ...d, last_saved_at: new Date().toISOString() } as Partial<SetupBatchRow>,
+      });
+      setSavedDraft(d);
+    },
+    // updateBatch is a stable mutation object.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [batchId],
+  );
+
+  const autosave = useDebouncedSave(draft, saveDraft, { dirty, enabled: batchId !== null });
+
+  /** Open a stored batch, replacing everything on screen. */
+  function openBatch(b: SetupBatchRow) {
+    setBatchId(b.id);
+    setBatchName(b.name);
+    setConfig({ ...defaultBatchConfig(), ...(b.config as Partial<BatchConfig>) });
+    setDomainsText(b.domains_text ?? "");
+    setDefaultPrefixes(b.default_prefixes?.length ? b.default_prefixes : ["tanuj", "tanuj.s"]);
+    setOverrides(b.overrides ?? {});
+    setProfileId(b.profile_id ?? "");
+    setCreatedEmails(b.created_emails ?? []);
+    setCreateLog(b.create_log ?? []);
+    // Seed the baseline from what we just loaded, so opening a batch doesn't
+    // immediately look unsaved.
+    setSavedDraft(draftOf(b));
+  }
+
+  async function newBatch() {
+    const row = await insertBatch.mutateAsync({
+      name: suggestBatchName(""),
+      status: "draft",
+      config: defaultBatchConfig() as unknown as Record<string, unknown>,
+      domains_text: "",
+      default_prefixes: ["tanuj", "tanuj.s"],
+      overrides: {},
+      profile_id: "",
+      created_emails: [],
+      create_log: [],
+      last_saved_at: new Date().toISOString(),
+    } as Partial<SetupBatchRow>);
+    openBatch(row);
+    toast.push("New batch started — it saves as you type", "success");
+  }
+
+  // Open the most recent batch on arrival, so returning to the page resumes
+  // rather than presenting an empty form.
+  const openedRef = useRef(false);
+  useEffect(() => {
+    if (openedRef.current || batchesQ.isLoading) return;
+    openedRef.current = true;
+    const latest = [...batches].sort((a, b) =>
+      (b.last_saved_at ?? "").localeCompare(a.last_saved_at ?? ""),
+    )[0];
+    if (latest) openBatch(latest);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchesQ.isLoading]);
+
+
   const setCfg = <K extends keyof BatchConfig>(k: K, v: BatchConfig[K]) =>
     setConfig((c) => ({ ...c, [k]: v }));
   const setOverride = (domain: string, patch: Override) =>
@@ -97,6 +204,10 @@ export default function SetupBatch() {
       }),
     [domains, overrides, defaultPrefixes],
   );
+
+  // How much of this batch Instantly has already confirmed — drives the resume
+  // banner and lets a restarted run skip what exists.
+  const progress = useMemo(() => batchProgress(specs, createdEmails), [specs, createdEmails]);
 
   const statuses = useMemo(() => specs.map((s) => statusFor(s, config)), [specs, config]);
   const readyCount = statuses.filter((s) => s.dkimComplete).length;
@@ -179,12 +290,27 @@ export default function SetupBatch() {
       return;
     }
     setCreating(true);
-    setCreateLog([]);
     const log: string[] = [];
+    setCreateLog([]);
+
+    // A real run resumes: anything Instantly already confirmed is skipped, so
+    // an interrupted batch costs only the work that genuinely remains. A dry
+    // run rehearses the whole thing — it isn't creating anything, so there is
+    // nothing to skip.
+    const pending = dryRun ? null : new Set(pendingMailboxes(specs, createdEmails));
+    const alreadyDone = dryRun ? 0 : progress.created;
+    if (alreadyDone > 0) {
+      log.push(`Resuming: skipping ${alreadyDone} mailbox(es) already created.`);
+      setCreateLog([...log]);
+    }
+    // Accumulated locally and persisted as we go, so an interruption loses at
+    // most the single address in flight.
+    const confirmed = [...createdEmails];
 
     for (const spec of specs) {
       for (const prefix of spec.prefixes) {
         const email = `${prefix}@${spec.domain}`;
+        if (pending && !pending.has(email)) continue;
         const res = await instantly.createAccount(
           {
             email,
@@ -219,6 +345,28 @@ export default function SetupBatch() {
             : `FAILED ${email} — ${res.error}`,
         );
         setCreateLog([...log]);
+
+        // Only a confirmed, non-dry create counts. Recording a rehearsal or a
+        // failure would make the next run skip a mailbox that doesn't exist.
+        if (res.ok && !dryRun) {
+          confirmed.push(email);
+          setCreatedEmails([...confirmed]);
+          if (batchId) {
+            await updateBatch
+              .mutateAsync({
+                id: batchId,
+                patch: {
+                  created_emails: [...confirmed],
+                  create_log: log,
+                  status: "creating",
+                  last_saved_at: new Date().toISOString(),
+                } as Partial<SetupBatchRow>,
+              })
+              // A failed progress write must not abort the run — losing the
+              // bookmark is bad, losing the remaining mailboxes is worse.
+              .catch(() => log.push(`(couldn't save progress after ${email})`));
+          }
+        }
         if (res.writesDisabled) {
           log.push("Stopped: writes are disabled.");
           setCreateLog([...log]);
@@ -256,10 +404,100 @@ export default function SetupBatch() {
             </p>
           </div>
         </div>
-        <Link to="/domains" className="btn-ghost btn-sm">
-          Domains
-        </Link>
+        <div className="flex items-center gap-2">
+          {/* Never leave the save state a guess — that's what made losing work
+              a surprise rather than a decision. */}
+          <span className="text-[11px] text-muted">
+            {!batchId
+              ? "no batch open"
+              : autosave.state === "saving"
+                ? "Saving…"
+                : autosave.state === "error"
+                  ? "⚠ Save failed — your last edits are not stored"
+                  : dirty
+                    ? "Unsaved…"
+                    : autosave.savedAt
+                      ? `Saved ${autosave.savedAt.toLocaleTimeString()}`
+                      : "Saved"}
+          </span>
+          <Link to="/domains" className="btn-ghost btn-sm">
+            Domains
+          </Link>
+        </div>
       </Card>
+
+      {/* Batches, so a run you started last week is still here. */}
+      <Card className="p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-extrabold">Batches</p>
+          <button className="btn-ghost btn-sm" onClick={() => void newBatch()}>
+            <Plus size={13} /> New batch
+          </button>
+          {batchId ? (
+            <input
+              className="input h-8 max-w-xs text-xs"
+              value={batchName}
+              onChange={(e) => setBatchName(e.target.value)}
+              onBlur={autosave.flush}
+              placeholder="Name this batch"
+            />
+          ) : null}
+          {batchId ? (
+            <button
+              className="btn-ghost btn-sm ml-auto"
+              onClick={() => {
+                if (!window.confirm(`Delete "${batchName}"? The domains and mailboxes it already created stay put — this only removes the saved batch.`)) return;
+                void removeBatch.mutateAsync(batchId).then(() => {
+                  setBatchId(null);
+                  setSavedDraft(null);
+                  setCreatedEmails([]);
+                  setCreateLog([]);
+                });
+              }}
+            >
+              <X size={13} /> Delete batch
+            </button>
+          ) : null}
+        </div>
+        {batches.length > 0 ? (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {[...batches]
+              .sort((a, b) => (b.last_saved_at ?? "").localeCompare(a.last_saved_at ?? ""))
+              .map((b) => (
+                <button
+                  key={b.id}
+                  className={cn("chip", b.id === batchId && "bg-ink text-white")}
+                  onClick={() => openBatch(b)}
+                  title={`Last saved ${b.last_saved_at ?? "never"}`}
+                >
+                  {b.name || "(unnamed)"}
+                  {(b.created_emails ?? []).length > 0
+                    ? ` · ${(b.created_emails ?? []).length} created`
+                    : ""}
+                </button>
+              ))}
+          </div>
+        ) : (
+          <p className="mt-1 text-xs text-muted">
+            No saved batches yet. Start one and everything you type is kept, including the
+            DKIM tokens.
+          </p>
+        )}
+      </Card>
+
+      {/* An interrupted run is the case where knowing what already exists
+          matters most. */}
+      {progress.partiallyDone ? (
+        <Card className="flex items-start gap-2 border-sky bg-sky/10 p-3 text-sm">
+          <ClipboardList size={16} className="mt-0.5 shrink-0" />
+          <p>
+            <b>
+              {progress.created} of {progress.total} mailboxes already created.
+            </b>{" "}
+            Creating again skips those and does only the remaining {progress.pending}.
+          </p>
+        </Card>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard label="Domains" value={domains.length} sublabel="in this batch" icon={<Layers size={18} />} />

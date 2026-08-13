@@ -219,6 +219,46 @@ export interface SequenceEmail extends BaseRow {
   notes: string;
 }
 
+// --- Bulk domain setup -----------------------------------------------------
+
+/** Per-domain deviations from the batch defaults. */
+export interface SetupOverride {
+  prefixes?: string[];
+  /** The three SES DKIM tokens, as pasted. The most expensive field to lose. */
+  dkimText?: string;
+  netlifySite?: string;
+}
+
+/**
+ * A bulk domain setup, saved as you work.
+ *
+ * Everything in the Bulk Setup page used to live in React state, so a refresh
+ * discarded it — including the DKIM tokens, which are copied out of AWS one
+ * domain at a time.
+ *
+ * `created_emails` is the other half: it records which mailboxes Instantly
+ * confirmed, so an interrupted run resumes instead of re-attempting every
+ * address with no idea where it stopped.
+ *
+ * Stores `profile_id` only. SMTP/IMAP credentials stay in `mail_profiles`,
+ * which is gated behind APP_FUNCTION_TOKEN; copying them here would quietly
+ * move secrets into a table that isn't.
+ */
+export interface SetupBatch extends BaseRow {
+  name: string;
+  status: "draft" | "creating" | "done";
+  /** BatchConfig from dnsPlan.ts — typed loosely to avoid a circular import. */
+  config: Record<string, unknown>;
+  domains_text: string;
+  default_prefixes: string[];
+  overrides: Record<string, SetupOverride>;
+  profile_id: string;
+  /** Confirmed created in Instantly. Dry runs and failures never appear here. */
+  created_emails: string[];
+  create_log: string[];
+  last_saved_at: string;
+}
+
 /**
  * One run of the daily scheduled swapper. Written by the cron, read-only in
  * the UI — the record of what happened while nobody was watching.
@@ -387,6 +427,7 @@ export const TABLES = {
   sequenceEmails: "sequence_emails",
   recovery: "mailbox_recovery",
   autoSwapRuns: "auto_swap_runs",
+  setupBatches: "setup_batches",
   mailProfiles: "mail_profiles",
   settings: "app_settings",
 } as const;
