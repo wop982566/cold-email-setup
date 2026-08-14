@@ -159,6 +159,34 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 
 ---
 
+## 🏷️ Niche tags
+
+A mailbox warmed on CBD outreach has a reputation built against that audience.
+Dropping it into a kratom campaign because it was the healthiest spare wastes the
+warmup and pollutes both niches, so **a mailbox is only ever swapped into a
+campaign of its own niche.**
+
+A campaign's niche is resolved in one order, used by the UI and the cron alike:
+your `campaign_group_overrides` entry, else a `tags` field if your Instantly
+workspace returns one, else the first token of the campaign name — so
+"CBD — Outreach US" is `CBD`. Instantly's tags are read off the campaign payload
+already fetched, so this costs no extra API call and simply yields nothing if
+your workspace has no such field.
+
+A mailbox's niche is explicit, stored in `mailbox_tags`, because a swap
+candidate is by definition attached to no active campaign and so has no history
+to infer one from. Set it in bulk setup (a chip row per domain, applied to both
+its mailboxes) or later in the Planner's mailbox table, **Niche** column.
+
+**Untagged means never eligible.** "We don't know" has to mean "don't touch it",
+or the whole rule is decorative. The practical consequence is that a brand-new
+spare cannot be swapped anywhere until you tag it — so untagged spares are
+reported as their own outcome in the Maintenance tab, the dry run and the daily
+email, rather than looking like a quiet day. If gating is ever off (no tag map
+supplied), the tab says so in red.
+
+---
+
 ## 💾 Bulk setup batches
 
 The Bulk Setup page saves as you work. A batch is a stored record — domains,

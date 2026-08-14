@@ -16,6 +16,7 @@
 import { AppSettings, Domain } from "./types";
 import { Plan, PlannerCampaign, PlannerMailbox } from "./campaignPlan";
 import { daysUntil } from "./format";
+import { campaignTagsOf, eligibleFor, tagsFor, untaggedAmong, type TagMap } from "./tags";
 
 export type IssueCode =
   | "account_broken"
@@ -40,6 +41,8 @@ export interface Issue {
 }
 
 export interface MailboxHealth {
+  /** Set when a swap for this mailbox was blocked by tags, not by a lack of spares. */
+  tagBlock?: string | null;
   box: PlannerMailbox;
   verdict: Verdict;
   issues: Issue[];
@@ -71,6 +74,10 @@ export interface Maintenance {
   unassigned: MailboxHealth[];
   candidates: MailboxHealth[];
   shortfall: number;
+  /** False when no tag map was supplied — gating is off and swaps ignore niche. */
+  tagGatingActive: boolean;
+  /** Healthy spares that can never be used until someone tags them. */
+  untaggedSpares: string[];
   placementChecked: number;
   untrackedDomains: number;
   stats: { critical: number; warn: number; watch: number; ramping: number };
@@ -81,6 +88,12 @@ export interface MaintenanceInput {
   domains: Domain[];
   placement?: Map<string, { inboxRate: number | null; score: number | null }>;
   recovering?: Set<string>; // emails currently convalescing — never proposed
+  /**
+   * Mailbox niches. Omitted entirely, tag gating is skipped — which keeps every
+   * existing caller and test working exactly as before. Supplied, an untagged
+   * mailbox becomes ineligible everywhere, which is the point.
+   */
+  tagMap?: TagMap;
   settings: AppSettings;
   today?: Date;
 }
@@ -129,10 +142,15 @@ export function computeMaintenance({
   domains,
   placement,
   recovering = new Set(),
+  tagMap,
   settings,
   today,
 }: MaintenanceInput): Maintenance {
   const now = today ?? new Date();
+  // Reported on the result so "gating is off because nobody passed tags" is
+  // visible in the UI and the cron log rather than being a silent no-op.
+  const tagGatingActive = tagMap !== undefined;
+  const groupOverrides = settings.campaign_group_overrides ?? {};
   const s = settings as unknown as Record<string, unknown>;
   const minScore = num(s.maintenance_min_warmup_score, DEF.minScore);
   const criticalScore = num(s.maintenance_critical_score, DEF.criticalScore);
@@ -294,8 +312,30 @@ export function computeMaintenance({
     );
     const badDomain = need.domainName;
 
-    const pool = candidates.filter((c) => !reserved.has(c.box.email));
+    // The niche rule. A mailbox warmed for one audience must not be dropped
+    // into another just because it happened to be the healthiest spare, so a
+    // candidate has to share a tag with every campaign it would be entering.
+    // Untagged matches nothing — "we don't know" means don't touch it.
+    const needTags = [
+      ...new Set(targets.flatMap((c) => campaignTagsOf({ id: c.id, name: c.name, instantlyTags: c.instantlyTags }, groupOverrides))),
+    ];
+    const free = candidates.filter((c) => !reserved.has(c.box.email));
+    const pool = tagGatingActive
+      ? free.filter((c) => eligibleFor(tagsFor(tagMap, c.box.email), needTags))
+      : free;
+
     if (pool.length === 0) {
+      // Being blocked by tags is a different problem from having no spares at
+      // all, and needs a different fix, so the two are not merged into silence.
+      const untagged = untaggedAmong(free.map((c) => c.box.email), tagMap);
+      need.tagBlock =
+        free.length === 0
+          ? null
+          : needTags.length === 0
+            ? `No tag on ${targets.map((c) => c.name).join(", ") || "this campaign"}, so nothing is eligible for it.`
+            : untagged.length === free.length
+              ? `${free.length} healthy spare${free.length === 1 ? "" : "s"} available but none is tagged — tag them ${needTags.join(" or ")} to make them eligible.`
+              : `${free.length} healthy spare${free.length === 1 ? "" : "s"} available, none tagged ${needTags.join(" or ")}.`;
       unassigned.push(need);
       continue;
     }
@@ -367,6 +407,15 @@ export function computeMaintenance({
     unassigned,
     candidates,
     shortfall: unassigned.length,
+    tagGatingActive,
+    // Healthy, free, and unusable until tagged — the state that otherwise looks
+    // identical to having no spares at all.
+    untaggedSpares: tagGatingActive
+      ? untaggedAmong(
+          candidates.map((c) => c.box.email),
+          tagMap,
+        )
+      : [],
     placementChecked: placement ? placement.size : 0,
     untrackedDomains: mailboxes.filter((m) => !m.domain).length,
     stats,

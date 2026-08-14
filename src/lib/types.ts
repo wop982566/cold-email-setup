@@ -219,6 +219,22 @@ export interface SequenceEmail extends BaseRow {
   notes: string;
 }
 
+/**
+ * A mailbox's niche, e.g. CBD.
+ *
+ * Kept per mailbox rather than per domain because a mailbox outlives the batch
+ * that made it and may be retagged later, and because the swapper needs to
+ * answer "may this address enter this campaign?" for addresses it has no other
+ * information about — a swap candidate is attached to no active campaign, so
+ * there's no history to infer a niche from.
+ */
+export interface MailboxTag extends BaseRow {
+  email: string;
+  tags: string[];
+  /** Where it came from, so a hand correction is distinguishable from a bulk one. */
+  source: "batch" | "manual" | "instantly";
+}
+
 // --- Bulk domain setup -----------------------------------------------------
 
 /** Per-domain deviations from the batch defaults. */
@@ -227,6 +243,10 @@ export interface SetupOverride {
   /** The three SES DKIM tokens, as pasted. The most expensive field to lose. */
   dkimText?: string;
   netlifySite?: string;
+  /** Niche for this domain's mailboxes, e.g. CBD. Gates swap eligibility. */
+  tag?: string;
+  /** Per-address exceptions, when one mailbox on the domain serves another niche. */
+  mailboxTags?: Record<string, string>;
 }
 
 /**
@@ -428,6 +448,7 @@ export const TABLES = {
   recovery: "mailbox_recovery",
   autoSwapRuns: "auto_swap_runs",
   setupBatches: "setup_batches",
+  mailboxTags: "mailbox_tags",
   mailProfiles: "mail_profiles",
   settings: "app_settings",
 } as const;

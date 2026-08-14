@@ -29,8 +29,8 @@ import {
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
-import { useCollection, useSettings, useSaveSettings } from "../lib/hooks";
-import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES } from "../lib/types";
+import { useCollection, useInsert, useSettings, useSaveSettings, useUpdate } from "../lib/hooks";
+import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag } from "../lib/types";
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
@@ -43,6 +43,7 @@ import {
   type PlacementMap,
 } from "../lib/placement";
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
+import { buildTagMap, normaliseTag, tagsFor } from "../lib/tags";
 import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
@@ -207,6 +208,13 @@ export default function Planner() {
   const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
 
   // Computed once here and shared: the Maintenance tab and the per-campaign
+  // Mailbox niches. Built here and passed down so the table, the maintenance
+  // tab and the swap decision all read one source.
+  const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
+  const tagMap = useMemo(() => buildTagMap(tagRowsQ.data ?? []), [tagRowsQ.data]);
+  const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
+  const updateTag = useUpdate<MailboxTag>(TABLES.mailboxTags);
+
   // mailbox breakdown must never disagree about an address.
   const maintenance = useMemo(() => {
     if (!plan || !settings) return null;
@@ -216,8 +224,11 @@ export default function Planner() {
       settings,
       placement: placementHealthInput,
       recovering,
+      // Supplying this at all turns niche gating on, so the tab refuses
+      // cross-niche swaps exactly as the cron does.
+      tagMap,
     });
-  }, [plan, domains, settings, placementHealthInput, recovering]);
+  }, [plan, domains, settings, placementHealthInput, recovering, tagMap]);
 
   const healthByEmail = useMemo(() => {
     const m = new Map<string, MailboxHealth>();
@@ -238,6 +249,34 @@ export default function Planner() {
   async function patchSettings(patch: Partial<AppSettings>) {
     if (!settings) return;
     await saveSettings.mutateAsync({ ...settings, ...patch });
+  }
+
+  /**
+   * Set a mailbox's niche. Comma-separated for the rare address that genuinely
+   * serves two, and blank clears it — which makes it swap-ineligible again, so
+   * the toast says so rather than looking like nothing happened.
+   */
+  async function saveTag(email: string, raw: string) {
+    const tags = raw.split(",").map(normaliseTag).filter(Boolean);
+    const existing = (tagRowsQ.data ?? []).find(
+      (r) => (r.email ?? "").trim().toLowerCase() === email.trim().toLowerCase(),
+    );
+    if (JSON.stringify(tags) === JSON.stringify(tagsFor(tagMap, email))) return;
+    try {
+      if (existing) await updateTag.mutateAsync({ id: existing.id, patch: { tags, source: "manual" } });
+      else await insertTag.mutateAsync({ email, tags, source: "manual" } as Partial<MailboxTag>);
+      toast.push(
+        tags.length > 0
+          ? `${email} tagged ${tags.join(", ")}`
+          : `${email} untagged — it can't be swapped into any campaign now`,
+        tags.length > 0 ? "success" : "info",
+      );
+    } catch (err) {
+      toast.push(
+        `Couldn't save that tag: ${err instanceof Error ? err.message : "unknown error"}`,
+        "error",
+      );
+    }
   }
 
   /**
@@ -713,6 +752,7 @@ export default function Planner() {
                   <th className="w-28 px-3 py-2">Sending</th>
                   <th className="w-24 px-3 py-2">Last used</th>
                   <th className="px-3 py-2">Campaigns</th>
+                  <th className="w-28 px-3 py-2">Niche</th>
                   <th className="w-28 px-3 py-2">State</th>
                 </tr>
               </thead>
@@ -787,6 +827,18 @@ export default function Planner() {
                           {b.pausedOnly ? " (paused)" : ""}
                         </span>
                       )}
+                    </td>
+                    {/* Editable here because a mailbox outlives the batch that
+                        made it, and an untagged one is invisible to the swapper
+                        until someone fixes it. */}
+                    <td className="px-3 py-2">
+                      <input
+                        className="input h-7 w-24 text-xs"
+                        defaultValue={tagsFor(tagMap, b.email).join(", ")}
+                        placeholder="untagged"
+                        title="Niche tag. Only mailboxes tagged for a campaign's niche can be swapped into it."
+                        onBlur={(e) => void saveTag(b.email, e.target.value)}
+                      />
                     </td>
                     <td className="px-3 py-2">
                       {!b.active ? (

@@ -12,6 +12,7 @@ import {
   Eye,
   Lock,
   Ban,
+  Tag,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, Details } from "../ui/primitives";
 import { useToast } from "../ui/toast";
@@ -649,6 +650,37 @@ export function CampaignMaintenance({
         onRetire={(v) => void retire(v)}
         busy={busyRecovery}
       />
+
+      {/* Strict tagging means a healthy spare can be sitting right there and
+          still be unusable. Silence would read as "nothing needed doing". */}
+      {m.untaggedSpares.length > 0 ? (
+        <Card className="flex items-start gap-2 border-sun bg-sun/20 p-3 text-sm">
+          <Tag size={16} className="mt-0.5 shrink-0" />
+          <div>
+            <p className="font-extrabold">
+              {m.untaggedSpares.length} healthy spare
+              {m.untaggedSpares.length === 1 ? " is" : "s are"} untagged, so
+              {m.untaggedSpares.length === 1 ? " it" : " they"} can't be swapped anywhere
+            </p>
+            <p className="mt-1 text-xs">
+              A mailbox is only eligible for a campaign in its own niche. Give these a tag
+              in the Planner's mailbox table (Niche column) to make them usable:{" "}
+              <b>{m.untaggedSpares.slice(0, 6).join(", ")}</b>
+              {m.untaggedSpares.length > 6 ? ` and ${m.untaggedSpares.length - 6} more` : ""}.
+            </p>
+          </div>
+        </Card>
+      ) : null}
+
+      {!m.tagGatingActive ? (
+        <Card className="flex items-start gap-2 border-danger bg-danger/10 p-3 text-sm">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+          <p>
+            <b>Niche gating is off.</b> Swaps are not checking tags, so a mailbox can be
+            moved into a campaign of a different niche.
+          </p>
+        </Card>
+      ) : null}
 
       <AutoSwapLog runs={autoSwapRuns} />
 

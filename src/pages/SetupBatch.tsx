@@ -42,7 +42,7 @@ import {
   suggestBatchName,
   type BatchDraft,
 } from "../lib/setupBatch";
-import { Domain, MailProfile, SetupBatch as SetupBatchRow, TABLES } from "../lib/types";
+import { Domain, MailProfile, MailboxTag, SetupBatch as SetupBatchRow, TABLES } from "../lib/types";
 import {
   DKIM_TOKEN_COUNT,
   checklistFor,
@@ -61,6 +61,10 @@ import {
   type DomainSpec,
 } from "../lib/dnsPlan";
 import { instantly } from "../lib/instantly";
+import { asItems } from "../lib/apiShape";
+import { useQuery } from "@tanstack/react-query";
+import { knownTags, normaliseTag } from "../lib/tags";
+import { tagsFromPayload } from "../lib/campaignPlan";
 import { download, uuid } from "../lib/utils";
 import { cn } from "../lib/utils";
 
@@ -71,6 +75,8 @@ interface Override {
   prefixes?: string[];
   dkimText?: string;
   netlifySite?: string;
+  /** Niche for this domain's mailboxes. Untagged is never swap-eligible. */
+  tag?: string;
 }
 
 function expand(tpl: string, prefix: string, domain: string): string {
@@ -204,6 +210,26 @@ export default function SetupBatch() {
       }),
     [domains, overrides, defaultPrefixes],
   );
+
+  // The chips: every niche your campaigns are already in, plus anything you've
+  // tagged before. Read live from Instantly rather than typed from memory.
+  const campaignsQ = useQuery({
+    queryKey: ["inst", "campaigns"],
+    queryFn: () => instantly.campaigns(),
+    staleTime: 5 * 60_000,
+  });
+  const existingTagsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
+  const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
+
+  const tagChips = useMemo(() => {
+    const camps = asItems<Record<string, unknown>>(campaignsQ.data?.data).map((c) => ({
+      id: String(c.id ?? ""),
+      name: String(c.name ?? ""),
+      instantlyTags: tagsFromPayload(c),
+    }));
+    const assigned = (existingTagsQ.data ?? []).flatMap((r) => r.tags ?? []);
+    return knownTags(camps, settings?.campaign_group_overrides ?? {}, assigned);
+  }, [campaignsQ.data, existingTagsQ.data, settings?.campaign_group_overrides]);
 
   // How much of this batch Instantly has already confirmed — drives the resume
   // banner and lets a restarted run skip what exists.
@@ -351,6 +377,18 @@ export default function SetupBatch() {
         if (res.ok && !dryRun) {
           confirmed.push(email);
           setCreatedEmails([...confirmed]);
+
+          // Tag it at birth. A mailbox created without one is invisible to the
+          // swapper forever, so this is written the moment it exists rather
+          // than left as a step to remember later.
+          const tag = normaliseTag(overrides[spec.domain]?.tag ?? "");
+          if (tag) {
+            await insertTag
+              .mutateAsync({ email, tags: [tag], source: "batch" } as Partial<MailboxTag>)
+              .catch(() => log.push(`(couldn't save the ${tag} tag for ${email})`));
+          } else {
+            log.push(`NOTE ${email} has no niche tag — it can't be swapped into a campaign yet`);
+          }
           if (batchId) {
             await updateBatch
               .mutateAsync({
@@ -681,6 +719,38 @@ export default function SetupBatch() {
                             })
                           }
                         />
+                      </Field>
+                      {/* The niche. Without it these mailboxes are created but
+                          can never be swapped into anything. */}
+                      <Field
+                        label="Niche tag"
+                        hint="Both mailboxes get this. Untagged mailboxes are never swapped into a campaign."
+                      >
+                        <div className="flex flex-wrap gap-1.5">
+                          {tagChips.map((t) => (
+                            <button
+                              key={t}
+                              className={cn(
+                                "chip",
+                                normaliseTag(o.tag ?? "") === t && "bg-ink text-white",
+                              )}
+                              onClick={() =>
+                                setOverride(spec.domain, {
+                                  tag: normaliseTag(o.tag ?? "") === t ? "" : t,
+                                })
+                              }
+                            >
+                              {t}
+                            </button>
+                          ))}
+                          <input
+                            className="input h-7 w-28 text-xs"
+                            value={o.tag ?? ""}
+                            onChange={(e) => setOverride(spec.domain, { tag: e.target.value })}
+                            onBlur={autosave.flush}
+                            placeholder="or type one"
+                          />
+                        </div>
                       </Field>
                     </div>
                   </div>

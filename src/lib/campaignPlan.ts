@@ -135,6 +135,12 @@ export interface PlannerCampaign {
   id: string;
   name: string;
   group: string;
+  /**
+   * Tags as Instantly reports them, when this workspace exposes any. Read
+   * opportunistically off the payload we already fetch — no extra endpoint, and
+   * an empty array simply means the field wasn't there.
+   */
+  instantlyTags: string[];
   active: boolean;
   dailyLimit: number;
   dailyMaxLeads: number;
@@ -385,6 +391,33 @@ export function healthOf(boxes: PlannerMailbox[], placement?: PlacementInput): H
 
 // "AEO - US SaaS" -> "AEO". Splits on the separators operators actually use in
 // campaign names, then falls back to the whole name.
+/**
+ * Tags off a raw Instantly payload, if this workspace has them.
+ *
+ * Written defensively because the shape is unverified — the API docs were
+ * unreachable when this was built. Accepts a list of strings or of objects
+ * carrying a name/label/tag field, and yields nothing for anything else rather
+ * than throwing. Costs no extra request: the payload is already in hand.
+ */
+export function tagsFromPayload(payload: unknown): string[] {
+  const raw = (payload as { tags?: unknown; labels?: unknown } | null)?.tags
+    ?? (payload as { labels?: unknown } | null)?.labels;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      if (entry.trim()) out.push(entry.trim());
+      continue;
+    }
+    if (entry && typeof entry === "object") {
+      const o = entry as Record<string, unknown>;
+      const v = o.name ?? o.label ?? o.tag ?? o.title;
+      if (typeof v === "string" && v.trim()) out.push(v.trim());
+    }
+  }
+  return out;
+}
+
 export function groupFromName(name: string): string {
   const token = name.trim().split(/[\s\-–—:|/_]+/).filter(Boolean)[0];
   if (!token) return UNGROUPED;
@@ -512,6 +545,7 @@ export function computePlan({
       id,
       name,
       group: overrides[id] || groupFromName(name),
+      instantlyTags: tagsFromPayload(c),
       active,
       dailyLimit: lim === MISSING ? 0 : lim,
       dailyMaxLeads: maxLeads === MISSING ? 0 : maxLeads,
@@ -607,6 +641,7 @@ export function computePlan({
       id: p.id,
       name: p.name,
       group: p.group,
+      instantlyTags: p.instantlyTags,
       active: p.active,
       dailyLimit: p.dailyLimit,
       dailyMaxLeads: p.dailyMaxLeads,

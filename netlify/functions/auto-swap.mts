@@ -20,6 +20,7 @@ import { computePlan } from "../../src/lib/campaignPlan.js";
 import { computeMaintenance } from "../../src/lib/mailboxHealth.js";
 import { computeCapacity } from "../../src/lib/capacity.js";
 import { planAutoSwaps, recordScores, type ScoreHistory } from "../../src/lib/autoSwap.js";
+import { buildTagMap } from "../../src/lib/tags.js";
 import { DEFAULT_SETTINGS, type AppSettings, type Domain } from "../../src/lib/types.js";
 
 const STORE = "cec-data";
@@ -189,7 +190,23 @@ export default async (req?: Request): Promise<Response> => {
         .map((r) => String(r.email).trim().toLowerCase()),
     );
 
-    const maintenance = computeMaintenance({ plan, domains, recovering, settings });
+    // Niche gating. Passing the map at all turns it on, so an untagged spare is
+    // never swapped into a campaign — the cron must not do unattended what the
+    // UI refuses to do by hand.
+    const tagRows = (await readTable("mailbox_tags")) as unknown as {
+      email: string;
+      tags: string[];
+    }[];
+    const tagMap = buildTagMap(tagRows);
+
+    const maintenance = computeMaintenance({ plan, domains, recovering, tagMap, settings });
+
+    if (maintenance.untaggedSpares.length > 0) {
+      log(
+        `${maintenance.untaggedSpares.length} healthy spare(s) are untagged and therefore ` +
+          `ineligible everywhere: ${maintenance.untaggedSpares.slice(0, 10).join(", ")}`,
+      );
+    }
 
     // Roll today's readings into the stored history BEFORE deciding, so a
     // minBadDays > 1 policy can see today as part of the streak.
