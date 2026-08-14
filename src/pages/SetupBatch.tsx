@@ -63,7 +63,7 @@ import {
 import { instantly } from "../lib/instantly";
 import { asItems } from "../lib/apiShape";
 import { useQuery } from "@tanstack/react-query";
-import { knownTags, normaliseTag } from "../lib/tags";
+import { knownTags, normaliseTag, parseTagPayload } from "../lib/tags";
 import { tagsFromPayload } from "../lib/campaignPlan";
 import { download, uuid } from "../lib/utils";
 import { cn } from "../lib/utils";
@@ -221,15 +221,30 @@ export default function SetupBatch() {
   const existingTagsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
   const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
 
+  // Chips are the tags you set in Instantly, never campaign names — a name ties
+  // a mailbox to one campaign, which is the opposite of what a tag is for.
+  const instTagsQ = useQuery({
+    queryKey: ["inst", "tags"],
+    queryFn: () => instantly.tags(),
+    staleTime: 5 * 60_000,
+  });
+
   const tagChips = useMemo(() => {
+    const fromInstantly = parseTagPayload(instTagsQ.data?.data);
     const camps = asItems<Record<string, unknown>>(campaignsQ.data?.data).map((c) => ({
       id: String(c.id ?? ""),
       name: String(c.name ?? ""),
-      instantlyTags: tagsFromPayload(c),
+      instantlyTags: [
+        ...tagsFromPayload(c),
+        ...(fromInstantly.byCampaign.get(String(c.id ?? "")) ?? []),
+      ],
     }));
     const assigned = (existingTagsQ.data ?? []).flatMap((r) => r.tags ?? []);
-    return knownTags(camps, settings?.campaign_group_overrides ?? {}, assigned);
-  }, [campaignsQ.data, existingTagsQ.data, settings?.campaign_group_overrides]);
+    return knownTags(camps, settings?.campaign_group_overrides ?? {}, [
+      ...assigned,
+      ...fromInstantly.all,
+    ]);
+  }, [campaignsQ.data, existingTagsQ.data, instTagsQ.data, settings?.campaign_group_overrides]);
 
   // How much of this batch Instantly has already confirmed — drives the resume
   // banner and lets a restarted run skip what exists.

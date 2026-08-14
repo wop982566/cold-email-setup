@@ -26,6 +26,17 @@ const ACCOUNT_ANALYTICS_PATHS = [
   "/accounts/campaign-mappings",
 ];
 
+// Custom tags. Instantly has moved these between revisions and the docs were
+// unreachable when this was written, so the paths are probed in order and the
+// caller is told which one answered — the same approach used above for
+// per-account analytics, for the same reason.
+const TAG_PATHS = [
+  "/custom-tags",
+  "/tags",
+  "/custom-tag",
+  "/workspaces/current/tags",
+];
+
 const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", "starting_after"];
 
 // The only three mutations this function can perform. Deleting anything,
@@ -207,6 +218,34 @@ export default async (req: Request): Promise<Response> => {
         attempts,
         data: null,
       });
+    }
+
+    // Custom tags, so a mailbox tagged AEO in Instantly is eligible for every
+    // AEO campaign without being re-tagged here. The response reports the path
+    // that answered and the raw payload, because the shape is unverified and a
+    // sample from the real workspace is what settles it.
+    if (resource === "tags") {
+      const attempts: { path: string; status: number }[] = [];
+      for (const path of TAG_PATHS) {
+        try {
+          const res = await fetch(`${BASE}${path}?limit=100`, { headers: auth });
+          attempts.push({ path, status: res.status });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const empty =
+            data == null ||
+            (Array.isArray(data) && data.length === 0) ||
+            (Array.isArray(data?.items) && data.items.length === 0);
+          // An empty list is a real answer from a real endpoint — keep the path
+          // but say it returned nothing, rather than falling through and
+          // reporting the endpoint as missing.
+          if (empty) return json({ ok: true, supported: true, path, empty: true, data });
+          return json({ ok: true, supported: true, path, empty: false, data: scrub(data) });
+        } catch {
+          attempts.push({ path, status: 0 });
+        }
+      }
+      return json({ ok: true, supported: false, attempts, data: null });
     }
 
     // Single campaign, by path id. Used as a fallback when the /campaigns list

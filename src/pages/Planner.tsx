@@ -43,7 +43,7 @@ import {
   type PlacementMap,
 } from "../lib/placement";
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
-import { buildTagMap, normaliseTag, tagsFor } from "../lib/tags";
+import { buildTagMap, mergeTagMaps, normaliseTag, parseTagPayload, tagsFor } from "../lib/tags";
 import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
@@ -211,7 +211,21 @@ export default function Planner() {
   // Mailbox niches. Built here and passed down so the table, the maintenance
   // tab and the swap decision all read one source.
   const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
-  const tagMap = useMemo(() => buildTagMap(tagRowsQ.data ?? []), [tagRowsQ.data]);
+  // Tags set in Instantly are the source of truth; the app's own table covers
+  // workspaces (or mailboxes) Instantly doesn't tag. Union, not precedence.
+  const instTagsQ = useQuery({
+    queryKey: ["inst", "tags"],
+    queryFn: () => instantly.tags(),
+    staleTime: 5 * 60_000,
+  });
+  const tagAssignments = useMemo(
+    () => parseTagPayload(instTagsQ.data?.data),
+    [instTagsQ.data],
+  );
+  const tagMap = useMemo(
+    () => mergeTagMaps(buildTagMap(tagRowsQ.data ?? []), tagAssignments.byEmail),
+    [tagRowsQ.data, tagAssignments],
+  );
   const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
   const updateTag = useUpdate<MailboxTag>(TABLES.mailboxTags);
 
@@ -227,8 +241,9 @@ export default function Planner() {
       // Supplying this at all turns niche gating on, so the tab refuses
       // cross-niche swaps exactly as the cron does.
       tagMap,
+      campaignTagsById: tagAssignments.byCampaign,
     });
-  }, [plan, domains, settings, placementHealthInput, recovering, tagMap]);
+  }, [plan, domains, settings, placementHealthInput, recovering, tagMap, tagAssignments]);
 
   const healthByEmail = useMemo(() => {
     const m = new Map<string, MailboxHealth>();

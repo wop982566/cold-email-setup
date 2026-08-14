@@ -21,6 +21,9 @@ import { fmtDateShort } from "../../lib/format";
  * they look identical from outside and need completely different fixes.
  */
 function dryRunSummary(r: Record<string, unknown>): string {
+  if (r.unreachable) {
+    return `Couldn't run the dry run.\n\n${String(r.error)}\n\nNothing was changed.`;
+  }
   if (r.ok === false) return `Failed: ${String(r.error ?? "unknown error")}`;
   const reach = r.reachedInstantly as { mailboxes: number; campaigns: number; note: string };
   const health = r.healthSummary as { proposals: number; healthySpares: number; shortfall: number };
@@ -46,6 +49,19 @@ function dryRunSummary(r: Record<string, unknown>): string {
     for (const s of skip) out.push(`  ${s.email}: ${s.reason}`);
   }
   if (Number(r.overCap ?? 0) > 0) out.push("", `${r.overCap} more were over the per-run cap.`);
+
+  // A dry run proves the logic works. It does NOT prove Netlify is firing the
+  // schedule, which is the other half of "is auto-swapping working".
+  const sched = r.schedule as { hasEverRun?: boolean | null; lastRunAt?: string; runsRecorded?: number; note?: string } | undefined;
+  if (sched) {
+    out.push("", "--- Daily schedule ---");
+    if (sched.hasEverRun === true) {
+      out.push(`Has run ${sched.runsRecorded} time(s); last at ${sched.lastRunAt}.`);
+    } else {
+      out.push(String(sched.note ?? "No record of a scheduled run."));
+    }
+  }
+
   out.push("", "Nothing was written. This was a dry run.");
   return out.join("\n");
 }
@@ -67,12 +83,29 @@ export function AutoSwapLog({ runs, limit = 5 }: { runs: AutoSwapRun[]; limit?: 
     setTesting("testEmail");
     setResult(null);
     const r = await autoSwap.testEmail();
+    if (r.ok) {
+      setResult(`Email sent — ${String(r.detail)}.\nCheck ${String(r.to)}; it may take a minute.`);
+      setTesting(null);
+      return;
+    }
+    // Only say what the function actually told us. When the request never
+    // arrived, the honest answer is "couldn't reach it" — not a verdict on
+    // credentials we never asked about.
+    if (r.unreachable) {
+      setResult(`Couldn't run the test.\n\n${String(r.error)}\n\nNothing was sent, and this says nothing about your Resend key.`);
+      setTesting(null);
+      return;
+    }
     setResult(
-      r.ok
-        ? `Email sent — ${String(r.detail)}.\nCheck ${String(r.to)}; it may take a minute.`
-        : `Email NOT sent.\n\n${String(r.detail ?? r.error)}\n\nKey configured: ${
-            r.keyConfigured ? "yes" : "no — RESEND_API_KEY is missing"
-          }\nFrom: ${String(r.from ?? "(not set)")}\nTo: ${String(r.to ?? "(not set)")}`,
+      [
+        "Email NOT sent.",
+        "",
+        String(r.detail ?? r.error),
+        "",
+        `Key configured: ${r.keyConfigured === true ? "yes" : r.keyConfigured === false ? "no — RESEND_API_KEY is not set in Netlify" : "unknown"}`,
+        `From: ${r.from ? String(r.from) : "(not set)"}`,
+        `To: ${r.to ? String(r.to) : "(not set)"}`,
+      ].join("\n"),
     );
     setTesting(null);
   }

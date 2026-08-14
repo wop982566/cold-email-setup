@@ -142,20 +142,49 @@ async function write<T = unknown>(body: Record<string, unknown>): Promise<WriteR
 // decision and writes nothing; testEmail sends one email and reports what
 // Resend actually said.
 async function autoSwapCall(mode: "dryRun" | "testEmail"): Promise<Record<string, unknown>> {
+  // Note the endpoint: auto-swap-test, NOT auto-swap. The latter is a scheduled
+  // function and Netlify does not serve those over HTTP — its URL returns an
+  // empty 404, which is what produced "Unexpected end of JSON input".
+  const url = `/.netlify/functions/auto-swap-test?${mode}=1`;
+  let res: Response;
   try {
-    const res = await fetch(`/.netlify/functions/auto-swap?${mode}=1`, {
-      method: "POST",
-      headers: headers(),
-    });
-    const body = (await res.json()) as Record<string, unknown>;
-    if (!res.ok) return { ...body, ok: false, error: body.error ?? `HTTP ${res.status}` };
-    return body;
+    res = await fetch(url, { method: "POST", headers: headers() });
   } catch (e) {
     return {
       ok: false,
-      error: e instanceof Error ? e.message : "Network error (functions only run on Netlify)",
+      unreachable: true,
+      error: `Couldn't reach ${url}: ${e instanceof Error ? e.message : "network error"}`,
     };
   }
+
+  // Read as text first. Calling res.json() on an empty or HTML body throws, and
+  // the old catch turned that into a result object with every field missing —
+  // which the UI then rendered as "RESEND_API_KEY is missing". Reporting a
+  // cause we never observed is worse than reporting nothing.
+  const text = await res.text().catch(() => "");
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = text ? (JSON.parse(text) as Record<string, unknown>) : null;
+  } catch {
+    body = null;
+  }
+
+  if (body === null) {
+    return {
+      ok: false,
+      unreachable: true,
+      status: res.status,
+      error:
+        res.status === 404
+          ? `The function isn't deployed at ${url} (HTTP 404). Redeploy, then try again.`
+          : `${url} answered HTTP ${res.status} with ${
+              text ? `a non-JSON body: ${text.slice(0, 200)}` : "an empty body"
+            }`,
+    };
+  }
+
+  if (!res.ok) return { ...body, ok: false, status: res.status, error: body.error ?? `HTTP ${res.status}` };
+  return body;
 }
 
 export const autoSwap = {
@@ -187,6 +216,12 @@ export const instantly = {
   // Single campaign — used only when the list payload omits email_list, which
   // is the campaign -> mailbox linkage the planner is built on.
   campaignDetail: (id: string) => call("campaign-detail", { id }),
+  // Custom tags. Resolves with supported:false when none of the probed paths
+  // exist in this workspace — an answer, not a failure.
+  tags: () =>
+    call<unknown>("tags") as Promise<
+      InstantlyResult<unknown> & { supported?: boolean; path?: string; empty?: boolean; attempts?: unknown }
+    >,
   warmup: async (emails: string[]): Promise<InstantlyResult> => {
     try {
       const res = await fetch("/.netlify/functions/instantly?resource=warmup", {

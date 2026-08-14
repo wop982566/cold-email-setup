@@ -94,6 +94,12 @@ export interface MaintenanceInput {
    * mailbox becomes ineligible everywhere, which is the point.
    */
   tagMap?: TagMap;
+  /**
+   * Campaign id -> tags, from Instantly's custom-tags endpoint. Merged with any
+   * tags carried inline on the campaign payload, since a workspace may expose
+   * them one way, the other, or both.
+   */
+  campaignTagsById?: Map<string, string[]>;
   settings: AppSettings;
   today?: Date;
 }
@@ -143,6 +149,7 @@ export function computeMaintenance({
   placement,
   recovering = new Set(),
   tagMap,
+  campaignTagsById,
   settings,
   today,
 }: MaintenanceInput): Maintenance {
@@ -317,7 +324,20 @@ export function computeMaintenance({
     // candidate has to share a tag with every campaign it would be entering.
     // Untagged matches nothing — "we don't know" means don't touch it.
     const needTags = [
-      ...new Set(targets.flatMap((c) => campaignTagsOf({ id: c.id, name: c.name, instantlyTags: c.instantlyTags }, groupOverrides))),
+      ...new Set(
+        targets.flatMap((c) =>
+          campaignTagsOf(
+            {
+              id: c.id,
+              name: c.name,
+              // Either source counts: tags may arrive inline on the campaign or
+              // from the custom-tags endpoint, depending on the workspace.
+              instantlyTags: [...c.instantlyTags, ...(campaignTagsById?.get(c.id) ?? [])],
+            },
+            groupOverrides,
+          ),
+        ),
+      ),
     ];
     const free = candidates.filter((c) => !reserved.has(c.box.email));
     const pool = tagGatingActive

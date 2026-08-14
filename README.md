@@ -94,7 +94,7 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
 | `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
 | `INSTANTLY_WRITE_ENABLED` | functions | **Required for any write.** Set to `true` to let the planner create mailboxes and swap them on campaigns. Unset, every write returns 403 and the Maintenance tab shows a banner saying so. Reads are unaffected. |
-| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. |
+| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`, logic in `_autoSwapRun.ts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. |
 | `RESEND_API_KEY` | functions | Resend key for run-summary emails. Without it the swapper still runs and still logs — it just can't email you. The sending domain must be verified in Resend or sends fail with 403. |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
@@ -145,7 +145,14 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   "nothing to report" rather than "the cron died". Swaps it makes are ordinary
   archive entries, so you can undo any of them by hand.
 
-  **Testing it without waiting a day.** The same panel has two buttons.
+  **Testing it without waiting a day.** The buttons call
+  `/.netlify/functions/auto-swap-test`, a separate ordinary HTTP function —
+  **not** `auto-swap` itself. Netlify does not serve scheduled functions over
+  HTTP, so anything with a `schedule` export answers an empty 404; both share
+  one implementation in `_autoSwapRun.ts`. Do not add a `schedule` export to
+  `auto-swap-test.mts` or the buttons break again.
+
+  The same panel has two buttons.
   *Test now (dry run)* runs the entire pipeline — settings, Instantly fetch,
   health, the swap decision — and writes **nothing**, then shows exactly what it
   would have swapped and what it skipped. *Send test email* pushes one message
@@ -166,12 +173,17 @@ Dropping it into a kratom campaign because it was the healthiest spare wastes th
 warmup and pollutes both niches, so **a mailbox is only ever swapped into a
 campaign of its own niche.**
 
-A campaign's niche is resolved in one order, used by the UI and the cron alike:
-your `campaign_group_overrides` entry, else a `tags` field if your Instantly
-workspace returns one, else the first token of the campaign name — so
-"CBD — Outreach US" is `CBD`. Instantly's tags are read off the campaign payload
-already fetched, so this costs no extra API call and simply yields nothing if
-your workspace has no such field.
+A campaign's niche is a **tag you set in Instantly** — never its name. Tagging
+two unrelated campaigns `AEO` makes one AEO mailbox eligible for both, including
+campaigns you create later; deriving a niche from the name would tie a mailbox
+to one campaign and lock it out of its own siblings.
+
+Resolution order, used by the UI and the cron alike: tags from Instantly, else
+an explicit per-campaign entry in `campaign_group_overrides` (comma-separated
+for two niches), else untagged — and an untagged campaign takes no swaps. Tags
+are read from Instantly's custom-tags endpoint, probed across several paths
+because the API has moved it between revisions; the response names the path that
+answered, so the Maintenance tab can tell you if none of them exist.
 
 A mailbox's niche is explicit, stored in `mailbox_tags`, because a swap
 candidate is by definition attached to no active campaign and so has no history
