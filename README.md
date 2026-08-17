@@ -220,6 +220,21 @@ skips what exists and tells you how many it skipped. Dry runs and failed creates
 are never recorded — either would make the next run skip a mailbox that doesn't
 exist.
 
+**Manual import — the API-free path.** *Instantly CSV* on the create panel
+downloads a ready-to-upload account file in Instantly's exact 15-column format
+(`Email, First/Last Name, IMAP/SMTP …, Warmup …`), filled from the batch and the
+selected credential profile, generated entirely in your browser. Tweak anything
+(the SMTP port especially — port 25 is throttled by AWS; 587 is safer) and
+import it into Instantly directly, skipping the API. The file holds plaintext
+SMTP/IMAP passwords, so delete it after importing.
+
+**Usernames are the login, not the mailbox address.** The SMTP/IMAP username on
+a credential profile is sent as-is — a blank one is no longer silently replaced
+with the mailbox email, which is what produced *"IMAP connection failed"* on a
+shared-account setup (one Gmail IMAP + an SES access key). Set it explicitly: the
+SES access key for SMTP, your shared address for IMAP, or `{prefix}@{domain}` for
+per-mailbox Google. A blank username is reported, not guessed.
+
 **Creating mailboxes — the tracking-domain default.** Instantly rejects an
 account whose `tracking_domain_name` it can't verify, and a brand-new domain's
 `inst.` CNAME isn't verified yet — so the batch **omits the tracking domain by

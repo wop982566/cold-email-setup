@@ -72,6 +72,10 @@ export interface BatchConfig {
    * point it at your own later, once the CNAME is green.
    */
   sendTrackingDomain: boolean;
+  /** Sender first/last name written into the Instantly import CSV. Per-row
+   *  fallback (capitalised prefix / blank) applies when these are empty. */
+  importFirstName: string;
+  importLastName: string;
 }
 
 const MX_HOSTS = ["route1.mx.cloudflare.net", "route2.mx.cloudflare.net", "route3.mx.cloudflare.net"];
@@ -104,6 +108,8 @@ export function defaultBatchConfig(): BatchConfig {
     mxPriorities: [10, 20, 30],
     omitEmailRoutingRecords: false,
     sendTrackingDomain: false,
+    importFirstName: "",
+    importLastName: "",
   };
 }
 
@@ -328,7 +334,7 @@ export function zoneBundle(specs: DomainSpec[], config: BatchConfig, now = new D
   return specs.map((s) => zoneFileFor(s, config, now)).join("\n\n");
 }
 
-function csvCell(v: string): string {
+export function csvCell(v: string): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 

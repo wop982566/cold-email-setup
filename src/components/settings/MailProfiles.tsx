@@ -232,7 +232,7 @@ export function MailProfiles() {
                 <NumberField value={editing.smtp_port} onChange={(v) => set("smtp_port", v ?? 0)} />
               </Field>
             </div>
-            <Field label="SMTP username" hint="Blank uses the mailbox address">
+            <Field label="SMTP username" hint="The login — e.g. your SES access key. NOT the mailbox address. For per-mailbox Google use {prefix}@{domain}.">
               <TextField
                 value={editing.smtp_username}
                 onChange={(v) => set("smtp_username", v)}
@@ -256,7 +256,7 @@ export function MailProfiles() {
                 <NumberField value={editing.imap_port} onChange={(v) => set("imap_port", v ?? 0)} />
               </Field>
             </div>
-            <Field label="IMAP username" hint="{prefix} and {domain} expand per mailbox">
+            <Field label="IMAP username" hint="The IMAP login. A shared inbox uses one address for all; per-mailbox uses {prefix}@{domain}. Not auto-filled from the email.">
               <TextField value={editing.imap_username} onChange={(v) => set("imap_username", v)} />
             </Field>
             <Field label="IMAP password" hint="For Gmail this is an app password">

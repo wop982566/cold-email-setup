@@ -13,7 +13,7 @@
 //
 // Pure module — the page fetches and persists, this decides.
 // ---------------------------------------------------------------------------
-import { trackingDomainFor, type BatchConfig, type DomainSpec } from "./dnsPlan";
+import { csvCell, trackingDomainFor, type BatchConfig, type DomainSpec } from "./dnsPlan";
 import type { MailProfile, SetupBatch } from "./types";
 import type { NewAccount } from "./instantly";
 
@@ -118,6 +118,28 @@ function expand(tpl: string, prefix: string, domain: string): string {
 }
 
 /**
+ * The login for SMTP/IMAP, from the profile template.
+ *
+ * Returns "" when the profile field is blank — deliberately NOT the mailbox
+ * email. Substituting the address is how a shared-account setup (one Gmail
+ * IMAP, an SES access key for SMTP) ended up trying to log in as
+ * tanuj@domain and failing with "IMAP connection failed". A blank login is a
+ * misconfiguration to surface, not one to paper over with a wrong value.
+ */
+export function usernameFor(template: string, prefix: string, domain: string): string {
+  const t = (template ?? "").trim();
+  return t ? expand(t, prefix, domain) : "";
+}
+
+/** First name for the import sheet: the batch override, else the capitalised prefix token. */
+function firstNameFor(prefix: string, override: string): string {
+  const o = (override ?? "").trim();
+  if (o) return o;
+  const token = prefix.split(/[._-]/)[0] ?? prefix;
+  return token ? token.charAt(0).toUpperCase() + token.slice(1) : prefix;
+}
+
+/**
  * The Instantly create-account payload for one mailbox.
  *
  * Pure and separate from the page so the two things that cause a 400 are
@@ -138,11 +160,13 @@ export function createAccountArgs(
     first_name: prefix.split(/[._-]/)[0] ?? prefix,
     last_name: "",
     provider_code: profile.provider_code,
-    smtp_username: profile.smtp_username ? expand(profile.smtp_username, prefix, spec.domain) : email,
+    // No email fallback: a blank login is surfaced by the server, never
+    // silently replaced with the mailbox address (see usernameFor).
+    smtp_username: usernameFor(profile.smtp_username, prefix, spec.domain),
     smtp_password: profile.smtp_password,
     smtp_host: profile.smtp_host,
     smtp_port: profile.smtp_port,
-    imap_username: profile.imap_username ? expand(profile.imap_username, prefix, spec.domain) : email,
+    imap_username: usernameFor(profile.imap_username, prefix, spec.domain),
     imap_password: profile.imap_password,
     imap_host: profile.imap_host,
     imap_port: profile.imap_port,
@@ -155,6 +179,56 @@ export function createAccountArgs(
     args.tracking_domain_name = trackingDomainFor(spec, config);
   }
   return args;
+}
+
+/**
+ * Instantly's account-import CSV, ready to upload.
+ *
+ * The manual path that doesn't touch the API at all: emails from the batch,
+ * credentials from the saved profile, in Instantly's exact 15-column order. A
+ * blank profile username is left blank in the sheet rather than filled with the
+ * mailbox address, because that value is known to be wrong for a shared-account
+ * setup — better an empty cell the operator notices than a wrong login that
+ * fails on import.
+ *
+ * Generated in the browser; the caller hands it straight to download().
+ */
+export const INSTANTLY_CSV_HEADERS = [
+  "Email", "First Name", "Last Name",
+  "IMAP Username", "IMAP Password", "IMAP Host", "IMAP Port",
+  "SMTP Username", "SMTP Password", "SMTP Host", "SMTP Port",
+  "Daily Limit", "Warmup Enabled", "Warmup Limit", "Warmup Increment",
+] as const;
+
+export function instantlyImportCsv(
+  specs: DomainSpec[],
+  profile: MailProfile,
+  config: BatchConfig,
+): string {
+  const rows: string[][] = [[...INSTANTLY_CSV_HEADERS]];
+  for (const spec of specs) {
+    for (const prefix of spec.prefixes) {
+      const email = `${prefix}@${spec.domain}`;
+      rows.push([
+        email,
+        firstNameFor(prefix, config.importFirstName),
+        (config.importLastName ?? "").trim(),
+        usernameFor(profile.imap_username, prefix, spec.domain),
+        profile.imap_password,
+        profile.imap_host,
+        String(profile.imap_port),
+        usernameFor(profile.smtp_username, prefix, spec.domain),
+        profile.smtp_password,
+        profile.smtp_host,
+        String(profile.smtp_port),
+        String(profile.daily_limit),
+        "TRUE",
+        String(profile.warmup_limit),
+        String(profile.warmup_increment),
+      ]);
+    }
+  }
+  return rows.map((r) => r.map((c) => csvCell(c ?? "")).join(",")).join("\n");
 }
 
 /** A name that means something in a list six weeks from now. */

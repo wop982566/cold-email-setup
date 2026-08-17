@@ -38,6 +38,7 @@ import {
   batchProgress,
   createAccountArgs,
   draftOf,
+  instantlyImportCsv,
   isDirty,
   pendingMailboxes,
   suggestBatchName,
@@ -896,6 +897,26 @@ export default function SetupBatch() {
                 >
                   <Eye size={14} /> Preview {totalMailboxes}
                 </button>
+                {/* The manual path: hand Instantly its own import format and skip
+                    the API entirely. Generated in-browser from the loaded profile. */}
+                <button
+                  className="btn-ghost btn-sm"
+                  disabled={!profile || specs.length === 0}
+                  onClick={() => {
+                    if (!profile) return;
+                    download(
+                      `instantly-import-${batchName || "batch"}.csv`,
+                      instantlyImportCsv(specs, profile, config),
+                    );
+                    toast.push(
+                      `CSV ready — ${totalMailboxes} mailbox${totalMailboxes === 1 ? "" : "es"}. It contains plaintext passwords; delete it after importing.`,
+                      "info",
+                    );
+                  }}
+                  title="Download a ready-to-import Instantly account CSV for this batch"
+                >
+                  <Download size={14} /> Instantly CSV
+                </button>
                 <button
                   className="btn-primary btn-sm"
                   disabled={!profile || creating}
@@ -920,6 +941,38 @@ export default function SetupBatch() {
                   {profile.warmup_limit} · provider code {profile.provider_code}
                 </p>
               ) : null}
+
+              {/* A blank SMTP/IMAP username on the profile is now sent blank (not
+                  the mailbox email), so name it before it fails on either path. */}
+              {profile && (!profile.smtp_username.trim() || !profile.imap_username.trim()) ? (
+                <p className="mt-2 flex items-start gap-1.5 rounded-lg border-2 border-ink bg-sun/30 p-2 text-[11px] font-semibold">
+                  <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                  This profile has no {!profile.smtp_username.trim() ? "SMTP" : ""}
+                  {!profile.smtp_username.trim() && !profile.imap_username.trim() ? " / " : ""}
+                  {!profile.imap_username.trim() ? "IMAP" : ""} username. That's the login,
+                  not the mailbox address — set it in Settings → Mailbox credentials (SES
+                  access key for SMTP; your shared IMAP address for IMAP).
+                </p>
+              ) : null}
+
+              {/* Names for the import sheet. Blank falls back to the capitalised
+                  prefix per row, so the sheet is usable without touching these. */}
+              <div className="mt-2 flex flex-wrap items-end gap-3">
+                <Field label="Sender first name" hint="Blank = derived from the prefix">
+                  <TextField
+                    value={config.importFirstName}
+                    onChange={(v) => setCfg("importFirstName", v)}
+                    placeholder="Tanuj"
+                  />
+                </Field>
+                <Field label="Sender last name">
+                  <TextField
+                    value={config.importLastName}
+                    onChange={(v) => setCfg("importLastName", v)}
+                    placeholder="S."
+                  />
+                </Field>
+              </div>
 
               {/* Off by default: a fresh domain's inst.* CNAME isn't verified in
                   Instantly yet, and sending an unresolvable tracking domain is a

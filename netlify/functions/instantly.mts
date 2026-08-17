@@ -353,11 +353,15 @@ export default async (req: Request): Promise<Response> => {
           first_name: str(a.first_name),
           last_name: str(a.last_name),
           provider_code: int(a.provider_code, 2),
-          smtp_username: str(a.smtp_username) || email,
+          // No `|| email` fallback: for a shared-account setup (one Gmail IMAP,
+          // an SES access key for SMTP) the login is NOT the mailbox address, and
+          // silently substituting it produced "IMAP connection failed". A blank
+          // username is caught below and reported, not papered over.
+          smtp_username: str(a.smtp_username),
           smtp_password: str(a.smtp_password),
           smtp_host: str(a.smtp_host),
           smtp_port: int(a.smtp_port, 587),
-          imap_username: str(a.imap_username) || email,
+          imap_username: str(a.imap_username),
           imap_password: str(a.imap_password),
           imap_host: str(a.imap_host),
           imap_port: int(a.imap_port, 993),
@@ -371,11 +375,22 @@ export default async (req: Request): Promise<Response> => {
         const tracking = str(a.tracking_domain_name);
         if (tracking) payload.tracking_domain_name = tracking;
 
-        const missing = ["smtp_password", "smtp_host", "imap_password", "imap_host"].filter(
-          (k) => !payload[k],
-        );
+        const missing = [
+          "smtp_username", "smtp_password", "smtp_host",
+          "imap_username", "imap_password", "imap_host",
+        ].filter((k) => !payload[k]);
         if (missing.length) {
-          return json({ ok: false, error: `Missing required field(s): ${missing.join(", ")}` }, 400);
+          return json(
+            {
+              ok: false,
+              email,
+              error: `Missing required field(s): ${missing.join(", ")}`,
+              hint: /username/.test(missing.join())
+                ? "Set the SMTP/IMAP username in the credential profile — it's the login, e.g. your SES access key and the shared IMAP address. For per-mailbox Google, use {prefix}@{domain}."
+                : undefined,
+            },
+            400,
+          );
         }
 
         if (dryRun) return json({ ok: true, dryRun: true, email, payload: scrub(payload) });
