@@ -36,12 +36,14 @@ import {
 } from "../lib/hooks";
 import {
   batchProgress,
+  createAccountArgs,
   draftOf,
   isDirty,
   pendingMailboxes,
   suggestBatchName,
   type BatchDraft,
 } from "../lib/setupBatch";
+import { formatCreateError } from "../lib/writeResult";
 import { Domain, MailProfile, MailboxTag, SetupBatch as SetupBatchRow, TABLES } from "../lib/types";
 import {
   DKIM_TOKEN_COUNT,
@@ -77,10 +79,6 @@ interface Override {
   netlifySite?: string;
   /** Niche for this domain's mailboxes. Untagged is never swap-eligible. */
   tag?: string;
-}
-
-function expand(tpl: string, prefix: string, domain: string): string {
-  return tpl.replace(/\{prefix\}/g, prefix).replace(/\{domain\}/g, domain);
 }
 
 export default function SetupBatch() {
@@ -353,29 +351,7 @@ export default function SetupBatch() {
         const email = `${prefix}@${spec.domain}`;
         if (pending && !pending.has(email)) continue;
         const res = await instantly.createAccount(
-          {
-            email,
-            first_name: prefix.split(/[._-]/)[0] ?? prefix,
-            last_name: "",
-            provider_code: profile.provider_code,
-            smtp_username: profile.smtp_username
-              ? expand(profile.smtp_username, prefix, spec.domain)
-              : email,
-            smtp_password: profile.smtp_password,
-            smtp_host: profile.smtp_host,
-            smtp_port: profile.smtp_port,
-            imap_username: profile.imap_username
-              ? expand(profile.imap_username, prefix, spec.domain)
-              : email,
-            imap_password: profile.imap_password,
-            imap_host: profile.imap_host,
-            imap_port: profile.imap_port,
-            daily_limit: profile.daily_limit,
-            warmup_limit: profile.warmup_limit,
-            warmup_increment: profile.warmup_increment,
-            warmup_reply_rate: profile.warmup_reply_rate,
-            tracking_domain_name: trackingDomainFor(spec, config),
-          },
+          createAccountArgs(profile, spec, prefix, config),
           dryRun,
         );
         log.push(
@@ -383,7 +359,9 @@ export default function SetupBatch() {
             ? dryRun
               ? `would create ${email}`
               : `created ${email}`
-            : `FAILED ${email} — ${res.error}`,
+            : // The reason lives in res.data/res.sent, both scrubbed server-side.
+              // Printing only "Instantly 400" is what made this undiagnosable.
+              `FAILED ${formatCreateError(email, res)}`,
         );
         setCreateLog([...log]);
 
@@ -939,9 +917,26 @@ export default function SetupBatch() {
                 <p className="mt-2 text-[11px] text-muted">
                   {profile.smtp_host}:{profile.smtp_port} sending · {profile.imap_host}:
                   {profile.imap_port} receiving · {profile.daily_limit}/day · warmup{" "}
-                  {profile.warmup_limit}
+                  {profile.warmup_limit} · provider code {profile.provider_code}
                 </p>
               ) : null}
+
+              {/* Off by default: a fresh domain's inst.* CNAME isn't verified in
+                  Instantly yet, and sending an unresolvable tracking domain is a
+                  400 at create time. Turn on once the CNAME is green. */}
+              <label className="mt-2 flex items-start gap-2 text-[11px]">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 accent-ink"
+                  checked={config.sendTrackingDomain}
+                  onChange={(e) => setCfg("sendTrackingDomain", e.target.checked)}
+                />
+                <span>
+                  Send a custom tracking domain (<code>{trackingDomainFor(specs[0] ?? { domain: "your-domain", prefixes: [], dkimTokens: [], netlifySite: "" }, config)}</code>).
+                  Leave <b>off</b> for brand-new domains — Instantly rejects a tracking
+                  domain it can't verify yet. You can point mailboxes at it later.
+                </span>
+              </label>
 
               {createLog.length > 0 ? (
                 <pre

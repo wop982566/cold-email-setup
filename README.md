@@ -220,6 +220,17 @@ skips what exists and tells you how many it skipped. Dry runs and failed creates
 are never recorded — either would make the next run skip a mailbox that doesn't
 exist.
 
+**Creating mailboxes — the tracking-domain default.** Instantly rejects an
+account whose `tracking_domain_name` it can't verify, and a brand-new domain's
+`inst.` CNAME isn't verified yet — so the batch **omits the tracking domain by
+default** and creates against Instantly's shared one. Tick *"Send a custom
+tracking domain"* in the create panel once your CNAME is green. When a create
+does fail, the log now shows Instantly's own message and the exact (credential-
+scrubbed) payload sent, so a 400 names its own cause instead of reading only
+"Instantly 400". Provider code lives on the credential profile — custom SMTP
+(SES) uses a different code from Google/Microsoft, and the surfaced error names
+the one Instantly expects.
+
 ---
 
 ## 🧱 Tech & structure

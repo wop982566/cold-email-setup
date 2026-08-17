@@ -80,6 +80,42 @@ export function formatAttempts(res: WriteResult, label: string): string {
   return lines.join("\n");
 }
 
+/**
+ * A create-account failure, as text you can act on.
+ *
+ * Instantly quotes the offending fields in its validation errors, so its own
+ * message is the fastest route to the cause — but the bulk-setup log only ever
+ * showed "Instantly 400" and dropped `res.data` and `res.sent` on the floor.
+ * Both are scrubbed of credentials server-side before they arrive here.
+ */
+export function formatCreateError(email: string, res: WriteResult): string {
+  const lines = [`${email}: ${res.error ?? "failed"}`];
+  const message = extractMessage(res.data);
+  if (message) lines.push(`  Instantly said: ${message}`);
+  if (res.data && !message) lines.push(`  Instantly returned: ${JSON.stringify(res.data).slice(0, 400)}`);
+  if (res.sent) lines.push(`  We sent: ${JSON.stringify(res.sent).slice(0, 500)}`);
+  return lines.join("\n");
+}
+
+/** Pull the human-readable line out of whatever shape Instantly's error took. */
+function extractMessage(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const o = data as Record<string, unknown>;
+  for (const k of ["message", "error", "detail", "msg"]) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  // Some APIs return { errors: [{ message }] } or a bare array of strings.
+  const errs = o.errors ?? o.error;
+  if (Array.isArray(errs)) {
+    const parts = errs
+      .map((e) => (typeof e === "string" ? e : extractMessage(e)))
+      .filter(Boolean);
+    if (parts.length) return parts.join("; ");
+  }
+  return null;
+}
+
 /** Roll several per-campaign verdicts into one sentence. */
 export function summariseWrites(verdicts: WriteVerdict[]): {
   message: string;

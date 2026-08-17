@@ -10,7 +10,7 @@ import { useState } from "react";
 import { KeyRound, Plus, Pencil, Trash2, Copy, Eye, EyeOff, Lock, AlertTriangle } from "lucide-react";
 import { Card, Badge } from "../ui/primitives";
 import { Modal, ConfirmDialog } from "../ui/Modal";
-import { Field, TextField, NumberField, TextArea } from "../ui/Field";
+import { Field, TextField, NumberField, TextArea, SelectField } from "../ui/Field";
 import { useToast } from "../ui/toast";
 import { useCollection, useInsert, useUpdate, useRemove } from "../../lib/hooks";
 import { MailProfile, TABLES } from "../../lib/types";
@@ -268,8 +268,25 @@ export function MailProfiles() {
               <Field label="Daily limit">
                 <NumberField value={editing.daily_limit} onChange={(v) => set("daily_limit", v ?? 0)} />
               </Field>
-              <Field label="Provider code" hint="Instantly's provider id">
-                <NumberField value={editing.provider_code} onChange={(v) => set("provider_code", v ?? 0)} />
+              <Field
+                label="Provider"
+                hint="Custom SMTP (SES) uses a different code from Google/Microsoft. If a create fails with a provider error, the bulk-setup log now shows the code Instantly expected."
+              >
+                <div className="flex gap-2">
+                  <SelectField
+                    value={String(editing.provider_code)}
+                    onChange={(v) => set("provider_code", Number(v))}
+                    options={[
+                      { value: "1", label: "Custom SMTP / IMAP" },
+                      { value: "2", label: "Google Workspace" },
+                      { value: "3", label: "Microsoft 365" },
+                    ]}
+                  />
+                  {/* Kept editable: the labels are the common mapping, but the
+                      code Instantly actually wants is authoritative and now
+                      visible in the create error, so an override must be possible. */}
+                  <NumberField value={editing.provider_code} onChange={(v) => set("provider_code", v ?? 0)} />
+                </div>
               </Field>
               <Field label="Warmup limit">
                 <NumberField value={editing.warmup_limit} onChange={(v) => set("warmup_limit", v ?? 0)} />

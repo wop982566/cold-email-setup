@@ -97,6 +97,8 @@ export interface WriteResult<T = unknown> extends InstantlyResult<T> {
   applied?: boolean | null;
   current?: string[];
   payload?: unknown;
+  /** The scrubbed payload the server actually sent — for diagnosing a rejection. */
+  sent?: unknown;
   // capabilities probe
   writesEnabled?: boolean;
   hint?: string | null;

@@ -13,8 +13,9 @@
 //
 // Pure module — the page fetches and persists, this decides.
 // ---------------------------------------------------------------------------
-import type { DomainSpec } from "./dnsPlan";
-import type { SetupBatch } from "./types";
+import { trackingDomainFor, type BatchConfig, type DomainSpec } from "./dnsPlan";
+import type { MailProfile, SetupBatch } from "./types";
+import type { NewAccount } from "./instantly";
 
 /** Addresses compare case-insensitively; Instantly treats them that way. */
 function key(email: string): string {
@@ -109,6 +110,51 @@ function stableJson(value: unknown): string {
     }
     return v;
   });
+}
+
+/** `{prefix}`/`{domain}` templating for SMTP/IMAP usernames. */
+function expand(tpl: string, prefix: string, domain: string): string {
+  return tpl.replace(/\{prefix\}/g, prefix).replace(/\{domain\}/g, domain);
+}
+
+/**
+ * The Instantly create-account payload for one mailbox.
+ *
+ * Pure and separate from the page so the two things that cause a 400 are
+ * testable: whether the tracking domain is attached, and which provider/host
+ * values are sent. `tracking_domain_name` is included ONLY when the batch opts
+ * in — a fresh domain's tracking CNAME isn't verified in Instantly yet, and
+ * sending an unresolvable one is rejected at create time.
+ */
+export function createAccountArgs(
+  profile: MailProfile,
+  spec: DomainSpec,
+  prefix: string,
+  config: BatchConfig,
+): NewAccount {
+  const email = `${prefix}@${spec.domain}`;
+  const args: NewAccount = {
+    email,
+    first_name: prefix.split(/[._-]/)[0] ?? prefix,
+    last_name: "",
+    provider_code: profile.provider_code,
+    smtp_username: profile.smtp_username ? expand(profile.smtp_username, prefix, spec.domain) : email,
+    smtp_password: profile.smtp_password,
+    smtp_host: profile.smtp_host,
+    smtp_port: profile.smtp_port,
+    imap_username: profile.imap_username ? expand(profile.imap_username, prefix, spec.domain) : email,
+    imap_password: profile.imap_password,
+    imap_host: profile.imap_host,
+    imap_port: profile.imap_port,
+    daily_limit: profile.daily_limit,
+    warmup_limit: profile.warmup_limit,
+    warmup_increment: profile.warmup_increment,
+    warmup_reply_rate: profile.warmup_reply_rate,
+  };
+  if (config.sendTrackingDomain) {
+    args.tracking_domain_name = trackingDomainFor(spec, config);
+  }
+  return args;
 }
 
 /** A name that means something in a list six weeks from now. */

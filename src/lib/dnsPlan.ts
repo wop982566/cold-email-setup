@@ -62,6 +62,16 @@ export interface BatchConfig {
    * exports byte for byte — flip this if the import complains about them.
    */
   omitEmailRoutingRecords: boolean;
+  /**
+   * Send `tracking_domain_name` when creating the Instantly mailbox.
+   *
+   * Off by default: a freshly-created domain's `inst.` CNAME isn't verified in
+   * Instantly yet, and Instantly rejects an account whose tracking domain it
+   * can't resolve — a 400 at create time. With this off, the mailbox is created
+   * against Instantly's shared tracking domain (which always works) and you
+   * point it at your own later, once the CNAME is green.
+   */
+  sendTrackingDomain: boolean;
 }
 
 const MX_HOSTS = ["route1.mx.cloudflare.net", "route2.mx.cloudflare.net", "route3.mx.cloudflare.net"];
@@ -93,6 +103,7 @@ export function defaultBatchConfig(): BatchConfig {
     ttl: 1,
     mxPriorities: [10, 20, 30],
     omitEmailRoutingRecords: false,
+    sendTrackingDomain: false,
   };
 }
 
