@@ -45,6 +45,7 @@ import {
   type BatchDraft,
 } from "../lib/setupBatch";
 import { formatCreateError } from "../lib/writeResult";
+import { InboxBulkUpdate } from "../components/setup/InboxBulkUpdate";
 import { Domain, MailProfile, MailboxTag, SetupBatch as SetupBatchRow, TABLES } from "../lib/types";
 import {
   DKIM_TOKEN_COUNT,
@@ -1004,6 +1005,15 @@ export default function SetupBatch() {
             </>
           )}
         </Card>
+      ) : null}
+
+      {/* Update settings on inboxes that already exist (tracking domain, names,
+          warmup, tags) — read live first, then push. Never creates. */}
+      {specs.length > 0 ? (
+        <InboxBulkUpdate
+          domains={domains}
+          trackingPrefix={config.trackingPrefix || "inst"}
+        />
       ) : null}
 
       {/* Checklist */}

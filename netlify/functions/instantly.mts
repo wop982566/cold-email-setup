@@ -259,6 +259,19 @@ export default async (req: Request): Promise<Response> => {
       return json({ ok: true, data });
     }
 
+    // Full settings for one inbox — the account list is a summary, and the
+    // bulk-update preview needs the fields the settings screen shows (tracking
+    // domain, warmup filter tag, tags). Scrubbed so no credential can leak into
+    // the preview or the browser network log.
+    if (resource === "account-detail") {
+      const em = url.searchParams.get("email");
+      if (!em) return json({ ok: false, error: "Missing email" }, 400);
+      const res = await fetch(`${BASE}/accounts/${encodeURIComponent(em)}`, { headers: auth });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data: scrub(data) }, res.status);
+      return json({ ok: true, data: scrub(data) });
+    }
+
     // Accounts and campaigns paginate at 100/page. The planner counts mailboxes
     // per campaign, so a silent truncation would tell the operator to buy
     // inboxes they already own — page through the whole list instead.
@@ -411,17 +424,44 @@ export default async (req: Request): Promise<Response> => {
         const email = normEmail(body.email);
         if (!email) return json({ ok: false, error: "email is required" }, 400);
 
-        // Deliberately narrow: this op cannot rewrite credentials or identity.
+        // Still cannot rewrite credentials — no smtp_/imap_ passwords or hosts
+        // here, on purpose. The client sends a `patch` object it built from the
+        // enabled fields (see inboxUpdate.ts); we forward a WHITELISTED subset,
+        // so the browser can never smuggle a credential field into a PATCH.
+        const incoming = (body.patch ?? {}) as Record<string, unknown>;
         const patch: Record<string, unknown> = {};
-        if (body.daily_limit != null) patch.daily_limit = int(body.daily_limit, 30);
-        const w = (body.warmup ?? null) as Record<string, unknown> | null;
-        if (w) {
-          patch.warmup = {
-            limit: int(w.limit, 20),
-            increment: int(w.increment, 1),
-            reply_rate: int(w.reply_rate, 30),
-          };
+
+        if (incoming.first_name != null) patch.first_name = str(incoming.first_name);
+        if (incoming.last_name != null) patch.last_name = str(incoming.last_name);
+        if (incoming.tracking_domain_name != null) {
+          patch.tracking_domain_name = str(incoming.tracking_domain_name);
         }
+        if (incoming.daily_limit != null) patch.daily_limit = int(incoming.daily_limit, 30);
+
+        const w = (incoming.warmup ?? body.warmup ?? null) as Record<string, unknown> | null;
+        if (w) {
+          const warmup: Record<string, number> = {};
+          if (w.limit != null) warmup.limit = int(w.limit, 20);
+          if (w.increment != null) warmup.increment = int(w.increment, 1);
+          if (w.reply_rate != null) warmup.reply_rate = int(w.reply_rate, 30);
+          if (Object.keys(warmup).length) patch.warmup = warmup;
+        }
+
+        // Discovered-key fields: the client already resolved the real key name
+        // from the live account, so anything left in `incoming` that isn't a
+        // credential and isn't already mapped is passed through verbatim. The
+        // credential guard below is belt-and-braces.
+        for (const [k, v] of Object.entries(incoming)) {
+          if (k in patch || k === "warmup") continue;
+          if (/pass|secret|smtp_|imap_|credential/i.test(k)) continue;
+          patch[k] = v;
+        }
+
+        // Back-compat: older callers sent daily_limit/warmup at the top level.
+        if (incoming.daily_limit == null && body.daily_limit != null) {
+          patch.daily_limit = int(body.daily_limit, 30);
+        }
+
         if (Object.keys(patch).length === 0) {
           return json({ ok: false, error: "Nothing to update" }, 400);
         }
@@ -431,7 +471,10 @@ export default async (req: Request): Promise<Response> => {
         const res = await post(`/accounts/${encodeURIComponent(email)}`, patch, "PATCH");
         const data = await res.json().catch(() => null);
         if (!res.ok) {
-          return json({ ok: false, email, error: `Instantly ${res.status}`, data: scrub(data) }, res.status);
+          return json(
+            { ok: false, email, error: `Instantly ${res.status}`, data: scrub(data), sent: scrub(patch) },
+            res.status,
+          );
         }
         return json({ ok: true, email, data: scrub(data) });
       }

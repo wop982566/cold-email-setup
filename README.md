@@ -220,6 +220,18 @@ skips what exists and tells you how many it skipped. Dry runs and failed creates
 are never recorded — either would make the next run skip a mailbox that doesn't
 exist.
 
+**Updating inboxes that already exist.** *Live inboxes* on the bulk-setup page
+reads the current Instantly settings for the batch's domains (name, daily limit,
+warmup, tracking domain, tags, warmup filter tag) — each row expands to raw JSON.
+Below it, a bulk updater pushes only the fields you tick — tracking domain
+(`inst.<each inbox's own domain>`), name, daily limit, warmup, tags, warmup
+filter tag — to the selected inboxes. **Preview** dry-runs the exact diff; **Apply**
+PATCHes each and surfaces the per-inbox result. It never creates an account, and
+the server whitelists the patch so no credential field can be sent. Tags and the
+warmup filter tag are written back under the exact key the live account exposes
+them under (visible in the raw JSON); if an inbox doesn't expose that key, the
+field is skipped with a reason rather than sent as a guess.
+
 **Manual import — the API-free path.** *Instantly CSV* on the create panel
 downloads a ready-to-upload account file in Instantly's exact 15-column format
 (`Email, First/Last Name, IMAP/SMTP …, Warmup …`), filled from the batch and the

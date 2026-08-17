@@ -218,6 +218,9 @@ export const instantly = {
   // Single campaign — used only when the list payload omits email_list, which
   // is the campaign -> mailbox linkage the planner is built on.
   campaignDetail: (id: string) => call("campaign-detail", { id }),
+  // Full settings for one inbox — used by the bulk-update preview to show and
+  // discover the live field shape. Credentials are scrubbed server-side.
+  accountDetail: (email: string) => call("account-detail", { email }),
   // Custom tags. Resolves with supported:false when none of the probed paths
   // exist in this workspace — an answer, not a failure.
   tags: () =>
@@ -249,6 +252,12 @@ export const instantly = {
     payload: { email: string; daily_limit?: number; warmup?: { limit: number; increment: number; reply_rate: number } },
     dryRun = false,
   ) => write({ op: "update-account", ...payload, dryRun }),
+
+  // Bulk update of an existing inbox's settings. `patch` is built client-side
+  // from the enabled fields (inboxUpdate.accountUpdatePayload); the server
+  // whitelists it, so no credential field can slip through.
+  updateAccountFields: (email: string, patch: Record<string, unknown>, dryRun = false) =>
+    write({ op: "update-account", email, patch, dryRun }),
 
   // `expectedList` is what the page believed the campaign held. The server
   // aborts if reality disagrees, so a stale tab can't clobber a live campaign.
