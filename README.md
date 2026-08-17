@@ -220,6 +220,18 @@ skips what exists and tells you how many it skipped. Dry runs and failed creates
 are never recorded — either would make the next run skip a mailbox that doesn't
 exist.
 
+**The Domains tab mirrors Instantly live.** On load it reads the connected
+accounts and reconciles them against the stored table: a domain Instantly has
+that the table doesn't is **added automatically** (pre-filled with its mailbox
+addresses and `connected = Yes`, registrar/expiry/DNS left blank for you), and
+existing rows have their Instantly-owned fields — connection, warmup, and any
+blank mailbox slot — refreshed to the live value. It's additive and idempotent:
+it only ever fills blanks and updates status that actually changed, never
+overwrites your registrar/expiry/DNS/cost/notes, and never deletes — so a
+transient empty read can't wipe anything. Because the new rows are persisted,
+**Capacity and the Dashboard count them too**. Newly created inboxes from bulk
+setup are pushed into the Domains tab the moment they're created.
+
 **Updating inboxes that already exist.** *Live inboxes* on the bulk-setup page
 reads the current Instantly settings for the batch's domains (name, daily limit,
 warmup, tracking domain, tags, warmup filter tag) — each row expands to raw JSON.

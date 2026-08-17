@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import Papa from "papaparse";
 import {
@@ -32,6 +32,9 @@ import {
   TriState,
 } from "../lib/types";
 import { daysUntil, fmtDate } from "../lib/format";
+import { useQuery } from "@tanstack/react-query";
+import { instantly, asItems } from "../lib/instantly";
+import { reconcileDomains } from "../lib/domainSync";
 import { download, uuid } from "../lib/utils";
 import { lookupDomainExpiry } from "../lib/functions";
 
@@ -98,6 +101,49 @@ export default function Domains() {
   const insertMany = useInsertMany<Domain>(TABLES.domains);
   const update = useUpdate<Domain>(TABLES.domains);
   const remove = useRemove(TABLES.domains);
+
+  // Live Instantly accounts — same cache key the planner/insights share, so a
+  // Refresh anywhere updates all three.
+  const acctQ = useQuery({
+    queryKey: ["inst", "acct"],
+    queryFn: () => instantly.accounts(),
+    staleTime: 60_000,
+  });
+  const liveAccounts = useMemo(
+    () => (acctQ.data?.ok ? asItems<Record<string, unknown>>(acctQ.data.data) : []),
+    [acctQ.data],
+  );
+
+  // Reconcile the stored table against Instantly: add domains it has that we
+  // don't, and refresh the Instantly-owned fields (connection, warmup, blank
+  // mailbox slots) on existing rows. Additive and idempotent — it never
+  // overwrites your metadata and never deletes.
+  const [syncedAt, setSyncedAt] = useState<Date | null>(null);
+  const syncingRef = useRef(false);
+  useEffect(() => {
+    if (syncingRef.current || isLoading || !acctQ.data?.ok || liveAccounts.length === 0) return;
+    const { toAdd, toUpdate } = reconcileDomains(domains, liveAccounts, uuid);
+    if (toAdd.length === 0 && toUpdate.length === 0) {
+      if (!syncedAt) setSyncedAt(new Date());
+      return;
+    }
+    syncingRef.current = true;
+    void (async () => {
+      try {
+        if (toAdd.length) await insertMany.mutateAsync(toAdd);
+        for (const u of toUpdate) await update.mutateAsync({ id: u.id, patch: u.patch });
+        if (toAdd.length) {
+          toast.push(`Added ${toAdd.length} inbox domain${toAdd.length === 1 ? "" : "s"} from Instantly`, "success");
+        }
+        setSyncedAt(new Date());
+      } finally {
+        // Released after the domains query refetches with the new rows, so the
+        // next effect run sees the applied state and finds no diff.
+        syncingRef.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, acctQ.data, liveAccounts, domains]);
 
   const [search, setSearch] = useState("");
   const [campaignFilter, setCampaignFilter] = useState("");
@@ -286,6 +332,21 @@ export default function Domains() {
         </button>
         <button className="btn-ghost btn-sm" onClick={checkAll} disabled={bulkChecking}>
           <RefreshCw size={14} className={bulkChecking ? "animate-spin" : ""} /> Auto-fetch expiry
+        </button>
+        {/* Live from Instantly: connection, warmup and mailboxes on every row
+            below reflect Instantly, and new inboxes appear here automatically. */}
+        <button
+          className="btn-ghost btn-sm"
+          onClick={() => void acctQ.refetch()}
+          disabled={acctQ.isFetching}
+          title="Re-read live inbox status from Instantly"
+        >
+          <RefreshCw size={14} className={acctQ.isFetching ? "animate-spin" : ""} />
+          {acctQ.isFetching
+            ? "Syncing…"
+            : syncedAt
+              ? `Synced ${syncedAt.toLocaleTimeString()}`
+              : "Sync Instantly"}
         </button>
         <button className="btn-ghost btn-sm" onClick={exportCsv}>
           <Download size={14} /> Export

@@ -276,10 +276,12 @@ export default function SetupBatch() {
   }
 
   /** Write the batch into the Domains table so it joins the rest of the app. */
-  async function createDomainRows() {
+  async function createDomainRows(opts?: { silent?: boolean }) {
     const fresh = specs.filter((s) => !knownDomains.has(s.domain));
     if (fresh.length === 0) {
-      toast.push("Every domain in this batch is already in your Domains list", "info");
+      if (!opts?.silent) {
+        toast.push("Every domain in this batch is already in your Domains list", "info");
+      }
       return;
     }
     const base = existingDomains.length;
@@ -317,7 +319,9 @@ export default function SetupBatch() {
       };
     });
     await insertDomains.mutateAsync(rows);
-    toast.push(`Added ${rows.length} domain${rows.length === 1 ? "" : "s"}`, "success");
+    if (!opts?.silent) {
+      toast.push(`Added ${rows.length} domain${rows.length === 1 ? "" : "s"}`, "success");
+    }
   }
 
   /**
@@ -409,6 +413,14 @@ export default function SetupBatch() {
       }
     }
     setCreating(false);
+
+    // A real create means these domains now have live inboxes — surface them in
+    // the Domains tab immediately, without the separate "Add domains" click. The
+    // Domains tab's own Instantly sync then overlays live connection/warmup.
+    if (!dryRun && confirmed.length > createdEmails.length) {
+      await createDomainRows({ silent: true }).catch(() => {});
+    }
+
     const failed = log.filter((l) => l.startsWith("FAILED")).length;
     toast.push(
       failed === 0
