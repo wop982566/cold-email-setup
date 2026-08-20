@@ -44,6 +44,15 @@ import {
 } from "../lib/placement";
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
 import { buildTagMap, mergeTagMaps, normaliseTag, parseTagPayload, tagsFor } from "../lib/tags";
+import {
+  accountCredentials,
+  credsOf,
+  groupByImap,
+  mergeCredsFromDetail,
+  emailsMissingImap,
+  hasImapDetail,
+  type AccountCreds,
+} from "../lib/accountCreds";
 import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
@@ -226,6 +235,37 @@ export default function Planner() {
     () => mergeTagMaps(buildTagMap(tagRowsQ.data ?? []), tagAssignments.byEmail),
     [tagRowsQ.data, tagAssignments],
   );
+
+  // Which IMAP/SMTP each account is on — read from the live accounts payload,
+  // never from the (possibly stale) saved profile. Passwords are never fetched.
+  const [detailCreds, setDetailCreds] = useState<Map<string, AccountCreds>>(new Map());
+  const [loadingImap, setLoadingImap] = useState(false);
+  const creds = useMemo(() => {
+    // Start from whatever the accounts list carried, then overlay anything the
+    // on-demand account-detail fetch has filled in.
+    const base = accountCredentials(
+      acctQ.data?.ok ? asItems<Record<string, unknown>>(acctQ.data.data) : [],
+    );
+    let merged = base;
+    for (const [email, c] of detailCreds) merged = mergeCredsFromDetail(merged, email, { imap_host: c.imapHost, imap_username: c.imapUsername, imap_port: c.imapPort, smtp_host: c.smtpHost, smtp_username: c.smtpUsername, smtp_port: c.smtpPort });
+    return merged;
+  }, [acctQ.data, detailCreds]);
+  const imapGroups = useMemo(() => groupByImap(creds), [creds]);
+
+  // When the list didn't carry IMAP, fetch it per account (scrubbed) on demand.
+  async function loadImapDetails() {
+    setLoadingImap(true);
+    const filled = new Map(detailCreds);
+    for (const email of emailsMissingImap(creds)) {
+      const res = await instantly.accountDetail(email);
+      if (res.ok && res.data) {
+        const c = credsOf(res.data as Record<string, unknown>);
+        if (c.imapHost || c.imapUsername) filled.set(email.toLowerCase(), c);
+      }
+    }
+    setDetailCreds(filled);
+    setLoadingImap(false);
+  }
   const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
   const updateTag = useUpdate<MailboxTag>(TABLES.mailboxTags);
 
@@ -736,6 +776,35 @@ export default function Planner() {
         </Card>
       ) : null}
 
+      {/* Accounts grouped by the IMAP login they share — so you can see which
+          inboxes are on which mailbox, at a glance, after changing an IMAP. */}
+      {imapGroups.length > 0 ? (
+        <Card className="p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-base font-extrabold">Accounts by IMAP</h3>
+            {!hasImapDetail(creds) || emailsMissingImap(creds).length > 0 ? (
+              <button className="btn-ghost btn-sm" onClick={() => void loadImapDetails()} disabled={loadingImap}>
+                {loadingImap ? <Spinner /> : <RefreshCw size={14} />} Load IMAP details
+              </button>
+            ) : null}
+          </div>
+          <p className="mt-0.5 text-xs text-muted">
+            Which inbox each account is on. Live from Instantly — passwords are never shown.
+          </p>
+          <div className="mt-3 space-y-2">
+            {imapGroups.map((g) => (
+              <div key={g.identity} className="rounded-lg border-2 border-ink bg-canvas p-2 text-xs">
+                <p className="font-bold">
+                  {g.identity}{" "}
+                  <span className="font-normal text-muted">· {g.emails.length} inbox{g.emails.length === 1 ? "" : "es"}</span>
+                </p>
+                <p className="mt-1 break-words text-[11px] text-muted">{g.emails.join(", ")}</p>
+              </div>
+            ))}
+          </div>
+        </Card>
+      ) : null}
+
       {/* Mailboxes */}
       <Card className="overflow-hidden p-0">
         <button
@@ -767,6 +836,7 @@ export default function Planner() {
                   <th className="w-28 px-3 py-2">Sending</th>
                   <th className="w-24 px-3 py-2">Last used</th>
                   <th className="px-3 py-2">Campaigns</th>
+                  <th className="px-3 py-2">IMAP</th>
                   <th className="w-28 px-3 py-2">Niche</th>
                   <th className="w-28 px-3 py-2">State</th>
                 </tr>
@@ -842,6 +912,27 @@ export default function Planner() {
                           {b.pausedOnly ? " (paused)" : ""}
                         </span>
                       )}
+                    </td>
+                    {/* Live IMAP/SMTP identity — which login this account is on,
+                        so a changed IMAP is visible per account. No password. */}
+                    <td className="px-3 py-2 text-xs">
+                      {(() => {
+                        const c = creds.get(b.email.toLowerCase());
+                        if (!c || (!c.imapHost && !c.imapUsername)) {
+                          return <span className="text-muted">—</span>;
+                        }
+                        return (
+                          <span
+                            className="line-clamp-2"
+                            title={
+                              `IMAP: ${c.imapUsername ?? "?"} @ ${c.imapHost ?? "?"}${c.imapPort ? ":" + c.imapPort : ""}\n` +
+                              `SMTP: ${c.smtpUsername ?? "?"} @ ${c.smtpHost ?? "?"}${c.smtpPort ? ":" + c.smtpPort : ""}`
+                            }
+                          >
+                            {c.imapUsername ?? c.imapHost}
+                          </span>
+                        );
+                      })()}
                     </td>
                     {/* Editable here because a mailbox outlives the batch that
                         made it, and an untagged one is invisible to the swapper

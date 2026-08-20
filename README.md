@@ -220,6 +220,14 @@ skips what exists and tells you how many it skipped. Dry runs and failed creates
 are never recorded — either would make the next run skip a mailbox that doesn't
 exist.
 
+**See which IMAP/SMTP each account uses.** The Campaign Planner shows an **IMAP**
+column per inbox and an **Accounts by IMAP** card that lists every inbox grouped
+under the login it shares — read live from Instantly (the account's own value,
+not a saved profile that may be stale). Passwords are never shown: they're
+write-only in Instantly and the account-detail read scrubs them. If the accounts
+list doesn't carry IMAP fields, **Load IMAP details** fills them on demand from
+`account-detail`.
+
 **The Domains tab mirrors Instantly live.** On load it reads the connected
 accounts and reconciles them against the stored table: a domain Instantly has
 that the table doesn't is **added automatically** (pre-filled with its mailbox
