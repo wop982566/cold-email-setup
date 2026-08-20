@@ -9,7 +9,7 @@
 //
 // Pure module.
 // ---------------------------------------------------------------------------
-import { campaignTagsOf, eligibleFor, type TagMap, tagsFor } from "./tags";
+import { campaignTagsOf, eligibleFor, normaliseTag, normaliseTags, type TagMap, tagsFor } from "./tags";
 
 export interface CampaignLite {
   id: string;
@@ -98,4 +98,106 @@ export interface TagCoverage {
 export function tagCoverage(rows: AccountTagRow[]): TagCoverage {
   const tagged = rows.filter((r) => r.state === "tagged").length;
   return { total: rows.length, tagged, untagged: rows.length - tagged };
+}
+
+// ---------------------------------------------------------------------------
+// Why a Verify came back empty — so the tab can explain it instead of just
+// saying "no campaign matches", which reads as a bug when the real cause is
+// that NO campaign is tagged at all, or the account's tag simply differs.
+// ---------------------------------------------------------------------------
+export type NoMatchReason =
+  | { kind: "match" }
+  /** The account carries no tag, so it's eligible for nothing. */
+  | { kind: "account_untagged" }
+  /** Not one campaign has a tag — tagging the account can't help until they do. */
+  | { kind: "no_campaign_tagged" }
+  /** Both sides are tagged, they just don't overlap. Carries both, to show them. */
+  | { kind: "tag_mismatch"; accountTags: string[]; campaignTags: string[] };
+
+export function diagnoseNoMatch(
+  accountTags: readonly string[] | null | undefined,
+  resolved: ResolvedCampaign[],
+): NoMatchReason {
+  if (eligibleCampaignsFor(accountTags, resolved).length > 0) return { kind: "match" };
+  // No campaign has a tag → the account tag is irrelevant; this is the case the
+  // user actually hit. Check it first so the message points at the real fix.
+  if (resolved.every((c) => c.tags.length === 0)) return { kind: "no_campaign_tagged" };
+  const mine = normaliseTags(accountTags);
+  if (mine.length === 0) return { kind: "account_untagged" };
+  const campaignTags = [...new Set(resolved.flatMap((c) => c.tags))].sort();
+  return { kind: "tag_mismatch", accountTags: mine, campaignTags };
+}
+
+// ---------------------------------------------------------------------------
+// Manual match: bind an account to campaigns by giving both a shared niche tag.
+//
+// The swapper has one rule — eligibleFor(mailboxTags, campaignTags) — and it
+// reads mailbox tags from `mailbox_tags` and campaign tags via campaignTagsOf,
+// whose override fallback is `campaign_group_overrides`. So a durable manual
+// match is: tag the account NICHE, and set each chosen campaign's override to
+// NICHE. Then the existing rule (and the daily cron, which shares it) makes the
+// account eligible with no change to the swap code.
+//
+// The one caveat, mirrored faithfully: campaignTagsOf lets an Instantly tag
+// WIN over the override. So a campaign already tagged in Instantly can't be
+// matched via the override — writing one would be a silent no-op. Those are
+// reported (ignoredInstantly) rather than written, so the UI can say why.
+//
+// Pure — returns the writes to make; the caller persists them.
+// ---------------------------------------------------------------------------
+export interface ManualMatchResult {
+  /** The full new campaign_group_overrides map, ready to persist. */
+  overrides: Record<string, string>;
+  /** The account's tags after folding in the niche (deduped, normalised). */
+  tags: string[];
+  /** Campaign ids whose override was appended — the ones actually bound. */
+  changed: string[];
+  /** Campaign ids that already resolve to the niche — no write needed. */
+  alreadyEligible: string[];
+  /** Campaign ids carrying a different Instantly tag — override would be ignored. */
+  ignoredInstantly: string[];
+}
+
+export function applyManualMatch(
+  currentOverrides: Record<string, string>,
+  niche: string,
+  campaignIds: readonly string[],
+  existingAccountTags: readonly string[] | null | undefined,
+  campaigns: CampaignLite[],
+  byCampaign?: Map<string, string[]>,
+): ManualMatchResult {
+  const N = normaliseTag(niche);
+  const overrides = { ...(currentOverrides ?? {}) };
+  const result: ManualMatchResult = {
+    overrides,
+    tags: normaliseTags(existingAccountTags ?? []),
+    changed: [],
+    alreadyEligible: [],
+    ignoredInstantly: [],
+  };
+  if (!N) return result;
+
+  result.tags = normaliseTags([...(existingAccountTags ?? []), N]);
+  const byId = new Map(campaigns.map((c) => [c.id, c]));
+
+  for (const id of campaignIds) {
+    const c = byId.get(id);
+    // A campaign's Instantly-only tags — exactly what campaignTagsOf sees before
+    // it falls back to the override.
+    const inst = normaliseTags([
+      ...((c?.instantlyTags ?? []) as string[]),
+      ...(byCampaign?.get(id) ?? []),
+    ]);
+    if (inst.length > 0) {
+      if (inst.includes(N)) result.alreadyEligible.push(id);
+      else result.ignoredInstantly.push(id); // Instantly wins — override is inert.
+      continue;
+    }
+    // No Instantly tag → the override takes effect. Append, dedup, keep any
+    // niche this campaign was already bridged into.
+    const merged = normaliseTags([...(overrides[id] ?? "").split(","), N]);
+    overrides[id] = merged.join(",");
+    result.changed.push(id);
+  }
+  return result;
 }

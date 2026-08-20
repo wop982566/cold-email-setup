@@ -224,6 +224,43 @@ all** runs the check across every inbox at once. The stat cards summarise
 coverage: total inboxes, how many are tagged (swap-eligible), how many are not,
 and how many campaigns carry a tag.
 
+**Matching is an exact tag comparison, so "no campaign matches" has three
+distinct causes** — and the tab now names which one you hit: the account has no
+tag; the account's tag doesn't equal any campaign's tag (e.g. you typed
+`FOR AEO CAMPAIGN` but the campaign's tag is `AEO`); or **no campaign has a tag
+at all** (the usual case when Instantly's custom-tags endpoint returns nothing),
+in which case tagging the inbox can never help until the campaigns get tags. A
+collapsible **Campaign tags** reference lists every campaign and its current
+tag(s), so a mismatch is always visible.
+
+**Match… — the manual binding.** When you can't rely on Instantly's tags, the
+**Match…** button on any account opens a picker of every campaign (each showing
+its current tag) plus a niche field. Confirming gives the account and the
+campaigns you tick a **shared niche tag**: it writes the niche to the account's
+`mailbox_tags` row and to each chosen campaign's `campaign_group_overrides`
+entry. Because the swapper resolves a campaign's niche as *Instantly tag →
+`campaign_group_overrides` → untagged* and gates on `eligibleFor`, the account
+is immediately swap-eligible for those campaigns **and every sibling sharing the
+niche** — in both the Maintenance tab and the daily cron, with no change to the
+swap-decision code. One caveat, surfaced in the UI: a campaign already tagged in
+Instantly keeps that tag (Instantly wins over the override), so Match leaves it
+untouched and tells you to retag it in Instantly instead.
+
+**IMAP/SMTP per account.** Each row shows, under the address, the IMAP login it
+uses (SMTP in the tooltip), tagged **live** when Instantly reports it or
+**setup log** when the value is reconstructed from the credential profile that
+created the mailbox — the app knows which `mail_profiles` profile made each
+address (via the batch's `created_emails`) and expands its `{prefix}/{domain}`
+username template with the mailbox's own local-part and domain. Live wins per
+field; the log only fills gaps, because an IMAP you changed in Instantly is the
+truth and the creation-time log may be stale. Passwords are never read from
+either source. A per-row **raw** expander shows the account's raw JSON so any
+IMAP key the mapper doesn't yet recognise is discoverable, and **Load IMAP
+details** backfills from `account-detail` on demand. The `mail_profiles` source
+needs `APP_FUNCTION_TOKEN` (the table is gated); without it, only the live value
+shows. The Plan tab's **Accounts by IMAP** card renders the same grouping as a
+clean table.
+
 ---
 
 ## 💾 Bulk setup batches

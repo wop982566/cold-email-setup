@@ -30,7 +30,7 @@ import {
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
 import { useCollection, useInsert, useSettings, useSaveSettings, useUpdate } from "../lib/hooks";
-import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag } from "../lib/types";
+import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch } from "../lib/types";
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
@@ -51,6 +51,8 @@ import {
   mergeCredsFromDetail,
   emailsMissingImap,
   hasImapDetail,
+  credsFromBatches,
+  mergeCredsPreferLive,
   type AccountCreds,
 } from "../lib/accountCreds";
 import { computeSendingHealth } from "../lib/sendingHealth";
@@ -251,7 +253,39 @@ export default function Planner() {
     for (const [email, c] of detailCreds) merged = mergeCredsFromDetail(merged, email, { imap_host: c.imapHost, imap_username: c.imapUsername, imap_port: c.imapPort, smtp_host: c.smtpHost, smtp_username: c.smtpUsername, smtp_port: c.smtpPort });
     return merged;
   }, [acctQ.data, detailCreds]);
-  const imapGroups = useMemo(() => groupByImap(creds), [creds]);
+  // The setup log as a second creds source: which credential profile created
+  // each mailbox tells us the IMAP/SMTP it was born with, for accounts whose
+  // live payload omits it. mail_profiles is gated behind APP_FUNCTION_TOKEN, so
+  // it may 403 — retry:false keeps that from spamming, and we degrade to live.
+  const batchesQ = useCollection<SetupBatch>(TABLES.setupBatches);
+  const profilesQ = useCollection<MailProfile>(TABLES.mailProfiles, { retry: false });
+  const profilesById = useMemo(
+    () => new Map((profilesQ.data ?? []).map((p) => [p.id, p])),
+    [profilesQ.data],
+  );
+  const logCreds = useMemo(
+    () => credsFromBatches(batchesQ.data ?? [], profilesById),
+    [batchesQ.data, profilesById],
+  );
+  // Live wins per field; the setup log fills gaps. Labelled per account so a
+  // mailbox whose IMAP was changed in Instantly reads as live, not stale.
+  const credsByEmail = useMemo(() => mergeCredsPreferLive(creds, logCreds), [creds, logCreds]);
+  const imapGroups = useMemo(
+    () => groupByImap(new Map([...credsByEmail].map(([e, v]) => [e, v.creds]))),
+    [credsByEmail],
+  );
+  // Raw account JSON, so the tab's expander can reveal any IMAP key the mapper
+  // doesn't yet catch (passwords are already scrubbed server-side).
+  const rawAccountsByEmail = useMemo(() => {
+    const m = new Map<string, Record<string, unknown>>();
+    if (acctQ.data?.ok) {
+      for (const a of asItems<Record<string, unknown>>(acctQ.data.data)) {
+        const e = String(a.email ?? "").trim().toLowerCase();
+        if (e) m.set(e, a);
+      }
+    }
+    return m;
+  }, [acctQ.data]);
 
   // When the list didn't carry IMAP, fetch it per account (scrubbed) on demand.
   async function loadImapDetails() {
@@ -502,6 +536,12 @@ export default function Planner() {
           instantlyTagsByEmail={tagAssignments.byEmail}
           instantlyTagsByCampaign={tagAssignments.byCampaign}
           allInstantlyTags={tagAssignments.all}
+          onPatchSettings={patchSettings}
+          credsByEmail={credsByEmail}
+          rawAccountsByEmail={rawAccountsByEmail}
+          onLoadImap={() => void loadImapDetails()}
+          loadingImap={loadingImap}
+          canLoadImap={!hasImapDetail(creds) || emailsMissingImap(creds).length > 0}
         />
       ) : (
       <>
@@ -789,28 +829,42 @@ export default function Planner() {
       {/* Accounts grouped by the IMAP login they share — so you can see which
           inboxes are on which mailbox, at a glance, after changing an IMAP. */}
       {imapGroups.length > 0 ? (
-        <Card className="p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-base font-extrabold">Accounts by IMAP</h3>
+        <Card className="overflow-hidden p-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b-2 border-ink p-4">
+            <div>
+              <h3 className="text-base font-extrabold">Accounts by IMAP</h3>
+              <p className="mt-0.5 text-xs text-muted">
+                Which login each inbox is on — live from Instantly, filled from your setup log where the
+                API doesn't report it. Passwords are never shown.
+              </p>
+            </div>
             {!hasImapDetail(creds) || emailsMissingImap(creds).length > 0 ? (
               <button className="btn-ghost btn-sm" onClick={() => void loadImapDetails()} disabled={loadingImap}>
                 {loadingImap ? <Spinner /> : <RefreshCw size={14} />} Load IMAP details
               </button>
             ) : null}
           </div>
-          <p className="mt-0.5 text-xs text-muted">
-            Which inbox each account is on. Live from Instantly — passwords are never shown.
-          </p>
-          <div className="mt-3 space-y-2">
-            {imapGroups.map((g) => (
-              <div key={g.identity} className="rounded-lg border-2 border-ink bg-canvas p-2 text-xs">
-                <p className="font-bold">
-                  {g.identity}{" "}
-                  <span className="font-normal text-muted">· {g.emails.length} inbox{g.emails.length === 1 ? "" : "es"}</span>
-                </p>
-                <p className="mt-1 break-words text-[11px] text-muted">{g.emails.join(", ")}</p>
-              </div>
-            ))}
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+              <thead>
+                <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
+                  <th className="px-3 py-2">IMAP login</th>
+                  <th className="w-20 px-3 py-2">Inboxes</th>
+                  <th className="px-3 py-2">Addresses</th>
+                </tr>
+              </thead>
+              <tbody>
+                {imapGroups.map((g) => (
+                  <tr key={g.identity} className="border-b border-ink/10 align-top">
+                    <td className="px-3 py-2 font-semibold">{g.identity}</td>
+                    <td className="px-3 py-2 text-muted">{g.emails.length}</td>
+                    <td className="px-3 py-2 text-[11px] text-muted">
+                      <span className="break-words">{g.emails.join(", ")}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </Card>
       ) : null}
@@ -927,7 +981,8 @@ export default function Planner() {
                         so a changed IMAP is visible per account. No password. */}
                     <td className="px-3 py-2 text-xs">
                       {(() => {
-                        const c = creds.get(b.email.toLowerCase());
+                        const cw = credsByEmail.get(b.email.toLowerCase());
+                        const c = cw?.creds;
                         if (!c || (!c.imapHost && !c.imapUsername)) {
                           return <span className="text-muted">—</span>;
                         }
@@ -936,7 +991,8 @@ export default function Planner() {
                             className="line-clamp-2"
                             title={
                               `IMAP: ${c.imapUsername ?? "?"} @ ${c.imapHost ?? "?"}${c.imapPort ? ":" + c.imapPort : ""}\n` +
-                              `SMTP: ${c.smtpUsername ?? "?"} @ ${c.smtpHost ?? "?"}${c.smtpPort ? ":" + c.smtpPort : ""}`
+                              `SMTP: ${c.smtpUsername ?? "?"} @ ${c.smtpHost ?? "?"}${c.smtpPort ? ":" + c.smtpPort : ""}\n` +
+                              `source: ${cw?.source === "live" ? "live Instantly" : "setup log"}`
                             }
                           >
                             {c.imapUsername ?? c.imapHost}
