@@ -56,6 +56,7 @@ import {
 import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
+import { AccountsTab } from "../components/planner/AccountsTab";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
 import { cn } from "../lib/utils";
@@ -104,7 +105,7 @@ export default function Planner() {
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
-  const [tab, setTab] = useState<"plan" | "maintenance">("plan");
+  const [tab, setTab] = useState<"plan" | "maintenance" | "accounts">("plan");
 
   // Same keys as the Instantly page and the Sending Health card, so all three
   // share one fetch and the Instantly Refresh button invalidates them.
@@ -466,7 +467,7 @@ export default function Planner() {
       ) : null}
 
       <div className="flex rounded-xl border-2 border-ink">
-        {([["plan", "Plan"], ["maintenance", "Maintenance"]] as const).map(([k, label]) => (
+        {([["plan", "Plan"], ["maintenance", "Maintenance"], ["accounts", "Accounts"]] as const).map(([k, label]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
@@ -492,6 +493,15 @@ export default function Planner() {
           healthByEmail={healthByEmail}
           onApplied={refresh}
           onExclude={(email) => void toggleExclude(email)}
+        />
+      ) : tab === "accounts" ? (
+        <AccountsTab
+          emails={placementEmails}
+          campaigns={p.campaigns}
+          overrides={settings?.campaign_group_overrides ?? {}}
+          instantlyTagsByEmail={tagAssignments.byEmail}
+          instantlyTagsByCampaign={tagAssignments.byCampaign}
+          allInstantlyTags={tagAssignments.all}
         />
       ) : (
       <>

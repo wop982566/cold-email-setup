@@ -197,6 +197,33 @@ reported as their own outcome in the Maintenance tab, the dry run and the daily
 email, rather than looking like a quiet day. If gating is ever off (no tag map
 supplied), the tab says so in red.
 
+### The Accounts tab
+
+The Campaign Planner's **Accounts** tab is where you tag inboxes and confirm
+what a tag buys them. It lists **every** connected inbox — tagged and untagged
+in one table, untagged surfaced first because those are the ones that can't be
+swapped. Each row shows its current niche (or an `untagged` flag), a picker to
+attach or change one, and — after you press **Verify** — the exact campaigns
+that inbox is eligible to be swapped into.
+
+The picker's options are **fetched live from Instantly**: every tag seen on your
+campaigns and accounts, plus any niche your campaigns already use, plus anything
+already assigned in the app. Saving writes the tag to `mailbox_tags` — the same
+table the swapper reads — so a tag set here takes effect immediately, and
+changing a tag clears its stale verification so you re-verify against the new
+niche.
+
+**Verify uses the swapper's own rule**, not a second opinion. Eligibility is
+computed with the same `campaignTagsOf` resolution and `eligibleFor`
+intersection the Maintenance tab and the daily cron use
+(`src/lib/accountsTag.ts` is built on those primitives), so a campaign appears
+as eligible here **if and only if** a swap would actually be allowed into it. An
+untagged account verifies to nothing, and a tagged account that matches no
+campaign's tag says so rather than showing an empty column ambiguously. **Verify
+all** runs the check across every inbox at once. The stat cards summarise
+coverage: total inboxes, how many are tagged (swap-eligible), how many are not,
+and how many campaigns carry a tag.
+
 ---
 
 ## 💾 Bulk setup batches
