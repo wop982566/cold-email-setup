@@ -33,7 +33,9 @@ import { useCollection, useInsert, useSettings, useSaveSettings, useUpdate } fro
 import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch } from "../lib/types";
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
-import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
+import { computePlan, perUnitMonthly, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
+import { resolveCampaignTags } from "../lib/accountsTag";
+import { computeGrowthPlan } from "../lib/growthPlan";
 import { aggregateLeadCounts, type LeadStatusCounts } from "../lib/leadStatus";
 import { instantly, asItems } from "../lib/instantly";
 import {
@@ -363,6 +365,45 @@ export default function Planner() {
     });
   }, [plan, domains, settings, placementHealthInput, recovering, tagMap, tagAssignments]);
 
+  // The growth calculator: sizes the whole fleet (campaigns, sending inboxes,
+  // per-niche spares, domains) for the goal, against what already exists. The
+  // niches and current spare counts come from the tag system; the rest are
+  // plain plan totals fed into the pure computeGrowthPlan.
+  const growth = useMemo(() => {
+    if (!plan || !settings) return null;
+    const activeCamps = plan.campaigns.filter((c) => c.active);
+    const resolvedCamps = resolveCampaignTags(
+      activeCamps,
+      settings.campaign_group_overrides ?? {},
+      tagAssignments.byCampaign,
+    );
+    const niches = [...new Set(resolvedCamps.flatMap((c) => c.tags))];
+    // A healthy spare tagged AEO counts toward the AEO buffer; untagged spares
+    // count toward no niche (they can't be swapped anywhere until tagged).
+    const currentSparesByNiche: Record<string, number> = {};
+    for (const cand of maintenance?.candidates ?? []) {
+      for (const t of tagsFor(tagMap, cand.box.email)) {
+        currentSparesByNiche[t] = (currentSparesByNiche[t] ?? 0) + 1;
+      }
+    }
+    return computeGrowthPlan({
+      goalPerDay: plan.goal.emailsPerDay,
+      perCampaignLimit: Math.max(0, settings.planner_per_campaign_limit ?? 200),
+      perMailboxLimit: plan.perBoxCap,
+      mailboxesPerDomain: Math.max(1, settings.emails_per_domain || 1),
+      sparesPerNiche: Math.max(0, settings.planner_spares_per_niche ?? 2),
+      niches,
+      currentSparesByNiche,
+      activeCampaigns: activeCamps.length,
+      configuredDemand: plan.totalDemand,
+      usableInboxes: plan.usableInboxes,
+      currentSupply: plan.totalSupply,
+      providerCeiling: plan.goal.providerCeiling,
+      costPerDomainMonthly: perUnitMonthly(costs, "Domains"),
+      costPerMailboxMonthly: perUnitMonthly(costs, "Email Infrastructure"),
+    });
+  }, [plan, settings, tagMap, tagAssignments, maintenance, costs]);
+
   const healthByEmail = useMemo(() => {
     const m = new Map<string, MailboxHealth>();
     for (const h of maintenance?.mailboxes ?? []) m.set(h.box.email, h);
@@ -517,6 +558,7 @@ export default function Planner() {
 
   const p = plan;
   const gapTone = p.totalGap > 0 ? "danger" : "mint";
+  const activeCampaignCount = p.campaigns.filter((c) => c.active).length;
   // Instantly links campaigns to mailboxes by address (email_list); resolve the
   // ids back to names so the mailbox table can name the campaigns it serves.
   const campaignName = new Map(p.campaigns.map((c) => [c.id, c.name]));
@@ -689,11 +731,15 @@ export default function Planner() {
         </p>
       </Card>
 
-      {/* Goal planner */}
+      {/* Growth calculator */}
       <Card className="p-5">
-        <h3 className="mb-3 flex items-center gap-2 text-lg">
-          <Target size={18} /> Goal planner
+        <h3 className="mb-1 flex items-center gap-2 text-lg">
+          <Target size={18} /> Growth calculator
         </h3>
+        <p className="mb-3 text-xs text-muted">
+          Size the whole fleet for your daily goal against what you already run — campaigns,
+          sending inboxes, per-niche spares, and the domains to host them.
+        </p>
         <div className="flex flex-wrap items-end gap-3">
           <div>
             <p className="label">I want to</p>
@@ -707,72 +753,156 @@ export default function Planner() {
                     p.goal.kind === k ? "bg-ink text-paper" : "bg-paper hover:bg-canvas",
                   )}
                 >
-                  {k === "emails" ? "Send emails / day" : "Contact new leads / day"}
+                  {k === "emails" ? "Send emails / day" : "Contact leads / day"}
                 </button>
               ))}
             </div>
           </div>
           <div>
-            <p className="label">Target</p>
+            <p className="label">{p.goal.kind === "leads" ? "Leads / day" : "Emails / day"}</p>
             <input
               type="number"
               min={0}
-              className="input w-32"
+              className="input w-28"
               defaultValue={p.goal.value}
               onBlur={(e) => void patchSettings({ planner_goal_value: Number(e.target.value) || 0 })}
             />
           </div>
+          <div>
+            <p className="label">Limit / campaign</p>
+            <input
+              type="number"
+              min={0}
+              className="input w-28"
+              defaultValue={settings.planner_per_campaign_limit}
+              onBlur={(e) => void patchSettings({ planner_per_campaign_limit: Math.max(0, Number(e.target.value) || 0) })}
+            />
+          </div>
+          <div>
+            <p className="label">Inboxes / domain</p>
+            <input
+              type="number"
+              min={1}
+              max={3}
+              className="input w-24"
+              defaultValue={settings.emails_per_domain}
+              onBlur={(e) => void patchSettings({ emails_per_domain: Math.min(3, Math.max(1, Number(e.target.value) || 1)) })}
+            />
+          </div>
+          <div>
+            <p className="label">Spares / niche</p>
+            <input
+              type="number"
+              min={0}
+              className="input w-24"
+              defaultValue={settings.planner_spares_per_niche}
+              onBlur={(e) => void patchSettings({ planner_spares_per_niche: Math.max(0, Number(e.target.value) || 0) })}
+            />
+          </div>
         </div>
 
-        <div className="mt-4 rounded-xl border-2 border-ink bg-pink/20 p-4 text-sm">
-          {p.goal.value <= 0 ? (
-            <p>Enter a target to size the infrastructure you'd need.</p>
-          ) : (
-            <>
-              <p>
-                To {p.goal.kind === "leads" ? "contact" : "send"}{" "}
-                <span className="font-extrabold">
-                  {fmtNumber(p.goal.value)} {p.goal.kind === "leads" ? "new leads" : "emails"}/day
-                </span>
-                {p.goal.kind === "leads" ? (
-                  <>
-                    {" "}you need <span className="font-extrabold">{fmtNumber(p.goal.emailsPerDay)} emails/day</span>{" "}
-                    once follow-ups are flowing ({settings.default_sends_per_lead} touches per lead)
-                  </>
-                ) : (
-                  <>
-                    {" "}you'd be contacting about{" "}
-                    <span className="font-extrabold">{fmtNumber(p.goal.newLeadsPerDay)} new leads/day</span>
-                  </>
-                )}
-                .
+        {p.goal.value <= 0 || !growth ? (
+          <div className="mt-4 rounded-xl border-2 border-ink bg-pink/20 p-4 text-sm">
+            Enter a goal to size the campaigns, inboxes, spares and domains you'd need.
+          </div>
+        ) : (
+          <div className="mt-4 space-y-3">
+            <div className="rounded-xl border-2 border-ink bg-pink/20 p-4 text-sm">
+              To send <b>{fmtNumber(growth.goalPerDay)} emails/day</b>
+              {p.goal.kind === "leads" ? <> (~{fmtNumber(p.goal.newLeadsPerDay)} new leads/day)</> : null}: your{" "}
+              <b>{activeCampaignCount}</b> active campaign{activeCampaignCount === 1 ? "" : "s"} allow{" "}
+              <b>{fmtNumber(p.totalDemand)}/day</b> →{" "}
+              {growth.demandGap > 0 ? (
+                <span className="font-extrabold">{fmtNumber(growth.demandGap)} more emails/day needed</span>
+              ) : (
+                <span className="font-extrabold">already configured for the goal</span>
+              )}
+              .
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <StatCard
+                label="Campaigns"
+                value={growth.campaignsRequired}
+                sublabel={growth.campaignsToAdd > 0 ? `add ${growth.campaignsToAdd} (have ${activeCampaignCount})` : "you have enough"}
+                tone="pink"
+              />
+              <StatCard
+                label="Sending inboxes"
+                value={growth.sendingMailboxesRequired}
+                sublabel={`at ${fmtNumber(p.perBoxCap)}/day each`}
+                tone="sky"
+              />
+              <StatCard
+                label="Inboxes to add"
+                value={growth.mailboxesToAdd}
+                sublabel={
+                  growth.mailboxesToAdd > 0
+                    ? `~${growth.domainsToAdd} domain${growth.domainsToAdd === 1 ? "" : "s"} @ ${settings.emails_per_domain}/domain`
+                    : "your fleet is enough"
+                }
+                tone="mint"
+              />
+              <StatCard
+                label="Healthy spares"
+                value={growth.spareMailboxesRequired}
+                sublabel={growth.spareShortfall > 0 ? `${growth.spareShortfall} more to tag` : "buffer met"}
+                tone="sun"
+              />
+            </div>
+
+            {growth.spares.length > 0 ? (
+              <div className="overflow-hidden rounded-xl border-2 border-ink">
+                <table className="w-full border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
+                      <th className="px-3 py-2">Niche</th>
+                      <th className="w-28 px-3 py-2">Healthy spares</th>
+                      <th className="w-20 px-3 py-2">Keep</th>
+                      <th className="w-20 px-3 py-2">Add</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {growth.spares.map((s) => (
+                      <tr key={s.niche} className="border-b border-ink/10">
+                        <td className="px-3 py-2"><Badge tone="sky">{s.niche}</Badge></td>
+                        <td className="px-3 py-2">{s.current}</td>
+                        <td className="px-3 py-2">{s.target}</td>
+                        <td className="px-3 py-2">
+                          {s.shortfall > 0 ? <b className="text-danger">+{s.shortfall}</b> : <span className="text-muted">—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="border-t border-ink/10 px-3 py-2 text-[11px] text-muted">
+                  A spare only replaces a mailbox in a campaign of its own niche, so keep a buffer
+                  per niche. Tag spares on the <b>Accounts</b> tab; untagged spares count for none.
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-muted">
+                No campaign niches yet — tag your campaigns (Accounts tab) to size a per-niche spare buffer.
               </p>
-              <p className="mt-1">
-                That needs <span className="font-extrabold">{p.goal.inboxesRequired} inboxes</span> at{" "}
-                {fmtNumber(p.perBoxCap)}/day. You have {p.usableInboxes} usable →{" "}
-                {p.goal.inboxesToAdd > 0 ? (
-                  <span className="font-extrabold">
-                    add {p.goal.inboxesToAdd} inboxes (~{p.goal.domainsToAdd} domains)
-                  </span>
-                ) : (
-                  <span className="font-extrabold">you already have enough</span>
-                )}
-                {p.goal.monthlyCostAdd !== null && p.goal.inboxesToAdd > 0
-                  ? ` — about ${fmtMoney(p.goal.monthlyCostAdd, currency)}/mo more`
-                  : ""}
-                .
-              </p>
-              <p className="mt-1 text-muted">
-                {p.goal.inboxesToAdd > 0
-                  ? `New inboxes need roughly ${p.goal.daysToReady} days of warmup before they carry full volume. `
-                  : ""}
-                {p.goal.providerOk
-                  ? `Your provider caps allow it (ceiling ${fmtNumber(p.goal.providerCeiling)}/day).`
-                  : `⚠ This exceeds your provider ceiling of ${fmtNumber(p.goal.providerCeiling)}/day — raise the plan or SES limit too.`}
-              </p>
-            </>
-          )}
-        </div>
+            )}
+
+            <p className="text-xs text-muted">
+              {growth.mailboxesToAdd > 0 && growth.monthlyCostAdd !== null
+                ? `Adding ${growth.mailboxesToAdd} inboxes across ${growth.domainsToAdd} domains ≈ ${fmtMoney(growth.monthlyCostAdd, currency)}/mo more. `
+                : ""}
+              {growth.mailboxesToAdd > 0 ? `New inboxes need roughly ${p.goal.daysToReady} days of warmup first. ` : ""}
+              {settings.emails_per_domain > 2
+                ? "Note: domain records store 2 mailbox slots today, so 3/domain is a planning target. "
+                : ""}
+              {growth.providerOk
+                ? `Provider caps allow it${growth.providerCeiling > 0 ? ` (ceiling ${fmtNumber(growth.providerCeiling)}/day)` : ""}.`
+                : `⚠ This exceeds your provider ceiling of ${fmtNumber(growth.providerCeiling)}/day — raise the plan or SES limit too.`}
+              {growth.supplyGap > 0
+                ? ` Your mailboxes currently supply ${fmtNumber(p.totalSupply)}/day — ${fmtNumber(growth.supplyGap)}/day short of the goal even before adding campaigns.`
+                : ""}
+            </p>
+          </div>
+        )}
       </Card>
 
       {/* Actions */}

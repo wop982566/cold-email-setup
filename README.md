@@ -18,7 +18,7 @@ for domain-expiry lookups and AI enrichment.
 | **Dashboard** | KPIs, sending-capacity utilisation, domains-by-campaign, expiry alerts, setup readiness. |
 | **Domains** | Every field from your sheet (emails, expiry, registrar, DNS, forwarding, hosting account, Gravatar, Gmail send-as, Instantly, warmup). Search/filter, CSV import/export, **auto-fetch expiry** (RDAP/WHOIS) with manual fallback, per-domain mailbox limits, custom fields. |
 | **Sending Capacity** | The real ceiling = **min(mailbox capacity, SES cap, Instantly cap)**. Per-mailbox daily limits (global + per-domain overrides), bottleneck breakdown, "how many domains to max out SES", leads/month throughput. Fully editable provider limits. |
-| **Campaign Planner** | Per-campaign-group demand vs mailbox supply from live Instantly data (contention-aware), lead runway, idle mailboxes, mailbox exclusions, and a goal planner: \"to send N emails/day you need X inboxes across Y domains\". |
+| **Campaign Planner** | Per-campaign-group demand vs mailbox supply from live Instantly data (contention-aware), lead runway, idle mailboxes, mailbox exclusions, and a **growth calculator**: from a daily-send goal + per-campaign limit it sizes the whole fleet — campaigns to add, sending inboxes, healthy spares to keep **per niche**, and domains (up to 3 inboxes/domain) — against what you already run. |
 | **Leads** | Master list + nested **sub-lists**, advanced filters (status, industry, score, hide-already-used), **dedupe**, bulk move/tag/status, **make sub-list from selection**, CSV import (auto-dedupes on email), **AI enrichment (ChatGPT)** + **manual enrichment**. |
 | **Costs** | Track domains, SES, Instantly, hosting, AI, etc. Monthly/annual totals, cost-per-domain, cost-per-1k-emails, spend-by-category, upcoming renewals. |
 | **Setup Playbooks** | Named, dated, step-by-step record of how a setup was built — registrar → DNS → SES → forwarding → sites → Gmail send-as → Instantly → warmup, with platforms, accounts and links. Seeded with your current 2026 setup. |
@@ -276,6 +276,39 @@ details** backfills from `account-detail` on demand. The `mail_profiles` source
 needs `APP_FUNCTION_TOKEN` (the table is gated); without it, only the live value
 shows. The Plan tab's **Accounts by IMAP** card renders the same grouping as a
 clean table.
+
+---
+
+## 📈 Growth calculator
+
+On the Planner's **Plan** tab, the growth calculator sizes the whole fleet for a
+daily-send goal against the structure you already run — all inputs dynamic and
+persisted. You give it four numbers: the **goal** (emails/day, or leads/day which
+it converts via your sends-per-lead), the **limit per campaign** (campaigns are
+capped, so a big goal needs several), the **inboxes per domain** (1–3 — you can
+safely stretch past the default 2), and the **healthy spares to keep per niche**.
+
+It then reports, live (`src/lib/growthPlan.ts`, pure + tested):
+
+- **Campaigns** — `ceil(goal ÷ per-campaign limit)` and how many more than your
+  active campaigns; plus the **emails/day gap** vs. what your active campaigns are
+  already configured to allow (`plan.totalDemand`).
+- **Sending inboxes** — `ceil(goal ÷ per-mailbox limit)` at your observed
+  `perBoxCap`.
+- **Healthy spares, per niche** — a small table of each campaign niche, the
+  healthy spares you currently have tagged for it, the target you set, and how many
+  more to tag. A spare only replaces a mailbox in a campaign of its own niche, so
+  the buffer is per-niche; untagged spares count for none. Current spares come from
+  the same "healthy spare" pool the swapper uses (`maintenance.candidates`).
+- **Inboxes & domains to add** — sending inboxes + the spare buffer, minus what you
+  already have, divided across domains at your chosen inboxes/domain — with a
+  monthly-cost estimate from your Costs, a warmup lead-time, and the
+  **provider-ceiling** check (won't let the goal exceed your tightest SES/Instantly
+  daily cap). If your live mailbox supply is short of the goal even before new
+  campaigns, it says so.
+
+(Domain records store two mailbox slots today, so 3/domain is a planning figure —
+the extra mailbox is created in Instantly but not yet tracked in the domain row.)
 
 ---
 

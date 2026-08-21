@@ -390,6 +390,8 @@ export interface AppSettings {
   campaign_group_overrides: Record<string, string>; // instantly campaign id -> group key
   planner_goal_kind: "emails" | "leads";
   planner_goal_value: number;
+  planner_per_campaign_limit: number; // daily cap you set per campaign (growth calc)
+  planner_spares_per_niche: number; // healthy spares to keep for each niche
   // --- Campaign maintenance ------------------------------------------------
   maintenance_min_warmup_score: number; // below this, a mature mailbox needs replacing
   maintenance_critical_score: number; // below this, pull it now
@@ -422,6 +424,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   campaign_group_overrides: {},
   planner_goal_kind: "emails",
   planner_goal_value: 500,
+  planner_per_campaign_limit: 200,
+  planner_spares_per_niche: 2,
   maintenance_min_warmup_score: 80,
   maintenance_critical_score: 50,
   maintenance_new_mailbox_days: 21,

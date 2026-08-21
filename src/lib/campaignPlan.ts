@@ -454,7 +454,7 @@ function isActiveAccount(a: Obj): boolean {
 
 // Per-unit monthly cost from the operator's own cost items, so estimates use
 // real pricing rather than a made-up figure.
-function perUnitMonthly(costs: CostItem[], category: string): number | null {
+export function perUnitMonthly(costs: CostItem[], category: string): number | null {
   const items = costs.filter((c) => c.active && c.category === category && c.quantity > 0);
   if (items.length === 0) return null;
   let total = 0;
