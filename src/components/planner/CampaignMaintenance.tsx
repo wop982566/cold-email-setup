@@ -13,6 +13,7 @@ import {
   Lock,
   Ban,
   Tag,
+  X,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, Details } from "../ui/primitives";
 import { ConfirmDialog } from "../ui/Modal";
@@ -72,6 +73,30 @@ function PlaceBadge({ email, placement }: { email: string; placement: PlacementM
     <Badge tone={tone} className={undefined}>
       {rate}% inbox
     </Badge>
+  );
+}
+
+/**
+ * A copy-pasteable email chip. Click the chip (or its Copy icon) to put the
+ * exact address on the clipboard, and the text is `select-all` so a single
+ * click highlights the whole thing — both so a swapped-in/out address can be
+ * pasted straight into Instantly to verify a test swap.
+ */
+function EmailChip({ email }: { email: string }) {
+  const toast = useToast();
+  return (
+    <button
+      type="button"
+      title="Copy to clipboard"
+      onClick={() => {
+        void navigator.clipboard?.writeText(email);
+        toast.push(`${email} copied`, "success");
+      }}
+      className="inline-flex items-center gap-1 rounded border border-ink/20 bg-white px-1.5 py-0.5 font-mono text-xs hover:bg-ink/5"
+    >
+      <span className="select-all">{email}</span>
+      <Copy size={12} className="shrink-0 opacity-60" />
+    </button>
   );
 }
 
@@ -152,6 +177,7 @@ export function CampaignMaintenance({
   const testSwapsQ = useCollection<TestSwapRecord>(TABLES.testSwaps);
   const insertTestSwap = useInsert<TestSwapRecord>(TABLES.testSwaps);
   const updateTestSwap = useUpdate<TestSwapRecord>(TABLES.testSwaps);
+  const removeTestSwap = useRemove(TABLES.testSwaps);
   const activeTests = (testSwapsQ.data ?? []).filter((t) => t.status === "active");
 
   const [testCampaignId, setTestCampaignId] = useState("");
@@ -164,6 +190,20 @@ export function CampaignMaintenance({
   const [confirmTest, setConfirmTest] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const revertingRef = useRef<Set<string>>(new Set());
+
+  // The banner spans the whole lifecycle: still-active tests plus recently
+  // reverted ones the user hasn't dismissed yet — so the confirmation that the
+  // original was put back stays on screen to be checked, not flashed and gone.
+  // Old reverted rows (from long-past tests) drop off via a recency window so
+  // they don't pile up; the ✕ button deletes the row for good.
+  const bannerTests = (testSwapsQ.data ?? [])
+    .filter(
+      (t) =>
+        t.status === "active" ||
+        (t.status === "reverted" &&
+          nowTick - Date.parse(t.started_at) < 12 * 60 * 60 * 1000),
+    )
+    .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
 
   // Function declaration (hoisted) so the tick effect below can call it.
   async function revertTest(rec: TestSwapRecord, opts?: { silent?: boolean }) {
@@ -595,27 +635,79 @@ export function CampaignMaintenance({
         </Card>
       ) : null}
 
-      {/* Active test swap(s) — always visible with a live countdown and a
-          manual revert, so a temporary swap is never left silently in place. */}
-      {activeTests.map((t) => {
+      {/* Test-swap lifecycle banner. While a test is live it shows a running
+          countdown and the two copy-pasteable addresses so the operator can
+          verify the change in the live campaign; when the timer expires it
+          shows "reverting…", and once the original is confirmed back it turns
+          green so they can check and then close it. Never flashed-and-gone. */}
+      {bannerTests.map((t) => {
         const remaining = Math.max(0, Date.parse(t.revert_at) - nowTick);
         const mm = Math.floor(remaining / 60000);
         const ss = Math.floor((remaining % 60000) / 1000);
+        const reverting = revertingRef.current.has(t.id);
+        const reverted = t.status === "reverted";
         return (
-          <Card key={t.id} className="flex flex-wrap items-center gap-2 border-ink bg-sun/30 p-3 text-sm">
-            <Zap size={15} className="shrink-0" />
-            <span className="font-bold">Test swap live in {t.campaignName}:</span>
-            <span>
-              <b>{t.swappedIn}</b> in place of <b>{t.swappedOut}</b> — auto-reverts in{" "}
-              <b>{mm}:{String(ss).padStart(2, "0")}</b>
-            </span>
-            <button
-              className="btn-ghost btn-sm ml-auto"
-              disabled={revertingRef.current.has(t.id)}
-              onClick={() => void revertTest(t)}
-            >
-              Revert now
-            </button>
+          <Card
+            key={t.id}
+            className={cn(
+              "flex flex-wrap items-center gap-2 p-3 text-sm",
+              reverted ? "border-mint bg-mint/10" : "border-ink bg-sun/30",
+            )}
+          >
+            {reverted ? (
+              <Check size={15} className="shrink-0" />
+            ) : (
+              <Zap size={15} className="shrink-0" />
+            )}
+            {reverted ? (
+              <>
+                <span className="font-bold">Test complete in {t.campaignName}.</span>
+                <span className="flex flex-wrap items-center gap-1">
+                  Original <EmailChip email={t.swappedOut} /> restored — paste it into the
+                  campaign to confirm it's back.
+                </span>
+                <span className="flex flex-wrap items-center gap-1 text-ink/60">
+                  (test spare <EmailChip email={t.swappedIn} /> removed)
+                </span>
+                <button
+                  className="btn-ghost btn-sm ml-auto"
+                  title="Dismiss this confirmation"
+                  disabled={removeTestSwap.isPending}
+                  onClick={() => void removeTestSwap.mutateAsync(t.id)}
+                >
+                  <X size={14} /> Close
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="font-bold">Test swap live in {t.campaignName}:</span>
+                <span className="flex flex-wrap items-center gap-1">
+                  <EmailChip email={t.swappedIn} /> in place of{" "}
+                  <EmailChip email={t.swappedOut} />
+                </span>
+                <span className="flex items-center gap-1">
+                  {reverting || remaining === 0 ? (
+                    <>
+                      <Spinner /> reverting…
+                    </>
+                  ) : (
+                    <>
+                      auto-reverts in{" "}
+                      <b>
+                        {mm}:{String(ss).padStart(2, "0")}
+                      </b>
+                    </>
+                  )}
+                </span>
+                <button
+                  className="btn-ghost btn-sm ml-auto"
+                  disabled={reverting}
+                  onClick={() => void revertTest(t)}
+                >
+                  Revert now
+                </button>
+              </>
+            )}
           </Card>
         );
       })}

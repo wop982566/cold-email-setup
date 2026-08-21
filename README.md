@@ -178,9 +178,14 @@ any setting; a spare admitted only because you relaxed a gate is flagged.
 
 The revert is guaranteed three ways: a client timer, an on-load reconcile (so
 closing and reopening the tab still reverts), and a **daily-cron backstop**
-(`_autoSwapRun.ts` reverts any test left `active` past its time). An active test
-shows a live countdown banner with a manual **Revert now**. Requires
-`INSTANTLY_WRITE_ENABLED`; it's behind a confirm that states it's a real change.
+(`_autoSwapRun.ts` reverts any test left `active` past its time). A banner
+follows the whole lifecycle: while the test is live it shows a running countdown
+plus both swapped addresses as **one-click copy** chips (paste them into
+Instantly to verify the change), a manual **Revert now**, then a *reverting…*
+state when the timer expires. Once the original is *confirmed* back it turns
+green — "original restored" with the address still copyable to check — and you
+**close** the bar to dismiss it. Requires `INSTANTLY_WRITE_ENABLED`; it's behind
+a confirm that states it's a real change.
 
 ---
 
