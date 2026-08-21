@@ -15,9 +15,12 @@ import {
   Tag,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, Details } from "../ui/primitives";
+import { ConfirmDialog } from "../ui/Modal";
 import { useToast } from "../ui/toast";
 import type { Maintenance, MailboxHealth, SwapProposal } from "../../lib/mailboxHealth";
 import { Plan } from "../../lib/campaignPlan";
+import { buildTestSwap, type TestGates, type TestSwapPlan } from "../../lib/testSwap";
+import { campaignTagsOf, type TagMap } from "../../lib/tags";
 import type { PlacementMap } from "../../lib/placement";
 import { useQuery } from "@tanstack/react-query";
 import { instantly } from "../../lib/instantly";
@@ -42,7 +45,7 @@ import {
 import { SwapArchive } from "./SwapArchive";
 import { AutoSwapLog } from "./AutoSwapLog";
 import { useCollection, useInsert, useRemove, useRemoveMany, useUpdate } from "../../lib/hooks";
-import { AppSettings, AutoSwapRun, RecoveryEntry, TABLES } from "../../lib/types";
+import { AppSettings, AutoSwapRun, RecoveryEntry, TestSwapRecord, TABLES } from "../../lib/types";
 import { fmtNumber } from "../../lib/format";
 import { cn } from "../../lib/utils";
 import { RecoveryPanel } from "./RecoveryPanel";
@@ -83,6 +86,10 @@ export function CampaignMaintenance({
   healthByEmail,
   onApplied,
   onExclude,
+  tagMap,
+  campaignTagsById,
+  overrides,
+  recovering,
 }: {
   plan: Plan;
   // Computed once by the page and shared with the per-campaign breakdown, so
@@ -97,6 +104,11 @@ export function CampaignMaintenance({
   onApplied: () => void;
   /** Stop counting a mailbox anywhere in the planner. */
   onExclude: (email: string) => void;
+  /** For the test-swap harness — the same inputs the real swap decision uses. */
+  tagMap: TagMap;
+  campaignTagsById: Map<string, string[]>;
+  overrides: Record<string, string>;
+  recovering: Set<string>;
 }) {
   const toast = useToast();
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -133,6 +145,119 @@ export function CampaignMaintenance({
   const m = maintenance;
   const minScore =
     (settings as unknown as Record<string, number>).maintenance_min_warmup_score ?? 80;
+
+  // -------------------------------------------------------------------------
+  // Test-swap harness: a real, self-reverting swap to prove the automation.
+  // -------------------------------------------------------------------------
+  const testSwapsQ = useCollection<TestSwapRecord>(TABLES.testSwaps);
+  const insertTestSwap = useInsert<TestSwapRecord>(TABLES.testSwaps);
+  const updateTestSwap = useUpdate<TestSwapRecord>(TABLES.testSwaps);
+  const activeTests = (testSwapsQ.data ?? []).filter((t) => t.status === "active");
+
+  const [testCampaignId, setTestCampaignId] = useState("");
+  const [testGates, setTestGates] = useState<TestGates>({
+    ignoreNiche: false, ignoreWarmupScore: false, allowImmature: false, includeRecovering: false,
+  });
+  const [testMinutes, setTestMinutes] = useState(2);
+  const [testPlan, setTestPlan] = useState<TestSwapPlan | null>(null);
+  const [testBusy, setTestBusy] = useState(false);
+  const [confirmTest, setConfirmTest] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const revertingRef = useRef<Set<string>>(new Set());
+
+  // Function declaration (hoisted) so the tick effect below can call it.
+  async function revertTest(rec: TestSwapRecord, opts?: { silent?: boolean }) {
+    if (revertingRef.current.has(rec.id)) return;
+    revertingRef.current.add(rec.id);
+    try {
+      // The exact inverse: pull the spare back out, put the original back in.
+      const res = await instantly.setCampaignEmails({
+        campaignId: rec.campaignId, remove: rec.swappedIn, add: rec.swappedOut,
+      });
+      const verdict = classifyWrite(res, `revert ${rec.campaignName}`);
+      // Confirmed, or the campaign already lacks the swapped-in box (someone/
+      // something reverted it) — either way the original is back.
+      const alreadyBack = !res.ok && /not\b|present|current/i.test(res.error ?? "");
+      if (verdict.confirmed || alreadyBack) {
+        await updateTestSwap.mutateAsync({ id: rec.id, patch: { status: "reverted" } });
+        if (!opts?.silent) toast.push(`Test swap reverted — ${rec.swappedOut} back in ${rec.campaignName}`, "success");
+        onApplied();
+      } else if (!opts?.silent) {
+        toast.push(`Couldn't revert the test swap — ${verdict.message}. ${formatAttempts(res, "revert")}`, "error");
+      }
+    } finally {
+      revertingRef.current.delete(rec.id);
+    }
+  }
+
+  // One 1s tick: updates the countdown AND reverts any test past its time —
+  // covers the normal timer and reconciling a test left over from a closed tab.
+  useEffect(() => {
+    const tick = () => {
+      setNowTick(Date.now());
+      for (const rec of (testSwapsQ.data ?? []).filter((t) => t.status === "active")) {
+        if (Date.parse(rec.revert_at) <= Date.now()) void revertTest(rec);
+      }
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [testSwapsQ.data]);
+
+  function runTestPreview() {
+    if (!m) return;
+    const camp = plan.campaigns.find((c) => c.id === testCampaignId);
+    if (!camp) { toast.push("Pick a campaign first", "error"); return; }
+    const campaignTags = campaignTagsOf(
+      { id: camp.id, name: camp.name, instantlyTags: [...camp.instantlyTags, ...(campaignTagsById.get(camp.id) ?? [])] },
+      overrides,
+    );
+    const result = buildTestSwap({
+      mailboxes: m.mailboxes,
+      campaignEmails: camp.emails,
+      campaignTags,
+      gates: testGates,
+      tagMap,
+      recovering,
+      minScore,
+    });
+    setTestPlan(result);
+    if (!result.bad) toast.push(`No failing mailbox in ${camp.name} right now — nothing to test-swap.`, "info");
+    else if (!result.spare) toast.push("Found a failing mailbox but no eligible spare — relax a gate or tag more spares.", "info");
+  }
+
+  async function applyTestSwap() {
+    const camp = plan.campaigns.find((c) => c.id === testCampaignId);
+    if (!camp || !testPlan?.bad || !testPlan?.spare) return;
+    setTestBusy(true);
+    try {
+      const res = await instantly.setCampaignEmails({
+        campaignId: camp.id, remove: testPlan.bad.email, add: testPlan.spare.email, expectedList: camp.emails,
+      });
+      const verdict = classifyWrite(res, `test swap ${camp.name}`);
+      if (!verdict.confirmed) {
+        toast.push(`Test swap not applied — ${verdict.message}. ${formatAttempts(res, "test swap")}`, "error");
+        return;
+      }
+      const mins = Math.max(1, Math.min(60, Math.round(testMinutes) || 2));
+      await insertTestSwap.mutateAsync({
+        campaignId: camp.id, campaignName: camp.name,
+        swappedOut: testPlan.bad.email, swappedIn: testPlan.spare.email,
+        started_at: new Date().toISOString(),
+        revert_at: new Date(Date.now() + mins * 60_000).toISOString(),
+        status: "active",
+      } as Partial<TestSwapRecord>);
+      toast.push(`Test swap live: ${testPlan.spare.email} in ${camp.name} for ${mins} min, then auto-reverts.`, "success");
+      setTestPlan(null);
+      onApplied();
+    } catch (err) {
+      toast.push(`Couldn't run test swap: ${err instanceof Error ? err.message : "error"}`, "error");
+    } finally {
+      setTestBusy(false);
+      setConfirmTest(false);
+    }
+  }
 
   const recoveryViews: RecoveryView[] = useMemo(
     () =>
@@ -470,6 +595,31 @@ export function CampaignMaintenance({
         </Card>
       ) : null}
 
+      {/* Active test swap(s) — always visible with a live countdown and a
+          manual revert, so a temporary swap is never left silently in place. */}
+      {activeTests.map((t) => {
+        const remaining = Math.max(0, Date.parse(t.revert_at) - nowTick);
+        const mm = Math.floor(remaining / 60000);
+        const ss = Math.floor((remaining % 60000) / 1000);
+        return (
+          <Card key={t.id} className="flex flex-wrap items-center gap-2 border-ink bg-sun/30 p-3 text-sm">
+            <Zap size={15} className="shrink-0" />
+            <span className="font-bold">Test swap live in {t.campaignName}:</span>
+            <span>
+              <b>{t.swappedIn}</b> in place of <b>{t.swappedOut}</b> — auto-reverts in{" "}
+              <b>{mm}:{String(ss).padStart(2, "0")}</b>
+            </span>
+            <button
+              className="btn-ghost btn-sm ml-auto"
+              disabled={revertingRef.current.has(t.id)}
+              onClick={() => void revertTest(t)}
+            >
+              Revert now
+            </button>
+          </Card>
+        );
+      })}
+
       {/* Placement coverage. Stated explicitly because partial coverage looks
           identical to a clean bill of health if you don't say so. */}
       <Card className="flex flex-wrap items-center gap-2 p-3 text-xs">
@@ -683,6 +833,126 @@ export function CampaignMaintenance({
       ) : null}
 
       <AutoSwapLog runs={autoSwapRuns} />
+
+      {/* Test-swap harness — a real, self-reverting swap to prove the automation. */}
+      <Card className="p-4">
+        <h3 className="flex items-center gap-2 text-base font-extrabold">
+          <Zap size={16} /> Test a swap
+        </h3>
+        <p className="mt-0.5 text-xs text-muted">
+          Picks a genuinely failing mailbox in the chosen campaign and swaps in a spare using the
+          exact eligibility rules the automation uses — for a couple of minutes, then reverts to
+          exactly what it was. Relax a gate below only if you want an amateur/low spare to qualify
+          for the test.
+        </p>
+
+        <div className="mt-3 flex flex-wrap items-end gap-3">
+          <div>
+            <p className="label">Campaign</p>
+            <select
+              className="input h-9 w-64 cursor-pointer"
+              value={testCampaignId}
+              onChange={(e) => { setTestCampaignId(e.target.value); setTestPlan(null); }}
+            >
+              <option value="">Choose a campaign…</option>
+              {plan.campaigns.filter((c) => c.active).map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <p className="label">Revert after (min)</p>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              className="input h-9 w-24"
+              value={testMinutes}
+              onChange={(e) => setTestMinutes(Number(e.target.value) || 2)}
+            />
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-3 text-xs">
+          {([
+            ["ignoreNiche", "Ignore niche match"],
+            ["ignoreWarmupScore", "Ignore warmup score"],
+            ["allowImmature", "Allow immature (amateur) spares"],
+            ["includeRecovering", "Include recovering spares"],
+          ] as const).map(([key, label]) => (
+            <label key={key} className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-ink"
+                checked={testGates[key]}
+                onChange={(e) => { setTestGates((g) => ({ ...g, [key]: e.target.checked })); setTestPlan(null); }}
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <button className="btn btn-sm" onClick={runTestPreview} disabled={!testCampaignId || !m}>
+            <Eye size={13} /> Find failing mailbox
+          </button>
+          <button
+            className="btn-primary btn-sm"
+            disabled={!writesEnabled || testBusy || !testPlan?.bad || !testPlan?.spare || activeTests.length > 0}
+            onClick={() => setConfirmTest(true)}
+            title={!writesEnabled ? "Writes are off" : activeTests.length > 0 ? "A test is already running" : "Run the real swap for the chosen minutes, then auto-revert"}
+          >
+            {testBusy ? <Spinner /> : <Zap size={13} />} Run test swap
+          </button>
+        </div>
+
+        {testPlan ? (
+          <div className="mt-3 rounded-xl border-2 border-ink bg-canvas p-3 text-sm">
+            {!testPlan.bad ? (
+              <p className="text-muted">No mailbox is failing in this campaign right now — nothing to test-swap.</p>
+            ) : (
+              <>
+                <p className="flex flex-wrap items-center gap-2">
+                  <Badge tone="danger">{testPlan.bad.email}</Badge>
+                  <span className="text-xs text-muted">failing: {testPlan.bad.reason}</span>
+                  <ArrowRight size={14} />
+                  {testPlan.spare ? (
+                    <Badge tone="mint">{testPlan.spare.email}</Badge>
+                  ) : (
+                    <span className="text-xs font-bold text-danger">no eligible spare — relax a gate or tag more spares</span>
+                  )}
+                </p>
+                {testPlan.spare ? (
+                  <p className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
+                    <Badge tone={testPlan.spare.passesNiche ? "mint" : "sun"}>niche {testPlan.spare.passesNiche ? "✓" : "✗"}</Badge>
+                    <Badge tone={testPlan.spare.passesWarmup ? "mint" : "sun"}>warmup {testPlan.spare.score ?? "?"} {testPlan.spare.passesWarmup ? "✓" : "✗"}</Badge>
+                    <Badge tone={testPlan.spare.passesMature ? "mint" : "sun"}>mature {testPlan.spare.passesMature ? "✓" : "✗"}</Badge>
+                    <Badge tone={testPlan.spare.recovering ? "sun" : "mint"}>{testPlan.spare.recovering ? "recovering" : "not recovering"}</Badge>
+                    {testPlan.spare.relaxationsUsed.length ? (
+                      <span className="text-muted">— qualified only because you relaxed: {testPlan.spare.relaxationsUsed.join(", ")}</span>
+                    ) : (
+                      <span className="text-muted">— passes every real gate</span>
+                    )}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </div>
+        ) : null}
+      </Card>
+
+      <ConfirmDialog
+        open={confirmTest}
+        onClose={() => setConfirmTest(false)}
+        onConfirm={() => void applyTestSwap()}
+        title="Run a real test swap"
+        message={
+          testPlan?.bad && testPlan?.spare
+            ? `This performs a REAL swap in your live campaign: ${testPlan.spare.email} replaces ${testPlan.bad.email} for ${Math.max(1, Math.min(60, Math.round(testMinutes) || 2))} minutes, then automatically reverts to exactly the original. Real emails may send from the swapped-in inbox during the window.`
+            : ""
+        }
+        confirmLabel="Run test swap"
+      />
 
       {/* Excluded mailboxes are invisible everywhere else by design, which
           makes them easy to forget about and hard to undo. */}

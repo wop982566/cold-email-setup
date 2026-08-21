@@ -32,6 +32,7 @@ import {
   mergeTagMaps,
   knownTags,
   normaliseTag,
+  normaliseTags,
   type TagMap,
 } from "../../lib/tags";
 import {
@@ -164,6 +165,33 @@ export function AccountsTab({
     setSelected(new Set(filtered.filter((r) => r.state === "untagged").map((r) => r.email.toLowerCase())));
   const clearSelection = () => setSelected(new Set());
 
+  // --- Campaign tagging ----------------------------------------------------
+  const [campDraft, setCampDraft] = useState<Map<string, string>>(new Map());
+  const [campBusy, setCampBusy] = useState<string | null>(null);
+  const [campQuery, setCampQuery] = useState("");
+  // Campaigns Instantly itself tagged — their override is ignored (Instantly wins),
+  // so we lock those rather than let you set a no-op override.
+  const instantlyTaggedCampaign = (id: string) =>
+    (instantlyTagsByCampaign.get(id)?.length ?? 0) > 0 ||
+    ((campaigns.find((c) => c.id === id)?.instantlyTags?.length ?? 0) > 0);
+
+  /** Set/clear a campaign's niche via the app override (campaign_group_overrides). */
+  async function saveCampaignTag(id: string, raw: string) {
+    const niche = normaliseTags(raw.split(",")).join(",");
+    const next = { ...overrides };
+    if (niche) next[id] = niche;
+    else delete next[id];
+    setCampBusy(id);
+    try {
+      await onPatchSettings({ campaign_group_overrides: next });
+      toast.push(niche ? `Campaign tagged ${niche}` : "Campaign tag cleared", niche ? "success" : "info");
+    } catch (err) {
+      toast.push(`Couldn't save campaign tag: ${err instanceof Error ? err.message : "error"}`, "error");
+    } finally {
+      setCampBusy(null);
+    }
+  }
+
   // --- Single match modal --------------------------------------------------
   const [matchFor, setMatchFor] = useState<string | null>(null);
   const [matchNiche, setMatchNiche] = useState("");
@@ -203,10 +231,12 @@ export function AccountsTab({
     try {
       if (plan.upserts.length) await upsertTags.mutateAsync(plan.upserts as Partial<MailboxTag>[]);
       if (plan.removeIds.length) await removeTags.mutateAsync(plan.removeIds);
-      // The tags changed — drop stale verification for those inboxes.
+      // Re-verify against the just-saved tags rather than dropping the result —
+      // saving the tag you verified should keep the eligible-campaigns column
+      // populated, not blank it back to "not verified".
       setVerified((m) => {
         const n = new Map(m);
-        for (const t of targets) n.delete(t.email.toLowerCase());
+        for (const t of targets) n.set(t.email.toLowerCase(), eligibleCampaignsFor(t.tags, resolved));
         return n;
       });
       if (successMsg) toast.push(successMsg, "success");
@@ -231,9 +261,10 @@ export function AccountsTab({
     qc.setQueryData(TAGS_KEY, (prev ?? []).filter((r) => !rm.has(r.id)));
     try {
       await removeTags.mutateAsync(ids);
+      // Cleared = untagged = eligible for nothing; keep the column meaningful.
       setVerified((m) => {
         const n = new Map(m);
-        for (const e of set) n.delete(e);
+        for (const e of set) n.set(e, []);
         return n;
       });
       toast.push(`Cleared the tag on ${emailList.length} inbox${emailList.length === 1 ? "" : "es"}`, "success");
@@ -605,32 +636,96 @@ export function AccountsTab({
         )}
       </Card>
 
-      {/* Campaign-tag reference — so a mismatch like "FOR AEO CAMPAIGN" vs "AEO"
-          is always inspectable, and untagged campaigns are visible. */}
-      <Card className="p-4">
-        <details>
-          <summary className="cursor-pointer select-none text-sm font-bold">
-            Campaign tags ({campaignsWithTag}/{resolved.length} tagged)
-          </summary>
-          <div className="mt-3 flex flex-col gap-1.5">
-            {resolved.length === 0 ? (
-              <p className="text-xs text-muted">No campaigns loaded.</p>
-            ) : (
-              resolved.map((c) => (
-                <div key={c.id} className="flex items-center justify-between gap-2 text-xs">
-                  <span className="truncate">{c.name}</span>
-                  <span className="flex shrink-0 flex-wrap gap-1">
-                    {c.tags.length ? (
-                      c.tags.map((t) => <Badge key={t} tone="sky">{t}</Badge>)
-                    ) : (
-                      <Badge tone="sun">untagged</Badge>
-                    )}
-                  </span>
-                </div>
-              ))
-            )}
+      {/* Campaign tags — editable. Tag each campaign with its niche so accounts
+          of that niche become swap-eligible for it. The list is live from
+          Instantly, so newly-created campaigns appear here on Refresh. */}
+      <Card className="overflow-hidden p-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b-2 border-ink p-4">
+          <div>
+            <h3 className="text-base font-extrabold">Campaign tags ({campaignsWithTag}/{resolved.length} tagged)</h3>
+            <p className="text-xs text-muted">
+              Set each campaign's niche. Campaigns come live from Instantly — new ones appear on
+              <b> Refresh</b>. A campaign already tagged in Instantly keeps that tag.
+            </p>
           </div>
-        </details>
+          {resolved.length > 8 ? (
+            <div className="relative">
+              <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />
+              <input
+                className="input h-8 w-44 pl-7 text-xs"
+                value={campQuery}
+                onChange={(e) => setCampQuery(e.target.value)}
+                placeholder="Filter campaigns"
+              />
+            </div>
+          ) : null}
+        </div>
+        {resolved.length === 0 ? (
+          <p className="p-4 text-sm text-muted">No campaigns loaded.</p>
+        ) : (
+          <div className="max-h-[28rem] overflow-auto">
+            <table className="w-full min-w-[620px] border-collapse text-left text-sm">
+              <thead>
+                <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
+                  <th className="px-3 py-2">Campaign</th>
+                  <th className="w-28 px-3 py-2">Current tag</th>
+                  <th className="w-64 px-3 py-2">Set niche</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resolved
+                  .filter((c) => !campQuery.trim() || c.name.toLowerCase().includes(campQuery.trim().toLowerCase()))
+                  .map((c) => {
+                    const locked = instantlyTaggedCampaign(c.id);
+                    const pick = campDraft.get(c.id) ?? (overrides[c.id] ?? "");
+                    return (
+                      <tr key={c.id} className="border-b border-ink/10 align-top">
+                        <td className="px-3 py-2 font-semibold">{c.name}</td>
+                        <td className="px-3 py-2">
+                          {c.tags.length ? (
+                            c.tags.map((t) => <Badge key={t} tone="sky" className="mr-1">{t}</Badge>)
+                          ) : (
+                            <Badge tone="sun">untagged</Badge>
+                          )}
+                        </td>
+                        <td className="px-3 py-2">
+                          {locked ? (
+                            <span className="text-[11px] text-muted">tagged in Instantly — edit it there</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <input
+                                className="input h-8 w-32 text-xs"
+                                list="acct-tag-options"
+                                value={pick}
+                                onChange={(e) => setCampDraft((m) => new Map(m).set(c.id, e.target.value))}
+                                placeholder="choose niche"
+                              />
+                              <button
+                                className="btn-ghost btn-sm"
+                                disabled={campBusy === c.id}
+                                onClick={() => void saveCampaignTag(c.id, pick)}
+                              >
+                                {campBusy === c.id ? <Spinner /> : <Tag size={13} />} Save
+                              </button>
+                              {(overrides[c.id] ?? "") ? (
+                                <button
+                                  className="btn-ghost btn-sm"
+                                  disabled={campBusy === c.id}
+                                  onClick={() => { setCampDraft((m) => new Map(m).set(c.id, "")); void saveCampaignTag(c.id, ""); }}
+                                >
+                                  Clear
+                                </button>
+                              ) : null}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Card>
 
       {/* Live tag options for every row's datalist. */}

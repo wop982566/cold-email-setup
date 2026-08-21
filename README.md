@@ -164,6 +164,24 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   deploys. If the branch carrying this code is a branch deploy rather than the
   production branch, the cron never fires however the env vars are set.
 
+### Test a swap (Maintenance tab)
+
+To prove the automation end-to-end, the Maintenance tab has a **Test a swap**
+card. Pick a campaign, and it finds a *genuinely failing* mailbox there and a
+spare chosen by the **exact eligibility rules the real swapper uses**
+(`src/lib/testSwap.ts` mirrors the `available` predicate + niche gate) — then
+does a **real** swap for a couple of minutes and **auto-reverts** to exactly the
+original. It shows the chosen spare's per-check breakdown (niche / warmup /
+maturity / recovering) so you see *why* it qualified. Checkboxes relax a gate
+**for the test only** — e.g. *Allow immature (amateur) spares* — without changing
+any setting; a spare admitted only because you relaxed a gate is flagged.
+
+The revert is guaranteed three ways: a client timer, an on-load reconcile (so
+closing and reopening the tab still reverts), and a **daily-cron backstop**
+(`_autoSwapRun.ts` reverts any test left `active` past its time). An active test
+shows a live countdown banner with a manual **Revert now**. Requires
+`INSTANTLY_WRITE_ENABLED`; it's behind a confirm that states it's a real change.
+
 ---
 
 ## 🏷️ Niche tags
@@ -228,6 +246,16 @@ all to chosen campaigns in a single settings write, **Verify** runs eligibility
 across the selection, and **Clear tags** removes their app tag. Every bulk write
 is one `upsertMany`/`removeMany` — not N racy per-row writes — so it can't clobber
 itself.
+
+**Saving keeps the verification.** Verifying a row then saving the same tag keeps
+the eligible-campaigns column populated (Save re-verifies against the just-saved
+tag rather than blanking it).
+
+**Tag campaigns here too.** The **Campaign tags** table is editable: set each
+campaign's niche (written to `campaign_group_overrides`), which makes accounts of
+that niche swap-eligible for it. A campaign already tagged in Instantly is shown
+locked (Instantly's tag wins). The campaign list is live from Instantly, so newly
+created campaigns appear on **Refresh** — nothing stored to go stale.
 
 **Verify uses the swapper's own rule**, not a second opinion. Eligibility is
 computed with the same `campaignTagsOf` resolution and `eligibleFor`

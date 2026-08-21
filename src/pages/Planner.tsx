@@ -612,6 +612,10 @@ export default function Planner() {
           healthByEmail={healthByEmail}
           onApplied={refresh}
           onExclude={(email) => void toggleExclude(email)}
+          tagMap={tagMap}
+          campaignTagsById={tagAssignments.byCampaign}
+          overrides={settings.campaign_group_overrides ?? {}}
+          recovering={recovering}
         />
       ) : tab === "accounts" ? (
         <AccountsTab

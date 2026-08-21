@@ -93,6 +93,57 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/** Table of temporary test swaps the operator ran from the Maintenance tab. */
+const TEST_SWAPS_TABLE = "test_swaps";
+
+/**
+ * Last-resort backstop for the test-swap harness: the client reverts a test
+ * after ~2 minutes and reconciles overdue ones on load, but if the tab was
+ * closed and never reopened, the daily run reverts anything left `active` past
+ * its time — so a temporary swap can never be permanent.
+ */
+async function revertOverdueTestSwaps(log: (s: string) => void): Promise<void> {
+  let rows: Row[];
+  try {
+    rows = await readTable(TEST_SWAPS_TABLE);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  const overdue = rows.filter(
+    (r) => r.status === "active" && typeof r.revert_at === "string" && Date.parse(r.revert_at) <= now,
+  );
+  if (overdue.length === 0) return;
+  let changed = false;
+  for (const r of overdue) {
+    try {
+      const res = await callInstantly("resource=write", {
+        op: "set-campaign-emails",
+        campaignId: r.campaignId,
+        remove: r.swappedIn,
+        add: r.swappedOut,
+      });
+      const alreadyBack = res.ok === false && /not\b|present|current/i.test(String(res.error ?? ""));
+      if (res.applied === true || alreadyBack) {
+        r.status = "reverted";
+        changed = true;
+        log(`reverted stale test swap: ${String(r.swappedOut)} back in ${String(r.campaignName)}`);
+      } else {
+        log(`could not revert test swap ${String(r.id)}: ${String(res.error ?? "unconfirmed")}`);
+      }
+    } catch (e) {
+      log(`error reverting test swap ${String(r.id)}: ${e instanceof Error ? e.message : "error"}`);
+    }
+  }
+  if (changed) {
+    try {
+      await writeTable(TEST_SWAPS_TABLE, rows);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 /**
  * Manual invocation is gated on the app token, same as every other function
  * here. An endpoint that edits live campaigns must not be reachable by anyone
@@ -124,6 +175,11 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
   if (mode !== "scheduled" && !manualAllowed(req)) {
     return json({ ok: false, error: "Unauthorized" }, 401);
   }
+
+  // Safety backstop: revert any test swap the operator left running (real runs
+  // only — a dry run must never write). Done before anything else so a stale
+  // test swap can't skew the health read that follows.
+  if (mode === "scheduled") await revertOverdueTestSwaps(log);
 
   const settingsForEmail = await readSettings().catch(() => null);
 

@@ -294,6 +294,25 @@ export interface AutoSwapRun extends BaseRow {
   log: string[];
 }
 
+// --- Test swaps ------------------------------------------------------------
+/**
+ * A temporary, self-reverting swap the operator runs to prove the automation.
+ * The real swap is applied to a live campaign and reverted after `revert_at`;
+ * the record survives a page reload so the revert still happens, and the daily
+ * cron reverts any that were left `active` past their time as a last resort.
+ */
+export interface TestSwapRecord extends BaseRow {
+  campaignId: string;
+  campaignName: string;
+  /** The failing mailbox pulled out for the test (restored on revert). */
+  swappedOut: string;
+  /** The spare swapped in for the test (removed on revert). */
+  swappedIn: string;
+  started_at: string;
+  revert_at: string; // ISO — when the auto-revert is due
+  status: "active" | "reverted" | "failed";
+}
+
 // --- Mailbox recovery ------------------------------------------------------
 // "recovered" and "restored" are deliberately separate: the first releases a
 // mailbox back into the spare pool for FUTURE swaps, the second puts it back
@@ -451,6 +470,7 @@ export const TABLES = {
   sequenceEmails: "sequence_emails",
   recovery: "mailbox_recovery",
   autoSwapRuns: "auto_swap_runs",
+  testSwaps: "test_swaps",
   setupBatches: "setup_batches",
   mailboxTags: "mailbox_tags",
   mailProfiles: "mail_profiles",
