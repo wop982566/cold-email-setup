@@ -8,18 +8,25 @@
 // maintenance/cron swap path uses (accountsTag.eligibleCampaignsFor), so what
 // this tab shows is exactly what a swap would honour — no second opinion.
 //
-// "Match…" is the manual escape hatch: when Instantly has no tags to match on,
-// it gives an account and the campaigns you pick a shared niche tag (writing
-// the account's `mailbox_tags` and each campaign's `campaign_group_overrides`),
-// which the same eligibility rule then honours — no swap-code change.
+// Tag writes are OPTIMISTIC and de-duplicated (planTagWrites): the chip flips
+// immediately, a retag REPLACES rather than piling a second row on (which the
+// tag-map union would otherwise never clear), and one write covers many inboxes
+// so bulk tagging can't race itself.
+//
+// "Match…" is the manual escape hatch: it gives an account and the campaigns you
+// pick a shared niche tag (writing the account's `mailbox_tags` and each
+// campaign's `campaign_group_overrides`), which the same eligibility rule then
+// honours — no swap-code change. Bulk Match does the same across a selection.
 // ---------------------------------------------------------------------------
-import { useMemo, useState } from "react";
-import { Tag, Check, ShieldCheck, AlertTriangle, Link2, RefreshCw } from "lucide-react";
+import { useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Tag, Check, ShieldCheck, AlertTriangle, Link2, RefreshCw, Trash2, Search } from "lucide-react";
 import { Card, Badge, Spinner, StatCard } from "../ui/primitives";
-import { Modal } from "../ui/Modal";
+import { Modal, ConfirmDialog } from "../ui/Modal";
 import { useToast } from "../ui/toast";
-import { useCollection, useInsert, useUpdate } from "../../lib/hooks";
+import { useCollection, useUpsertMany, useRemoveMany } from "../../lib/hooks";
 import { MailboxTag, TABLES } from "../../lib/types";
+import { uuid } from "../../lib/utils";
 import {
   buildTagMap,
   mergeTagMaps,
@@ -34,6 +41,7 @@ import {
   tagCoverage,
   diagnoseNoMatch,
   applyManualMatch,
+  planTagWrites,
   type ResolvedCampaign,
   type CampaignLite,
   type NoMatchReason,
@@ -88,9 +96,11 @@ export function AccountsTab({
   canLoadImap?: boolean;
 }) {
   const toast = useToast();
+  const qc = useQueryClient();
   const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
-  const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
-  const updateTag = useUpdate<MailboxTag>(TABLES.mailboxTags);
+  const upsertTags = useUpsertMany<MailboxTag>(TABLES.mailboxTags);
+  const removeTags = useRemoveMany(TABLES.mailboxTags);
+  const TAGS_KEY = [TABLES.mailboxTags];
 
   // App tags unioned with Instantly's — the exact map the swapper consults.
   const tagMap = useMemo(
@@ -119,11 +129,120 @@ export function AccountsTab({
   const [draft, setDraft] = useState<Map<string, string>>(new Map());
   const [busy, setBusy] = useState<string | null>(null);
 
-  // --- Manual match modal state -------------------------------------------
+  // --- Selection + filter --------------------------------------------------
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter(
+      (r) => r.email.toLowerCase().includes(q) || r.tags.some((t) => t.toLowerCase().includes(q)),
+    );
+  }, [rows, query]);
+  const visibleKeys = filtered.map((r) => r.email.toLowerCase());
+  const allVisibleSelected = visibleKeys.length > 0 && visibleKeys.every((k) => selected.has(k));
+  const selectedEmails = () => rows.filter((r) => selected.has(r.email.toLowerCase())).map((r) => r.email);
+
+  function toggleOne(email: string) {
+    const k = email.toLowerCase();
+    setSelected((s) => {
+      const n = new Set(s);
+      if (n.has(k)) n.delete(k);
+      else n.add(k);
+      return n;
+    });
+  }
+  function toggleAllVisible() {
+    setSelected((s) => {
+      const n = new Set(s);
+      if (allVisibleSelected) visibleKeys.forEach((k) => n.delete(k));
+      else visibleKeys.forEach((k) => n.add(k));
+      return n;
+    });
+  }
+  const selectUntagged = () =>
+    setSelected(new Set(filtered.filter((r) => r.state === "untagged").map((r) => r.email.toLowerCase())));
+  const clearSelection = () => setSelected(new Set());
+
+  // --- Single match modal --------------------------------------------------
   const [matchFor, setMatchFor] = useState<string | null>(null);
   const [matchNiche, setMatchNiche] = useState("");
   const [matchChecked, setMatchChecked] = useState<Set<string>>(new Set());
   const [matchBusy, setMatchBusy] = useState(false);
+
+  // --- Bulk modals ---------------------------------------------------------
+  const [bulkOpen, setBulkOpen] = useState<null | "tag" | "match">(null);
+  const [bulkNiche, setBulkNiche] = useState("");
+  const [bulkChecked, setBulkChecked] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  // -------------------------------------------------------------------------
+  // The one write path: optimistic, de-duplicated, race-safe.
+  // -------------------------------------------------------------------------
+  async function saveTags(targets: { email: string; tags: string[] }[], successMsg?: string): Promise<void> {
+    const plan = planTagWrites(targets, tagRowsQ.data ?? [], uuid);
+    if (plan.upserts.length === 0 && plan.removeIds.length === 0) return;
+    const prev = qc.getQueryData<MailboxTag[]>(TAGS_KEY);
+
+    // Optimistic cache: apply the plan so the chip flips before the round-trip.
+    const removeSet = new Set(plan.removeIds);
+    const upsertById = new Map(plan.upserts.map((u) => [u.id, u]));
+    const existingIds = new Set((prev ?? []).map((r) => r.id));
+    const next: MailboxTag[] = [];
+    for (const r of prev ?? []) {
+      if (removeSet.has(r.id)) continue;
+      const u = upsertById.get(r.id);
+      next.push(u ? ({ ...r, tags: u.tags, source: u.source } as MailboxTag) : r);
+    }
+    for (const u of plan.upserts) {
+      if (!existingIds.has(u.id)) next.push({ id: u.id, email: u.email, tags: u.tags, source: u.source } as MailboxTag);
+    }
+    qc.setQueryData(TAGS_KEY, next);
+
+    try {
+      if (plan.upserts.length) await upsertTags.mutateAsync(plan.upserts as Partial<MailboxTag>[]);
+      if (plan.removeIds.length) await removeTags.mutateAsync(plan.removeIds);
+      // The tags changed — drop stale verification for those inboxes.
+      setVerified((m) => {
+        const n = new Map(m);
+        for (const t of targets) n.delete(t.email.toLowerCase());
+        return n;
+      });
+      if (successMsg) toast.push(successMsg, "success");
+    } catch (err) {
+      qc.setQueryData(TAGS_KEY, prev); // roll back the optimistic write
+      qc.invalidateQueries({ queryKey: TAGS_KEY });
+      toast.push(`Couldn't save: ${err instanceof Error ? err.message : "error"}`, "error");
+    }
+  }
+
+  async function clearTags(emailList: string[]): Promise<void> {
+    const set = new Set(emailList.map((e) => e.toLowerCase()));
+    const ids = (tagRowsQ.data ?? [])
+      .filter((r) => set.has((r.email ?? "").trim().toLowerCase()))
+      .map((r) => r.id);
+    if (ids.length === 0) {
+      toast.push("Those inboxes have no app tag to clear", "info");
+      return;
+    }
+    const prev = qc.getQueryData<MailboxTag[]>(TAGS_KEY);
+    const rm = new Set(ids);
+    qc.setQueryData(TAGS_KEY, (prev ?? []).filter((r) => !rm.has(r.id)));
+    try {
+      await removeTags.mutateAsync(ids);
+      setVerified((m) => {
+        const n = new Map(m);
+        for (const e of set) n.delete(e);
+        return n;
+      });
+      toast.push(`Cleared the tag on ${emailList.length} inbox${emailList.length === 1 ? "" : "es"}`, "success");
+    } catch (err) {
+      qc.setQueryData(TAGS_KEY, prev);
+      qc.invalidateQueries({ queryKey: TAGS_KEY });
+      toast.push(`Couldn't clear: ${err instanceof Error ? err.message : "error"}`, "error");
+    }
+  }
 
   async function attach(email: string, raw: string) {
     const tags = raw.split(",").map(normaliseTag).filter(Boolean);
@@ -132,24 +251,8 @@ export function AccountsTab({
       return;
     }
     setBusy(email);
-    const existing = (tagRowsQ.data ?? []).find(
-      (r) => (r.email ?? "").trim().toLowerCase() === email.trim().toLowerCase(),
-    );
-    try {
-      if (existing) await updateTag.mutateAsync({ id: existing.id, patch: { tags, source: "manual" } });
-      else await insertTag.mutateAsync({ email, tags, source: "manual" } as Partial<MailboxTag>);
-      // Clear any stale verification — the tag changed, so re-verify.
-      setVerified((m) => {
-        const n = new Map(m);
-        n.delete(email.toLowerCase());
-        return n;
-      });
-      toast.push(`${email} tagged ${tags.join(", ")}`, "success");
-    } catch (err) {
-      toast.push(`Couldn't save: ${err instanceof Error ? err.message : "error"}`, "error");
-    } finally {
-      setBusy(null);
-    }
+    await saveTags([{ email, tags }], `${email} tagged ${tags.join(", ")}`);
+    setBusy(null);
   }
 
   /** Verify = compute the campaigns this account may swap into, live. */
@@ -163,74 +266,125 @@ export function AccountsTab({
     }
   }
 
-  function verifyAll() {
-    const next = new Map<string, ResolvedCampaign[]>();
-    for (const r of rows) next.set(r.email.toLowerCase(), eligibleCampaignsFor(r.tags, resolved));
-    setVerified(next);
-    toast.push("Verified all accounts", "success");
+  function verifyRows(subset: typeof rows, label: string) {
+    setVerified((m) => {
+      const n = new Map(m);
+      for (const r of subset) n.set(r.email.toLowerCase(), eligibleCampaignsFor(r.tags, resolved));
+      return n;
+    });
+    toast.push(label, "success");
   }
 
-  // --- Match modal ---------------------------------------------------------
+  // --- Single match --------------------------------------------------------
   function openMatch(email: string, currentTag: string) {
     setMatchFor(email);
     setMatchNiche(currentTag);
     setMatchChecked(new Set());
   }
 
-  async function confirmMatch() {
-    if (matchFor === null) return;
-    const email = matchFor;
-    if (normaliseTag(matchNiche) === "") {
+  /** Persist a manual match for one or many accounts by a shared niche. */
+  async function runMatch(emailList: string[], niche: string, campaignIds: string[]): Promise<boolean> {
+    if (normaliseTag(niche) === "") {
       toast.push("Type a niche first", "error");
-      return;
+      return false;
     }
-    const row = rows.find((r) => r.email === email);
-    const result = applyManualMatch(
-      overrides,
-      matchNiche,
-      [...matchChecked],
-      row?.tags ?? [],
-      campaigns,
-      instantlyTagsByCampaign,
-    );
-    setMatchBusy(true);
+    // Thread the overrides map through every account so they accumulate into one
+    // settings write, and collect the tag rows for one saveTags call.
+    let acc = overrides;
+    const ignored = new Set<string>();
+    const tagTargets: { email: string; tags: string[] }[] = [];
+    for (const email of emailList) {
+      const row = rows.find((r) => r.email === email);
+      const result = applyManualMatch(acc, niche, campaignIds, row?.tags ?? [], campaigns, instantlyTagsByCampaign);
+      acc = result.overrides;
+      result.ignoredInstantly.forEach((id) => ignored.add(id));
+      tagTargets.push({ email, tags: result.tags });
+    }
     try {
-      // 1. The account gets the niche in mailbox_tags (the swapper's tag source).
-      const existing = (tagRowsQ.data ?? []).find(
-        (r) => (r.email ?? "").trim().toLowerCase() === email.trim().toLowerCase(),
-      );
-      if (existing) await updateTag.mutateAsync({ id: existing.id, patch: { tags: result.tags, source: "manual" } });
-      else await insertTag.mutateAsync({ email, tags: result.tags, source: "manual" } as Partial<MailboxTag>);
-      // 2. Each chosen untagged campaign gets the niche as its override.
-      await onPatchSettings({ campaign_group_overrides: result.overrides });
-      // 3. Instantly-tagged campaigns can't be overridden — say so plainly.
-      if (result.ignoredInstantly.length) {
-        const names = result.ignoredInstantly.map((id) => resolved.find((c) => c.id === id)?.name ?? id);
+      await onPatchSettings({ campaign_group_overrides: acc });
+      await saveTags(tagTargets);
+      if (ignored.size) {
+        const names = [...ignored].map((id) => resolved.find((c) => c.id === id)?.name ?? id);
         toast.push(
           `Already tagged in Instantly: ${names.join(", ")} — those keep Instantly's tag. Retag them there to change it.`,
           "info",
         );
       }
-      // 4. Re-verify against the new binding.
-      setVerified((m) => {
-        const n = new Map(m);
-        n.delete(email.toLowerCase());
-        return n;
-      });
-      const bound = result.changed.length + result.alreadyEligible.length;
       toast.push(
-        bound > 0
-          ? `${email} matched to ${bound} campaign${bound === 1 ? "" : "s"} (niche ${normaliseTag(matchNiche)})`
-          : `${email} tagged ${normaliseTag(matchNiche)} — tick campaigns to bind them`,
-        bound > 0 ? "success" : "info",
+        `Matched ${emailList.length} inbox${emailList.length === 1 ? "" : "es"} to ${campaignIds.length} campaign${campaignIds.length === 1 ? "" : "s"} (niche ${normaliseTag(niche)})`,
+        "success",
       );
-      setMatchFor(null);
+      return true;
     } catch (err) {
       toast.push(`Couldn't save match: ${err instanceof Error ? err.message : "error"}`, "error");
-    } finally {
-      setMatchBusy(false);
+      return false;
     }
   }
+
+  async function confirmMatch() {
+    if (matchFor === null) return;
+    setMatchBusy(true);
+    const ok = await runMatch([matchFor], matchNiche, [...matchChecked]);
+    setMatchBusy(false);
+    if (ok) setMatchFor(null);
+  }
+
+  async function confirmBulkTag() {
+    const niche = normaliseTag(bulkNiche);
+    if (!niche) {
+      toast.push("Type a niche first", "error");
+      return;
+    }
+    const list = selectedEmails();
+    setBulkBusy(true);
+    await saveTags(list.map((email) => ({ email, tags: [niche] })), `Tagged ${list.length} inbox${list.length === 1 ? "" : "es"} ${niche}`);
+    setBulkBusy(false);
+    setBulkOpen(null);
+    clearSelection();
+  }
+
+  async function confirmBulkMatch() {
+    setBulkBusy(true);
+    const ok = await runMatch(selectedEmails(), bulkNiche, [...bulkChecked]);
+    setBulkBusy(false);
+    if (ok) {
+      setBulkOpen(null);
+      clearSelection();
+    }
+  }
+
+  function openBulk(kind: "tag" | "match") {
+    setBulkNiche("");
+    setBulkChecked(new Set());
+    setBulkOpen(kind);
+  }
+
+  const toggleCampaign = (setter: Dispatch<SetStateAction<Set<string>>>) => (id: string) =>
+    setter((s) => {
+      const n = new Set(s);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+
+  // A reusable campaign checklist for the single + bulk match modals.
+  const campaignChecklist = (checked: Set<string>, onToggle: (id: string) => void) => (
+    <div className="max-h-72 space-y-1 overflow-auto rounded-lg border-2 border-ink p-2">
+      {resolved.length === 0 ? (
+        <p className="p-2 text-xs text-muted">No campaigns loaded.</p>
+      ) : (
+        resolved.map((c) => (
+          <label key={c.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 hover:bg-canvas">
+            <input type="checkbox" className="h-4 w-4 accent-ink" checked={checked.has(c.id)} onChange={() => onToggle(c.id)} />
+            <span className="flex-1 truncate text-sm">{c.name}</span>
+            <span className="flex shrink-0 flex-wrap gap-1">
+              {c.tags.length ? c.tags.map((t) => <Badge key={t} tone="sky">{t}</Badge>) : <Badge tone="sun">untagged</Badge>}
+            </span>
+          </label>
+        ))
+      )}
+    </div>
+  );
 
   return (
     <div className="space-y-4">
@@ -252,6 +406,31 @@ export function AccountsTab({
         </Card>
       ) : null}
 
+      {/* Bulk action bar — appears when inboxes are selected. */}
+      {selected.size > 0 ? (
+        <Card className="flex flex-wrap items-center gap-2 bg-pink/30 p-3">
+          <span className="text-sm font-bold">{selected.size} selected</span>
+          <button className="btn btn-sm" onClick={() => openBulk("tag")}>
+            <Tag size={13} /> Tag…
+          </button>
+          <button className="btn-ghost btn-sm" onClick={() => openBulk("match")}>
+            <Link2 size={13} /> Match…
+          </button>
+          <button
+            className="btn-ghost btn-sm"
+            onClick={() => verifyRows(rows.filter((r) => selected.has(r.email.toLowerCase())), `Verified ${selected.size} inboxes`)}
+          >
+            <Check size={13} /> Verify
+          </button>
+          <button className="btn-ghost btn-sm" onClick={() => setConfirmClear(true)}>
+            <Trash2 size={13} /> Clear tags
+          </button>
+          <button className="btn-ghost btn-sm" onClick={clearSelection}>
+            Clear selection
+          </button>
+        </Card>
+      ) : null}
+
       <Card className="overflow-hidden p-0">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b-2 border-ink p-4">
           <div>
@@ -262,12 +441,24 @@ export function AccountsTab({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" />
+              <input
+                className="input h-8 w-44 pl-7 text-xs"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter by email or tag"
+              />
+            </div>
+            <button className="btn-ghost btn-sm" onClick={selectUntagged} title="Select every untagged inbox in view">
+              Select untagged
+            </button>
             {onLoadImap && canLoadImap ? (
               <button className="btn-ghost btn-sm" onClick={onLoadImap} disabled={loadingImap}>
                 {loadingImap ? <Spinner /> : <RefreshCw size={14} />} Load IMAP details
               </button>
             ) : null}
-            <button className="btn-ghost btn-sm" onClick={verifyAll}>
+            <button className="btn-ghost btn-sm" onClick={() => verifyRows(rows, "Verified all accounts")}>
               <ShieldCheck size={14} /> Verify all
             </button>
           </div>
@@ -275,11 +466,22 @@ export function AccountsTab({
 
         {rows.length === 0 ? (
           <p className="p-4 text-sm text-muted">No connected inboxes yet.</p>
+        ) : filtered.length === 0 ? (
+          <p className="p-4 text-sm text-muted">No inboxes match “{query}”.</p>
         ) : (
           <div className="max-h-[32rem] overflow-auto">
-            <table className="w-full min-w-[820px] border-collapse text-left text-sm">
+            <table className="w-full min-w-[860px] border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
+                  <th className="w-10 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-ink"
+                      checked={allVisibleSelected}
+                      onChange={toggleAllVisible}
+                      title="Select all in view"
+                    />
+                  </th>
                   <th className="px-3 py-2">Inbox &amp; IMAP</th>
                   <th className="w-28 px-3 py-2">Current tag</th>
                   <th className="w-72 px-3 py-2">Tag / match</th>
@@ -287,15 +489,24 @@ export function AccountsTab({
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r) => {
+                {filtered.map((r) => {
                   const elig = verified.get(r.email.toLowerCase());
                   const pick = draft.get(r.email) ?? "";
                   const cw = credsByEmail?.get(r.email.toLowerCase());
                   const raw = rawAccountsByEmail?.get(r.email.toLowerCase());
                   const c = cw?.creds;
                   const hasImap = Boolean(c && (c.imapHost || c.imapUsername));
+                  const isSel = selected.has(r.email.toLowerCase());
                   return (
-                    <tr key={r.email} className="border-b border-ink/10 align-top">
+                    <tr key={r.email} className={`border-b border-ink/10 align-top ${isSel ? "bg-pink/10" : ""}`}>
+                      <td className="px-3 py-2">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 accent-ink"
+                          checked={isSel}
+                          onChange={() => toggleOne(r.email)}
+                        />
+                      </td>
                       <td className="px-3 py-2">
                         <div className="font-semibold">{r.email}</div>
                         <div className="mt-0.5 text-[11px] font-normal text-muted">
@@ -429,7 +640,7 @@ export function AccountsTab({
         ))}
       </datalist>
 
-      {/* Manual match modal. */}
+      {/* Single manual match modal. */}
       <Modal
         open={matchFor !== null}
         onClose={() => setMatchFor(null)}
@@ -440,11 +651,7 @@ export function AccountsTab({
             <button className="btn-ghost btn-sm" onClick={() => setMatchFor(null)} disabled={matchBusy}>
               Cancel
             </button>
-            <button
-              className="btn btn-sm"
-              onClick={() => void confirmMatch()}
-              disabled={matchBusy || normaliseTag(matchNiche) === ""}
-            >
+            <button className="btn btn-sm" onClick={() => void confirmMatch()} disabled={matchBusy || normaliseTag(matchNiche) === ""}>
               {matchBusy ? <Spinner /> : <Link2 size={14} />} Match
             </button>
           </>
@@ -457,50 +664,62 @@ export function AccountsTab({
         </p>
         <label className="mt-3 block">
           <span className="label">Niche</span>
-          <input
-            className="input"
-            list="acct-tag-options"
-            value={matchNiche}
-            onChange={(e) => setMatchNiche(e.target.value)}
-            placeholder="e.g. AEO"
-          />
+          <input className="input" list="acct-tag-options" value={matchNiche} onChange={(e) => setMatchNiche(e.target.value)} placeholder="e.g. AEO" />
         </label>
         <p className="mb-1 mt-4 text-xs font-bold uppercase tracking-wide text-muted">Campaigns</p>
-        <div className="max-h-72 space-y-1 overflow-auto rounded-lg border-2 border-ink p-2">
-          {resolved.length === 0 ? (
-            <p className="p-2 text-xs text-muted">No campaigns loaded.</p>
-          ) : (
-            resolved.map((c) => {
-              const checked = matchChecked.has(c.id);
-              return (
-                <label key={c.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 hover:bg-canvas">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 accent-ink"
-                    checked={checked}
-                    onChange={() =>
-                      setMatchChecked((s) => {
-                        const n = new Set(s);
-                        if (n.has(c.id)) n.delete(c.id);
-                        else n.add(c.id);
-                        return n;
-                      })
-                    }
-                  />
-                  <span className="flex-1 truncate text-sm">{c.name}</span>
-                  <span className="flex shrink-0 flex-wrap gap-1">
-                    {c.tags.length ? (
-                      c.tags.map((t) => <Badge key={t} tone="sky">{t}</Badge>)
-                    ) : (
-                      <Badge tone="sun">untagged</Badge>
-                    )}
-                  </span>
-                </label>
-              );
-            })
-          )}
-        </div>
+        {campaignChecklist(matchChecked, toggleCampaign(setMatchChecked))}
       </Modal>
+
+      {/* Bulk Tag / Bulk Match modal. */}
+      <Modal
+        open={bulkOpen !== null}
+        onClose={() => setBulkOpen(null)}
+        title={bulkOpen === "match" ? `Match ${selected.size} inboxes to campaigns` : `Tag ${selected.size} inboxes`}
+        size="lg"
+        footer={
+          <>
+            <button className="btn-ghost btn-sm" onClick={() => setBulkOpen(null)} disabled={bulkBusy}>
+              Cancel
+            </button>
+            <button
+              className="btn btn-sm"
+              onClick={() => void (bulkOpen === "match" ? confirmBulkMatch() : confirmBulkTag())}
+              disabled={bulkBusy || normaliseTag(bulkNiche) === ""}
+            >
+              {bulkBusy ? <Spinner /> : bulkOpen === "match" ? <Link2 size={14} /> : <Tag size={14} />}{" "}
+              {bulkOpen === "match" ? "Match all" : "Tag all"}
+            </button>
+          </>
+        }
+      >
+        <p className="text-xs text-muted">
+          {bulkOpen === "match"
+            ? "Give every selected inbox and the campaigns you tick a shared niche tag. Campaigns already tagged in Instantly keep their tag."
+            : "Set this niche tag on every selected inbox. It replaces any existing app tag on those inboxes."}
+        </p>
+        <label className="mt-3 block">
+          <span className="label">Niche</span>
+          <input className="input" list="acct-tag-options" value={bulkNiche} onChange={(e) => setBulkNiche(e.target.value)} placeholder="e.g. AEO" />
+        </label>
+        {bulkOpen === "match" ? (
+          <>
+            <p className="mb-1 mt-4 text-xs font-bold uppercase tracking-wide text-muted">Campaigns</p>
+            {campaignChecklist(bulkChecked, toggleCampaign(setBulkChecked))}
+          </>
+        ) : null}
+      </Modal>
+
+      <ConfirmDialog
+        open={confirmClear}
+        onClose={() => setConfirmClear(false)}
+        onConfirm={() => {
+          void clearTags(selectedEmails());
+          clearSelection();
+        }}
+        title="Clear tags"
+        message={`Remove the app tag from ${selected.size} inbox${selected.size === 1 ? "" : "es"}? They become untagged and won't be swapped until tagged again. (Any tag Instantly itself reports is unaffected.)`}
+        confirmLabel="Clear tags"
+      />
     </div>
   );
 }

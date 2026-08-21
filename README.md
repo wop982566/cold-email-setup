@@ -213,6 +213,22 @@ table the swapper reads — so a tag set here takes effect immediately, and
 changing a tag clears its stale verification so you re-verify against the new
 niche.
 
+**Saving is instant and reliable.** The tag chip updates optimistically the
+moment you Save (no wait for a round-trip), and the write is de-duplicated so a
+**retag replaces** rather than piling a second row on the same inbox — the cause
+of an earlier "my change didn't take". Under the hood the data function now reads
+Netlify Blobs with **strong consistency**, so the value you just saved is exactly
+what the next read (or a Refresh) returns, instead of an eventually-consistent
+stale copy.
+
+**Bulk operations.** Tick the checkboxes (or **Select untagged** to grab every
+untagged inbox at once, or filter first with the search box), and a toolbar
+appears: **Tag…** sets one niche on all selected inboxes, **Match…** binds them
+all to chosen campaigns in a single settings write, **Verify** runs eligibility
+across the selection, and **Clear tags** removes their app tag. Every bulk write
+is one `upsertMany`/`removeMany` — not N racy per-row writes — so it can't clobber
+itself.
+
 **Verify uses the swapper's own rule**, not a second opinion. Eligibility is
 computed with the same `campaignTagsOf` resolution and `eligibleFor`
 intersection the Maintenance tab and the daily cron use

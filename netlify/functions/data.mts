@@ -40,7 +40,11 @@ function json(body: unknown, status = 200): Response {
 }
 
 async function readTable(table: string): Promise<Row[]> {
-  const data = (await store().get(table, { type: "json" })) as Row[] | null;
+  // Strong consistency so a read immediately after a write returns the write.
+  // Blobs default to eventual reads, which made a just-saved tag/row fail to
+  // appear until a later refocus — and made read-modify-write ops clobber a
+  // concurrent write by starting from a stale copy.
+  const data = (await store().get(table, { type: "json", consistency: "strong" })) as Row[] | null;
   return Array.isArray(data) ? data : [];
 }
 async function writeTable(table: string, rows: Row[]): Promise<void> {
@@ -90,7 +94,7 @@ export default async (req: Request): Promise<Response> => {
 
     switch (op) {
       case "getSettings": {
-        const s = (await store().get("app_settings", { type: "json" })) as Record<string, unknown> | null;
+        const s = (await store().get("app_settings", { type: "json", consistency: "strong" })) as Record<string, unknown> | null;
         return json({ ok: true, value: s ?? null });
       }
       case "saveSettings": {

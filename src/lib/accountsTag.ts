@@ -201,3 +201,50 @@ export function applyManualMatch(
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Writing tags safely: exactly one mailbox_tags row per email.
+//
+// The old save decided update-vs-insert from a possibly-stale snapshot, so a
+// retag could insert a SECOND row for the same address; buildTagMap then unions
+// duplicates, so the old tag never cleared. This plans the writes so a retag
+// REPLACES: reuse the first existing row for each email, delete any duplicates,
+// and mint a fresh id only when the address has no row yet. One shape drives
+// both the single-row Save and the bulk operations.
+//
+// Pure — `newId` is injected so it's deterministic under test.
+// ---------------------------------------------------------------------------
+export interface TagWritePlan {
+  upserts: { id: string; email: string; tags: string[]; source: "manual" }[];
+  /** Extra duplicate rows for an address, to delete so only one remains. */
+  removeIds: string[];
+}
+
+export function planTagWrites(
+  targets: readonly { email: string; tags: readonly string[] }[],
+  existingRows: readonly { id: string; email: string }[],
+  newId: () => string,
+): TagWritePlan {
+  // All existing rows grouped by lowercased email, in stable order.
+  const byEmail = new Map<string, string[]>();
+  for (const r of existingRows) {
+    const key = (r.email ?? "").trim().toLowerCase();
+    if (!key || !r.id) continue;
+    (byEmail.get(key) ?? byEmail.set(key, []).get(key)!).push(r.id);
+  }
+
+  const upserts: TagWritePlan["upserts"] = [];
+  const removeIds: string[] = [];
+  const seen = new Set<string>();
+
+  for (const t of targets) {
+    const email = (t.email ?? "").trim().toLowerCase();
+    if (!email || seen.has(email)) continue; // one write per address
+    seen.add(email);
+    const ids = byEmail.get(email) ?? [];
+    const id = ids[0] ?? newId(); // reuse the first row, or a fresh one
+    for (const extra of ids.slice(1)) removeIds.push(extra); // kill duplicates
+    upserts.push({ id, email, tags: normaliseTags(t.tags as string[]), source: "manual" });
+  }
+  return { upserts, removeIds };
+}
