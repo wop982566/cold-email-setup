@@ -292,6 +292,29 @@ write-only in Instantly and the account-detail read scrubs them. If the accounts
 list doesn't carry IMAP fields, **Load IMAP details** fills them on demand from
 `account-detail`.
 
+**Lead progress mirrors Instantly, and never overshoots.** The planner's
+per-campaign progress reads Instantly's own per-status counts —
+`completed / total` is the headline percent (matching Instantly's "Progress"),
+and **not-yet-contacted** is the real "leads left" that drives the finish-ETA.
+It no longer derives "remaining" as `total − contacted_count`: that counter is
+cumulative and can exceed the current list, which used to clamp remaining to 0
+and wrongly declare a 14%-done list "complete". A list only reads as finished
+when Instantly's own not-yet-contacted is a real zero. `src/lib/leadStatus.ts`
+reconciles these counts defensively and **never reports a number larger than the
+list total**; when Instantly returns only the cumulative counter it says
+"per-status counts unavailable" rather than inventing a completion. **Load exact
+lead counts** aggregates the per-lead list to reproduce Instantly's Completed /
+contacted / not-yet-contacted figures exactly, overriding the analytics row.
+
+Two related display fixes: the group **"spare"** badge now shows the real
+supply−demand surplus (it was pinned to 0), the capacity footer's
+`inboxes × per-day` arithmetic reconciles (the shared-mailbox share is shown
+separately rather than as a result that didn't add up), the campaign **health**
+line labels its three separate figures (overall score · weakest inbox · worst
+placement) so they don't read as one broken equation, and **sending** is shown
+against the campaign's own Instantly daily limit rather than a derived
+fair-share number.
+
 **The Domains tab mirrors Instantly live.** On load it reads the connected
 accounts and reconciles them against the stored table: a domain Instantly has
 that the table doesn't is **added automatically** (pre-filled with its mailbox

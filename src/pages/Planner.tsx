@@ -34,6 +34,7 @@ import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, M
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
+import { aggregateLeadCounts, type LeadStatusCounts } from "../lib/leadStatus";
 import { instantly, asItems } from "../lib/instantly";
 import {
   batchEmails,
@@ -107,6 +108,11 @@ export default function Planner() {
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
+  // Exact per-campaign lead counts, aggregated from the per-lead list on demand.
+  // Empty until the operator asks — it's a heavier fetch than the analytics row.
+  const [exactCounts, setExactCounts] = useState<Map<string, LeadStatusCounts>>(new Map());
+  const [loadingExact, setLoadingExact] = useState(false);
+  const [exactProgress, setExactProgress] = useState("");
   const [tab, setTab] = useState<"plan" | "maintenance" | "accounts">("plan");
 
   // Same keys as the Instantly page and the Sending Health card, so all three
@@ -175,8 +181,9 @@ export default function Planner() {
       settings,
       costs,
       placement: placementHealthInput,
+      leadCounts: exactCounts.size > 0 ? exactCounts : undefined,
     });
-  }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs, placementHealthInput]);
+  }, [acctQ.data, campQ.data, statsQ.data, cap, settings, costs, placementHealthInput, exactCounts]);
 
   // Actual daily sends. Same query key as the Sending Health card, so this
   // shares that cache instead of refetching the series.
@@ -301,6 +308,42 @@ export default function Planner() {
     setDetailCreds(filled);
     setLoadingImap(false);
   }
+
+  // Count each active campaign's leads directly from the per-lead list — the
+  // exact Completed / contacted / not-yet-contacted figures Instantly shows,
+  // overriding the analytics row (whose cumulative counter can overshoot).
+  async function loadExactCounts() {
+    const active = (plan?.campaigns ?? []).filter((c) => c.active && c.id);
+    if (active.length === 0) {
+      toast.push("No active campaigns to count", "info");
+      return;
+    }
+    setLoadingExact(true);
+    const next = new Map<string, LeadStatusCounts>();
+    let done = 0;
+    for (const c of active) {
+      setExactProgress(`${done}/${active.length}`);
+      try {
+        const res = await instantly.workspaceLeads(c.id);
+        if (res.ok && res.data) {
+          next.set(c.id, aggregateLeadCounts(asItems<{ status?: number; contacted?: boolean }>(res.data)));
+        }
+      } catch {
+        // Skip a campaign that failed; the rest still get exact counts.
+      }
+      done++;
+    }
+    setExactProgress("");
+    setLoadingExact(false);
+    setExactCounts(next);
+    toast.push(
+      next.size > 0
+        ? `Exact lead counts loaded for ${next.size} campaign${next.size === 1 ? "" : "s"}`
+        : "Couldn't load exact counts",
+      next.size > 0 ? "success" : "error",
+    );
+  }
+
   const insertTag = useInsert<MailboxTag>(TABLES.mailboxTags);
   const updateTag = useUpdate<MailboxTag>(TABLES.mailboxTags);
 
@@ -752,12 +795,23 @@ export default function Planner() {
 
       {/* Groups */}
       <Card className="overflow-hidden p-0">
-        <div className="border-b-2 border-ink p-4">
-          <h3 className="text-lg">Campaign groups</h3>
-          <p className="text-xs text-muted">
-            Grouped by the first word of the campaign name. Supply is split when a mailbox runs in
-            more than one campaign, so shared inboxes aren't counted twice.
-          </p>
+        <div className="flex flex-wrap items-start justify-between gap-2 border-b-2 border-ink p-4">
+          <div>
+            <h3 className="text-lg">Campaign groups</h3>
+            <p className="text-xs text-muted">
+              Grouped by the first word of the campaign name. Supply is split when a mailbox runs in
+              more than one campaign, so shared inboxes aren't counted twice.
+            </p>
+          </div>
+          <button
+            className="btn-ghost btn-sm"
+            onClick={() => void loadExactCounts()}
+            disabled={loadingExact}
+            title="Count each campaign's leads directly from Instantly (Completed / contacted / not-yet-contacted) — the exact figures Instantly shows"
+          >
+            {loadingExact ? <Spinner /> : <RefreshCw size={14} />}
+            {loadingExact ? `Counting ${exactProgress}…` : "Load exact lead counts"}
+          </button>
         </div>
         {p.groups.length === 0 ? (
           <p className="p-6 text-sm text-muted">No campaigns found in Instantly.</p>
@@ -772,6 +826,7 @@ export default function Planner() {
                 healthByEmail={healthByEmail}
                 placement={placement}
                 perBoxCap={p.perBoxCap}
+                canLoadExact={exactCounts.size === 0}
               />
             ))}
           </div>
@@ -1051,6 +1106,7 @@ function GroupRow({
   healthByEmail,
   placement,
   perBoxCap,
+  canLoadExact,
 }: {
   g: PlannerGroup;
   open: boolean;
@@ -1059,6 +1115,8 @@ function GroupRow({
   placement: PlacementMap | null;
   /** Most common per-mailbox daily limit — the "× 15/day" in the breakdown. */
   perBoxCap: number;
+  /** Whether the "Load exact lead counts" action is available, for the hint. */
+  canLoadExact?: boolean;
 }) {
   const short = g.gapDaily > 0;
   const max = Math.max(g.demandDaily, g.supplyDaily, 1);
@@ -1081,7 +1139,11 @@ function GroupRow({
             <span className="text-base font-extrabold">{g.key}</span>
             <Badge tone="white">{g.activeCampaigns} active</Badge>
             <Badge tone={short ? "danger" : "mint"}>
-              {short ? `short ${fmtNumber(g.gapDaily)}/day` : `${fmtNumber(-g.gapDaily || 0)} spare`}
+              {short
+                ? `short ${fmtNumber(g.gapDaily)}/day`
+                : g.surplusDaily > 0
+                  ? `${fmtNumber(g.surplusDaily)}/day spare`
+                  : "balanced"}
             </Badge>
             {g.health.band !== "unknown" ? (
               <span title={healthTitle(g.health)}>
@@ -1122,7 +1184,7 @@ function GroupRow({
                 <th className="w-24 py-2 pr-3">Sending</th>
                 <th className="w-16 py-2 pr-3">Boxes</th>
                 <th className="w-32 py-2 pr-3">Priority</th>
-                <th className="w-44 py-2 pr-3">Leads contacted</th>
+                <th className="w-44 py-2 pr-3">Leads / progress</th>
                 <th className="w-20 py-2 pr-3">Health</th>
                 <th className="w-24 py-2 pr-3">New leads/day</th>
                 <th className="w-36 py-2 pr-3">At full capacity</th>
@@ -1147,8 +1209,11 @@ function GroupRow({
                         <>
                           <p className="font-bold">{fmtNumber(c.sentPerDay)}/day</p>
                           <p className="text-[11px] text-muted">
-                            {c.supplyDaily > 0
-                              ? `${fmtPercent((c.sentPerDay / c.supplyDaily) * 100)} of supply`
+                            {/* Compared to the campaign's OWN Instantly daily
+                                limit — a direct number — not the app's derived
+                                fair-share supply, so the ratio is legible. */}
+                            {c.dailyLimit > 0
+                              ? `${fmtPercent((c.sentPerDay / c.dailyLimit) * 100)} of the ${fmtNumber(c.dailyLimit)} limit`
                               : `${fmtNumber(c.sentLast30)} in 30d`}
                           </p>
                         </>
@@ -1178,18 +1243,41 @@ function GroupRow({
                         </Badge>
                       )}
                     </td>
+                    {/* Mirrors Instantly's own breakdown: progress = completed
+                        ÷ total, and the real not-yet-contacted count as "left".
+                        When Instantly returned only the cumulative counter, show
+                        contacted with a ≈ and never a false "done". */}
                     <td className="py-2 pr-3">
-                      <div className="flex items-center gap-2">
-                        <div className="min-w-0 flex-1">
-                          <ProgressBar value={c.pctContacted} max={100} color="#23A094" height={10} />
-                        </div>
-                        <span className="whitespace-nowrap text-xs text-muted">
-                          {fmtNumber(c.leadsContacted)}/{fmtNumber(c.leadsTotal)}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 text-[11px] text-muted">
-                        {fmtNumber(c.leadsRemaining)} left · {fmtPercent(c.pctContacted)} done
-                      </p>
+                      {c.notYetContacted === null ? (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <div className="min-w-0 flex-1">
+                              <ProgressBar value={Math.min(100, c.pctContacted)} max={100} color="#23A094" height={10} />
+                            </div>
+                            <span className="whitespace-nowrap text-xs text-muted">
+                              ≈{fmtNumber(c.leadsContacted)}/{fmtNumber(c.leadsTotal)}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-[11px] text-muted">
+                            per-status counts unavailable{canLoadExact ? " — use Load exact lead counts" : ""}
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <div className="min-w-0 flex-1">
+                              <ProgressBar value={c.pctComplete ?? 0} max={100} color="#23A094" height={10} />
+                            </div>
+                            <span className="whitespace-nowrap text-xs font-semibold text-muted">
+                              {fmtPercent(c.pctComplete ?? 0)}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-[11px] text-muted">
+                            {fmtNumber(c.leadsCompleted ?? 0)} completed · {fmtNumber(c.notYetContacted)} not yet contacted
+                            {c.leadsInProgress ? ` · ${fmtNumber(c.leadsInProgress)} in progress` : ""}
+                          </p>
+                        </>
+                      )}
                     </td>
                     <td className="py-2 pr-3">
                       {c.health.band === "unknown" ? (
@@ -1261,11 +1349,20 @@ function GroupRow({
                       capacity, rate, what's left, how long, what date. */}
                   <tr className="bg-canvas/40">
                     <td colSpan={11} className="px-1 pb-2 text-[11px] text-muted">
-                      {/* The capacity sum, spelled out end to end. */}
+                      {/* The capacity sum, spelled out end to end. The left and
+                          right of the "=" must reconcile: mailboxCount × perBox
+                          is the raw ceiling; when mailboxes are shared across
+                          campaigns the usable share is lower, shown separately. */}
                       <b>{fmtNumber(c.mailboxCount)}</b> inbox
                       {c.mailboxCount === 1 ? "" : "es"} ×{" "}
-                      <b>{fmtNumber(perBoxCap)}</b>/day = <b>{fmtNumber(c.supplyDaily)}</b>{" "}
-                      emails/day · <b>{fmtNumber(c.leadsRemaining)}</b> leads ×{" "}
+                      <b>{fmtNumber(perBoxCap)}</b>/day ={" "}
+                      <b>{fmtNumber(c.mailboxCount * perBoxCap)}</b> emails/day
+                      {Math.round(c.supplyDaily) !== Math.round(c.mailboxCount * perBoxCap) ? (
+                        <>
+                          {" "}(<b>{fmtNumber(c.supplyDaily)}</b>/day after sharing)
+                        </>
+                      ) : null}{" "}
+                      · <b>{fmtNumber(c.leadsRemaining)}</b> leads ×{" "}
                       <b>{fmtNumber(c.sequenceSteps)}</b> step
                       {c.sequenceSteps === 1 ? "" : "s"}
                       {!c.sequenceStepsKnown ? (

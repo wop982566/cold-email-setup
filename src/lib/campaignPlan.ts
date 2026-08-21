@@ -13,6 +13,7 @@ import { AppSettings, CostItem } from "./types";
 import { CapacityResult } from "./capacity";
 import { monthlyCost } from "./costs";
 import { asItems, pick } from "./apiShape";
+import { leadStatusOf, type LeadStatusCounts } from "./leadStatus";
 
 const F = {
   acctDailyLimit: ["daily_limit", "daily_sending_limit", "sending_limit", "max_daily_limit"],
@@ -151,8 +152,16 @@ export interface PlannerCampaign {
   gapDaily: number; // demand - supply, positive = short
   leadsTotal: number;
   leadsContacted: number;
-  leadsRemaining: number;
+  leadsRemaining: number; // = notYetContacted when known; the real "leads left"
   pctContacted: number;
+  // Instantly's per-status breakdown, read straight from its numbers rather than
+  // derived by subtraction (which used to overshoot and declare a live list
+  // "done"). Null fields = Instantly didn't report that status.
+  leadsCompleted: number | null;
+  leadsInProgress: number | null;
+  notYetContacted: number | null;
+  pctComplete: number | null; // completed / total — Instantly's headline "Progress"
+  countsSource: LeadStatusCounts["source"];
   // What this campaign ACTUALLY sent, against all the capacity figures above.
   // Already read from analytics for the reply/bounce rates — surfaced so a row
   // can show sending vs. capacity rather than only capacity.
@@ -191,6 +200,7 @@ export interface PlannerGroup {
   demandDaily: number;
   supplyDaily: number;
   gapDaily: number;
+  surplusDaily: number; // supply - demand, positive = spare capacity
   mailboxes: number;
   exclusiveMailboxes: number;
   sharedMailboxes: number;
@@ -257,6 +267,10 @@ export interface PlanInput {
   // Inbox-vs-spam rates, when warmup analytics has been fetched. Optional
   // throughout: without it health falls back to warmup score alone.
   placement?: PlacementInput;
+  // Exact per-campaign lead counts from the per-lead `leads` resource, fetched
+  // on demand. When present for a campaign, they override the analytics-derived
+  // counts — the guaranteed-correct source that matches Instantly's own numbers.
+  leadCounts?: Map<string, LeadStatusCounts>;
   today?: Date; // injected so completion dates stay deterministic in tests
 }
 
@@ -367,12 +381,15 @@ export function healthOf(boxes: PlannerMailbox[], placement?: PlacementInput): H
     null,
   );
 
+  // Each part is a DIFFERENT fact — an overall blended score, a single worst
+  // warmup, a single worst placement — so label them. Left unlabelled ("49 ·
+  // weakest 57 · 57%") they read as one broken equation.
   const parts: string[] = [];
   if (broken.length) parts.push(`${broken.length} not sending`);
   if (unknown.length) parts.push(`${unknown.length} with no score`);
-  if (weakest && weakest.score < 80) parts.push(`weakest ${weakest.score}`);
+  if (weakest && weakest.score < 80) parts.push(`weakest inbox ${weakest.score}/100`);
   if (worstPlacement && worstPlacement.inboxRate < 80) {
-    parts.push(`${Math.round(worstPlacement.inboxRate)}% inbox on ${worstPlacement.email}`);
+    parts.push(`worst placement ${Math.round(worstPlacement.inboxRate)}% (${worstPlacement.email})`);
   }
 
   return {
@@ -453,6 +470,7 @@ export function computePlan({
   settings,
   costs = [],
   placement,
+  leadCounts,
   today,
 }: PlanInput): Plan {
   // Weekends still pass on the calendar even though nothing sends, so ETAs are
@@ -594,9 +612,21 @@ export function computePlan({
       supply += box.shareCount > 0 ? box.dailyLimit / box.shareCount : box.dailyLimit;
     }
     const s = stats.get(p.id) ?? {};
-    const leadsTotal = pick(s, F.leadsTotal, 0);
-    const leadsContacted = pick(s, F.contacted, 0);
-    const leadsRemaining = Math.max(0, leadsTotal - leadsContacted);
+    // Real per-status counts, mirroring Instantly — the exact per-lead
+    // aggregation when it's been loaded, else reconciled from the analytics row.
+    // Never derived by the old total − contacted subtraction, which overshot and
+    // declared a live list "done".
+    const counts = leadCounts?.get(p.id) ?? leadStatusOf(s);
+    const leadsTotal = counts.total;
+    // "Leads left" is the real not-yet-contacted count. When Instantly gave only
+    // the cumulative counter (notYetContacted unknown), fall back to a clamped
+    // total − contacted so we never claim more than the list — but this path is
+    // flagged (countsSource "counter") so the UI can say the number is partial.
+    const leadsRemaining =
+      counts.notYetContacted !== null
+        ? counts.notYetContacted
+        : Math.max(0, leadsTotal - (counts.contacted ?? 0));
+    const leadsContacted = counts.contacted ?? Math.min(pick(s, F.contacted, 0), leadsTotal);
     const sent = pick(s, F.sent, 0);
     const newContacted = pick(s, F.newContacted, 0);
 
@@ -617,10 +647,14 @@ export function computePlan({
           ? configuredPerSendingDay * sendingDayFactor
           : 0;
     const perSendingDay = sendingDayFactor > 0 ? perCalendarDay / sendingDayFactor : perCalendarDay;
+    // A campaign only counts as finished when Instantly's OWN not-yet-contacted
+    // is a real zero. When we only had the cumulative counter (notYetContacted
+    // unknown), never claim "done" — that was the original bug.
+    const remainingKnown = counts.notYetContacted !== null;
     const daysToFinish =
       perCalendarDay > 0 && Number.isFinite(perCalendarDay) && leadsRemaining > 0
         ? leadsRemaining / perCalendarDay
-        : leadsRemaining === 0 && leadsTotal > 0
+        : remainingKnown && leadsRemaining === 0 && leadsTotal > 0
           ? 0 // whole list already contacted
           : null;
 
@@ -654,6 +688,11 @@ export function computePlan({
       leadsContacted,
       leadsRemaining,
       pctContacted: rate(leadsContacted, leadsTotal),
+      leadsCompleted: counts.completed,
+      leadsInProgress: counts.inProgress,
+      notYetContacted: counts.notYetContacted,
+      pctComplete: counts.pctComplete,
+      countsSource: counts.source,
       sentLast30: sent,
       // Per SENDING day, so it lines up with supplyDaily rather than being
       // deflated by the weekends nothing goes out on.
@@ -714,10 +753,13 @@ export function computePlan({
     const leadsRemaining = activeList.reduce((n, c) => n + c.leadsRemaining, 0);
     const leadRateCalendar = activeList.reduce((n, c) => n + c.newLeadsPerCalendarDay, 0);
     const groupLeadsTotal = activeList.reduce((n, c) => n + c.leadsTotal, 0);
+    // "Fully contacted" only if every active campaign's remaining is a REAL zero
+    // (Instantly's own not-yet-contacted), never off a partial counter fallback.
+    const groupRemainingKnown = activeList.every((c) => c.notYetContacted !== null);
     const groupDaysToFinish =
       leadsRemaining > 0 && leadRateCalendar > 0
         ? leadsRemaining / leadRateCalendar
-        : groupLeadsTotal > 0
+        : groupRemainingKnown && groupLeadsTotal > 0
           ? 0 // list fully contacted
           : null; // no list to finish
     const groupFinishDate =
@@ -731,6 +773,7 @@ export function computePlan({
       demandDaily,
       supplyDaily,
       gapDaily: gap,
+      surplusDaily: Math.max(0, supplyDaily - demandDaily),
       mailboxes: groupBoxes.length,
       exclusiveMailboxes: groupBoxes.length - shared,
       sharedMailboxes: shared,

@@ -124,7 +124,12 @@ export function diagnoseSupply({
   const confidence: SupplyDiagnosis["confidence"] =
     observed === 0 ? "configured" : observed === active.length ? "observed" : "mixed";
 
-  const outOfLeads = active.filter((c) => c.leadsTotal > 0 && c.leadsRemaining <= 0);
+  // A campaign is only "out of leads" when Instantly's OWN not-yet-contacted is
+  // a real zero — never off the cumulative counter, which used to overshoot and
+  // flag a live campaign as drained.
+  const outOfLeads = active.filter(
+    (c) => c.leadsTotal > 0 && c.notYetContacted !== null && c.notYetContacted <= 0,
+  );
   const withLeadsLeft = active.filter((c) => c.leadsRemaining > 0);
 
   // A zero intake rate means two very different things. If campaigns still hold
