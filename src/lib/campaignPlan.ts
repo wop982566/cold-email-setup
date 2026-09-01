@@ -392,6 +392,11 @@ export function healthOf(boxes: PlannerMailbox[], placement?: PlacementInput): H
     parts.push(`worst placement ${Math.round(worstPlacement.inboxRate)}% (${worstPlacement.email})`);
   }
 
+  // When every scored mailbox reports the same high warmup score, the number is
+  // not distinguishing anything — don't let it read as a clean bill of health.
+  const distinctScores = new Set(scored.map((b) => Math.round(b.warmupScore)));
+  const flatWarmup = scored.length >= 3 && distinctScores.size === 1 && [...distinctScores][0] >= 99;
+
   return {
     score,
     band: bandFor(score, scored.length),
@@ -402,7 +407,13 @@ export function healthOf(boxes: PlannerMailbox[], placement?: PlacementInput): H
     weakest,
     placementChecked,
     worstPlacement,
-    note: parts.length ? parts.join(" · ") : scored.length ? "all mailboxes healthy" : "no scores reported",
+    note: parts.length
+      ? parts.join(" · ")
+      : flatWarmup
+        ? `warmup score flat at ${[...distinctScores][0]} — not a reliable health signal`
+        : scored.length
+          ? "all mailboxes healthy"
+          : "no scores reported",
   };
 }
 

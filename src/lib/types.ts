@@ -416,6 +416,7 @@ export interface AppSettings {
   maintenance_critical_score: number; // below this, pull it now
   maintenance_new_mailbox_days: number; // younger than this, a low score is just warmup
   maintenance_min_inbox_rate: number; // inbox-vs-spam placement floor
+  maintenance_max_bounce_rate: number; // above this real-send bounce %, a mailbox needs replacing
   // --- Automatic swapping (daily scheduled function) -----------------------
   // The env var AUTO_SWAP_ENABLED is the kill switch; these tune it.
   auto_swap_max_per_run: number; // hard ceiling on swaps in one run
@@ -449,6 +450,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maintenance_critical_score: 50,
   maintenance_new_mailbox_days: 21,
   maintenance_min_inbox_rate: 80,
+  maintenance_max_bounce_rate: 5,
   auto_swap_max_per_run: 2,
   auto_swap_min_bad_days: 1,
   auto_swap_notify_email: "webofpicasso@gmail.com",

@@ -119,7 +119,17 @@ export default function Planner() {
 
   // Same keys as the Instantly page and the Sending Health card, so all three
   // share one fetch and the Instantly Refresh button invalidates them.
-  const acctQ = useQuery({ queryKey: ["inst", "acct"], queryFn: () => instantly.accounts(), staleTime: 60_000 });
+  // The health signals below (accounts, placement, per-mailbox sends) drive the
+  // mailbox Health column. Refetch daily so an always-open tab stays current
+  // without a manual refresh; they're already live on each load.
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const acctQ = useQuery({
+    queryKey: ["inst", "acct"],
+    queryFn: () => instantly.accounts(),
+    staleTime: 60_000,
+    refetchInterval: DAY_MS,
+    refetchOnWindowFocus: true,
+  });
   const campQ = useQuery({ queryKey: ["inst", "camplist"], queryFn: () => instantly.campaigns(), staleTime: 60_000 });
   const statsQ = useQuery({
     queryKey: ["inst", "camp", "30d"],
@@ -144,6 +154,8 @@ export default function Planner() {
     queryKey: ["inst", "placement", placementEmails],
     enabled: placementEmails.length > 0,
     staleTime: 5 * 60_000,
+    refetchInterval: DAY_MS,
+    refetchOnWindowFocus: true,
     queryFn: async (): Promise<PlacementMap> => {
       // The endpoint caps at 100 emails per call. Batches run in sequence to
       // stay polite with the API — 100 mailboxes is one request.
@@ -200,6 +212,8 @@ export default function Planner() {
     queryKey: ["inst", "acct-analytics", 30],
     queryFn: () => instantly.accountAnalytics(30),
     staleTime: 5 * 60_000,
+    refetchInterval: DAY_MS,
+    refetchOnWindowFocus: true,
   });
 
   const sends = useMemo(() => {
@@ -223,6 +237,19 @@ export default function Planner() {
       sendingDaysPerWeek: settings.sending_days_per_week,
     });
   }, [inboxQ.data, settings]);
+
+  // Real per-mailbox sends + bounce, for the health score. Supplied to
+  // computeMaintenance only when the workspace actually reports them, so its
+  // presence doubles as the "sends are supported" signal (a live-campaign
+  // mailbox absent from the map has genuinely sent nothing).
+  const mailboxSends = useMemo(() => {
+    if (!inboxSends?.supported) return undefined;
+    const m = new Map<string, { sentLast30: number; bounced: number; bounceRate: number | null }>();
+    for (const [email, s] of inboxSends.byEmail) {
+      m.set(email, { sentLast30: s.sentLast30, bounced: s.bounced, bounceRate: s.bounceRate });
+    }
+    return m;
+  }, [inboxSends]);
 
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
@@ -358,12 +385,15 @@ export default function Planner() {
       settings,
       placement: placementHealthInput,
       recovering,
+      // Real per-mailbox sends/bounce — flags a burned inbox even when its
+      // warmup score reads a flat 100.
+      sends: mailboxSends,
       // Supplying this at all turns niche gating on, so the tab refuses
       // cross-niche swaps exactly as the cron does.
       tagMap,
       campaignTagsById: tagAssignments.byCampaign,
     });
-  }, [plan, domains, settings, placementHealthInput, recovering, tagMap, tagAssignments]);
+  }, [plan, domains, settings, placementHealthInput, recovering, mailboxSends, tagMap, tagAssignments]);
 
   // The growth calculator: sizes the whole fleet (campaigns, sending inboxes,
   // per-niche spares, domains) for the goal, against what already exists. The
@@ -1085,6 +1115,9 @@ export default function Planner() {
                 <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
                   <th className="w-12 px-3 py-2">Use</th>
                   <th className="px-3 py-2">Mailbox</th>
+                  <th className="w-24 px-3 py-2" title="Composite deliverability score — bounce rate, inbox placement and account status, not the warmup number">
+                    Health
+                  </th>
                   <th className="w-20 px-3 py-2">Limit</th>
                   <th className="w-28 px-3 py-2">Sending</th>
                   <th className="w-24 px-3 py-2">Last used</th>
@@ -1124,6 +1157,41 @@ export default function Planner() {
                       />
                     </td>
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>
+                    {/* Composite real-health score — bounce/placement/status, not
+                        the warmup number. Reasons on hover; "—" when there isn't
+                        enough real signal yet. */}
+                    <td className="px-3 py-2">
+                      {(() => {
+                        const h = healthByEmail.get(b.email);
+                        if (!h || h.healthScore === null) {
+                          return (
+                            <span
+                              className="text-muted"
+                              title={
+                                h && h.healthReasons.length
+                                  ? h.healthReasons.join(" · ")
+                                  : "Not enough real deliverability data yet"
+                              }
+                            >
+                              —
+                            </span>
+                          );
+                        }
+                        const tone =
+                          h.healthBand === "good"
+                            ? "mint"
+                            : h.healthBand === "watch"
+                              ? "sky"
+                              : h.healthBand === "warn"
+                                ? "sun"
+                                : "danger";
+                        return (
+                          <span title={h.healthReasons.join(" · ") || undefined}>
+                            <Badge tone={tone}>{h.healthScore}</Badge>
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="px-3 py-2">{fmtNumber(b.dailyLimit)}</td>
                     {/* Real measured sends, or nothing. Never a share of a
                         campaign total dressed up as a per-inbox figure. */}

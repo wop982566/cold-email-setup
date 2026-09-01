@@ -19,6 +19,10 @@ export interface InboxSends {
   email: string;
   sentLast30: number;
   sentPerDay: number;
+  /** Real bounces in the window, when the payload reports them; 0 when it doesn't. */
+  bounced: number;
+  /** bounced / sent as a percentage, or null when there is nothing to divide. */
+  bounceRate: number | null;
 }
 
 export type InboxSendsResult =
@@ -27,6 +31,7 @@ export type InboxSendsResult =
 
 const F = {
   sent: ["sent", "emails_sent_count", "sent_count", "emails_sent", "total_sent", "sent_total"],
+  bounced: ["bounced", "bounced_count", "bounce_count", "total_bounced", "bounces"],
 };
 
 type Obj = Record<string, unknown>;
@@ -67,19 +72,38 @@ export function parseInboxSends(
   const windowDays = Math.max(1, opts.windowDays ?? 30);
   const factor = Math.min(7, Math.max(1, opts.sendingDaysPerWeek ?? 5)) / 7;
 
+  // A bounce field that is genuinely absent must not read as 0 bounces — 0 and
+  // "not reported" are different facts, and only the former earns a clean rate.
+  const bounceReported = new Set<string>();
+
   const byEmail = new Map<string, InboxSends>();
   for (const row of rows) {
     if (!isObj(row)) continue;
     const email = emailOf(row);
     if (!email) continue;
     const sent = pick(row, F.sent, 0);
+    const bounced = pick(row, F.bounced, -1);
+    if (bounced >= 0) bounceReported.add(email);
     const prev = byEmail.get(email);
     const total = (prev?.sentLast30 ?? 0) + sent;
+    const totalBounced = (prev?.bounced ?? 0) + Math.max(0, bounced);
     byEmail.set(email, {
       email,
       sentLast30: total,
       sentPerDay: factor > 0 ? total / windowDays / factor : 0,
+      bounced: totalBounced,
+      // Filled after the loop, once the per-email totals are final.
+      bounceRate: null,
     });
+  }
+
+  // Resolve bounce rate now that sums are complete: a real percentage only when
+  // this mailbox reported bounces AND actually sent something.
+  for (const [email, r] of byEmail) {
+    r.bounceRate =
+      bounceReported.has(email) && r.sentLast30 > 0
+        ? (r.bounced / r.sentLast30) * 100
+        : null;
   }
 
   // Rows that carry no send figures at all are the same as no rows: the shape

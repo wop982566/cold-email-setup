@@ -25,6 +25,9 @@ export type IssueCode =
   | "warmup_off"
   | "warmup_unknown"
   | "spam_placement"
+  | "bounce_critical"
+  | "bounce_high"
+  | "stalled"
   | "domain_expired"
   | "domain_expiring"
   | "domain_dns"
@@ -32,6 +35,29 @@ export type IssueCode =
 
 export type Severity = "critical" | "warn" | "watch";
 export type Verdict = "replace" | "attention" | "watch" | "ok" | "ramping";
+
+/** The composite "real health" band — never the warmup score alone. */
+export type HealthBand = "good" | "watch" | "warn" | "critical" | "unknown";
+
+/** Per-mailbox real-send stats, from account-analytics (when the workspace reports them). */
+export interface MailboxSendStat {
+  sentLast30: number;
+  bounced: number;
+  bounceRate: number | null;
+}
+
+/**
+ * Whether Instantly's warmup score is still telling us anything. When every
+ * account reports the same number (the flat-100 case the operator hit), or none
+ * reports one at all, the score can't distinguish a healthy inbox from a burned
+ * one — so we say so instead of rendering a wall of green.
+ */
+export interface WarmupSignal {
+  discriminating: boolean;
+  reason: string;
+  scored: number;
+  unknown: number;
+}
 
 export interface Issue {
   code: IssueCode;
@@ -46,8 +72,16 @@ export interface MailboxHealth {
   box: PlannerMailbox;
   verdict: Verdict;
   issues: Issue[];
-  score: number | null; // null when genuinely unknown
+  score: number | null; // Instantly warmup score — null when genuinely unknown
   inboxRate: number | null; // from warmup analytics, when available
+  /** Real bounce rate on real sends, when account-analytics reports it. */
+  bounceRate: number | null;
+  /** Real sends in the analytics window; null when the workspace doesn't report per-mailbox sends. */
+  sentLast30: number | null;
+  /** Composite deliverability score, 0-100 — the "real health" the warmup score can't fake. */
+  healthScore: number | null;
+  healthBand: HealthBand;
+  healthReasons: string[];
   ageDays: number | null;
   mature: boolean;
   domain: Domain | null;
@@ -74,6 +108,8 @@ export interface Maintenance {
   unassigned: MailboxHealth[];
   candidates: MailboxHealth[];
   shortfall: number;
+  /** Whether Instantly's warmup score is still a usable signal (see WarmupSignal). */
+  warmupSignal: WarmupSignal;
   /** False when no tag map was supplied — gating is off and swaps ignore niche. */
   tagGatingActive: boolean;
   /** Healthy spares that can never be used until someone tags them. */
@@ -100,6 +136,12 @@ export interface MaintenanceInput {
    * them one way, the other, or both.
    */
   campaignTagsById?: Map<string, string[]>;
+  /**
+   * Real per-mailbox sends/bounces. Supplied ⇒ the workspace reports them, so a
+   * live-campaign mailbox absent from the map has genuinely sent nothing
+   * (stalled). Omitted ⇒ no real-send judgments are made.
+   */
+  sends?: Map<string, MailboxSendStat>;
   settings: AppSettings;
   today?: Date;
 }
@@ -109,10 +151,130 @@ const DEF = {
   criticalScore: 50,
   maturityDays: 21,
   minInboxRate: 80,
+  maxBounce: 5,
 };
+
+/** Real sends needed before a bounce rate means anything — a 1/2 fluke must not flag. */
+const MIN_BOUNCE_SAMPLE = 20;
 
 function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function bandOf(score: number | null): HealthBand {
+  if (score === null) return "unknown";
+  if (score >= 80) return "good";
+  if (score >= 60) return "watch";
+  if (score >= 40) return "warn";
+  return "critical";
+}
+
+/**
+ * The composite "real health" score. Blends only the signals that reflect
+ * genuine deliverability — inbox placement and real-send bounce rate — with the
+ * warmup score demoted to a minor input, and dropped entirely when it has gone
+ * flat (see WarmupSignal). Never penalises an unmeasured signal; returns null
+ * only when there is nothing real to go on.
+ */
+export function computeHealthScore(args: {
+  inActive: boolean;
+  active: boolean;
+  setupPending: boolean;
+  inboxRate: number | null;
+  bounceRate: number | null;
+  sentLast30: number | null;
+  sendsSupported: boolean;
+  warmupScore: number | null;
+  warmupUsable: boolean;
+  domainExpired: boolean;
+  dnsUnverified: boolean;
+}): { score: number | null; band: HealthBand; reasons: string[] } {
+  const reasons: string[] = [];
+
+  // A mailbox that a live campaign can't send from is the worst kind of unhealthy.
+  if (args.inActive && (!args.active || args.setupPending)) {
+    return { score: 0, band: "critical", reasons: ["account not sending"] };
+  }
+
+  const stalled = args.inActive && args.sendsSupported && (args.sentLast30 ?? 0) === 0;
+
+  const parts: { v: number; w: number }[] = [];
+  if (args.inboxRate !== null) {
+    parts.push({ v: args.inboxRate, w: 0.5 });
+    reasons.push(`${Math.round(args.inboxRate)}% inbox placement`);
+  }
+  const bounceMeasured =
+    args.bounceRate !== null && (args.sentLast30 ?? 0) >= MIN_BOUNCE_SAMPLE;
+  if (bounceMeasured) {
+    parts.push({ v: clamp(100 - args.bounceRate! * 10, 0, 100), w: 0.4 });
+    reasons.push(`${args.bounceRate!.toFixed(1)}% bounce`);
+  }
+  if (args.warmupUsable && args.warmupScore !== null) {
+    parts.push({ v: args.warmupScore, w: 0.1 });
+  }
+
+  let score: number | null;
+  if (parts.length === 0) {
+    if (stalled) {
+      score = 30;
+      reasons.unshift("in a live campaign but not sending");
+    } else {
+      score = null;
+      reasons.push("no real deliverability data yet — Instantly's warmup score is flat");
+    }
+  } else {
+    const wsum = parts.reduce((n, p) => n + p.w, 0);
+    score = Math.round(parts.reduce((n, p) => n + p.v * p.w, 0) / wsum);
+    if (stalled) {
+      score = Math.min(score, 40);
+      reasons.push("in a live campaign but not sending");
+    }
+    if (args.domainExpired) {
+      score = Math.max(0, score - 40);
+      reasons.push("domain expired");
+    } else if (args.dnsUnverified) {
+      score = Math.max(0, score - 15);
+      reasons.push("DNS not verified");
+    }
+  }
+
+  return { score, band: bandOf(score), reasons };
+}
+
+/** Is Instantly's warmup score still discriminating, or has it gone flat? */
+export function assessWarmupSignal(scores: (number | null)[]): WarmupSignal {
+  const known = scores.filter((s): s is number => s !== null);
+  const scored = known.length;
+  const unknown = scores.length - scored;
+
+  if (scored === 0) {
+    return {
+      discriminating: false,
+      scored,
+      unknown,
+      reason:
+        unknown > 0
+          ? "No account is reporting a warmup score, so it can't be used to judge health."
+          : "No accounts to score.",
+    };
+  }
+  const distinct = new Set(known.map((s) => Math.round(s)));
+  // One value across a non-trivial fleet means the score isn't distinguishing
+  // anything — the flat-100 case, but also any other pinned value.
+  if (scored >= 3 && distinct.size === 1) {
+    const v = [...distinct][0];
+    return {
+      discriminating: false,
+      scored,
+      unknown,
+      reason: `Every account reports the same warmup score (${v}), so it can't tell a healthy inbox from a burned one — health below uses bounce rate and inbox placement instead.`,
+    };
+  }
+  return { discriminating: true, scored, unknown, reason: "" };
 }
 
 function norm(s: string): string {
@@ -150,6 +312,7 @@ export function computeMaintenance({
   recovering = new Set(),
   tagMap,
   campaignTagsById,
+  sends,
   settings,
   today,
 }: MaintenanceInput): Maintenance {
@@ -163,7 +326,11 @@ export function computeMaintenance({
   const criticalScore = num(s.maintenance_critical_score, DEF.criticalScore);
   const maturityDays = num(s.maintenance_new_mailbox_days, DEF.maturityDays);
   const minInboxRate = num(s.maintenance_min_inbox_rate, DEF.minInboxRate);
+  const maxBounce = num(s.maintenance_max_bounce_rate, DEF.maxBounce);
   const expiryWindow = num(settings.reminder_window_days, 30);
+  // Supplying the map at all means this workspace reports per-mailbox sends, so
+  // a live-campaign mailbox absent from it has genuinely sent nothing.
+  const sendsSupported = sends !== undefined;
 
   const ix = buildDomainIndex(domains);
   const campaignById = new Map(plan.campaigns.map((c) => [c.id, c]));
@@ -175,6 +342,12 @@ export function computeMaintenance({
     // Prefer the account's own score; fall back to whatever warmup analytics
     // reported, so a workspace that only exposes one of the two still works.
     const score = box.warmupScoreKnown ? box.warmupScore : (place?.score ?? null);
+
+    // Real-send signals, independent of the warmup score. When the workspace
+    // reports sends at all, a mailbox missing from the map has sent nothing.
+    const stat = sends?.get(box.email);
+    const sentLast30 = sendsSupported ? (stat?.sentLast30 ?? 0) : null;
+    const bounceRate = stat?.bounceRate ?? null;
 
     const ageDays = box.createdAt ? Math.max(0, -(daysUntil(box.createdAt) ?? 0)) : null;
     const hasSent = Boolean(box.lastUsedAt);
@@ -224,6 +397,24 @@ export function computeMaintenance({
       );
     }
 
+    // --- real-send bounce rate ---
+    // The signal a flat warmup score cannot hide: real recipients rejecting the
+    // mail. Only judged once there is a real sample behind the percentage.
+    if (bounceRate !== null && (sentLast30 ?? 0) >= MIN_BOUNCE_SAMPLE) {
+      if (bounceRate >= maxBounce) {
+        add("bounce_critical", "critical", `${bounceRate.toFixed(1)}% bounce rate — above ${maxBounce}%`, true);
+      } else if (bounceRate >= 3) {
+        add("bounce_high", "warn", `${bounceRate.toFixed(1)}% bounce rate`);
+      }
+    }
+
+    // --- stalled: in a live campaign yet sending nothing ---
+    // Suspicious rather than proven-bad (a campaign may be legitimately paused),
+    // so it flags for the operator's attention without forcing a swap.
+    if (inActive && sendsSupported && (sentLast30 ?? 0) === 0) {
+      add("stalled", "warn", "In a live campaign but hasn't sent in 30 days");
+    }
+
     // --- domain ---
     if (!domain) {
       add("domain_untracked", "watch", `${domainName} isn't in your Domains list`);
@@ -260,6 +451,11 @@ export function computeMaintenance({
       issues,
       score,
       inboxRate,
+      bounceRate,
+      sentLast30,
+      healthScore: null, // filled below (needs the fleet-wide warmup signal)
+      healthBand: "unknown" as HealthBand,
+      healthReasons: [] as string[],
       ageDays,
       mature,
       domain,
@@ -268,6 +464,33 @@ export function computeMaintenance({
       available: false, // filled below
     };
   });
+
+  // --- Is the warmup score still discriminating? -------------------------
+  // Computed across the fleet so the composite score can drop a flat-100 signal.
+  const warmupSignal = assessWarmupSignal(
+    mailboxes.filter((m) => m.box.active && !m.box.setupPending).map((m) => m.score),
+  );
+
+  // --- Composite "real health" score, per mailbox ------------------------
+  for (const m of mailboxes) {
+    const days = m.domain ? daysUntil(m.domain.expiry_date) : null;
+    const h = computeHealthScore({
+      inActive: m.box.campaignIds.length > 0,
+      active: m.box.active,
+      setupPending: m.box.setupPending,
+      inboxRate: m.inboxRate,
+      bounceRate: m.bounceRate,
+      sentLast30: m.sentLast30,
+      sendsSupported,
+      warmupScore: m.score,
+      warmupUsable: warmupSignal.discriminating,
+      domainExpired: days !== null && days < 0,
+      dnsUnverified: m.domain?.dns_status === "No",
+    });
+    m.healthScore = h.score;
+    m.healthBand = h.band;
+    m.healthReasons = h.reasons;
+  }
 
   const byEmail = new Map(mailboxes.map((m) => [m.box.email, m]));
 
@@ -427,6 +650,7 @@ export function computeMaintenance({
     unassigned,
     candidates,
     shortfall: unassigned.length,
+    warmupSignal,
     tagGatingActive,
     // Healthy, free, and unusable until tagged — the state that otherwise looks
     // identical to having no spares at all.

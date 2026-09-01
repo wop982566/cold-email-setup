@@ -57,10 +57,42 @@ const SEV_TONE: Record<string, "danger" | "sun" | "sky"> = {
   watch: "sky",
 };
 
-function ScoreBadge({ m }: { m: MailboxHealth }) {
-  if (m.score === null) return <Badge tone="white">no score</Badge>;
-  const tone = m.score >= 85 ? "mint" : m.score >= 70 ? "sky" : m.score >= 50 ? "sun" : "danger";
-  return <Badge tone={tone}>{m.score}</Badge>;
+// The Instantly warmup score. Labelled as such (via title) so a flat 100 never
+// reads as a deliverability guarantee — the composite HealthBadge is the real
+// verdict. `warmupFlat` greys it out when the score has stopped discriminating.
+function ScoreBadge({ m, warmupFlat = false }: { m: MailboxHealth; warmupFlat?: boolean }) {
+  const title = `Instantly warmup score${warmupFlat ? " — flat/unreliable right now" : ""}`;
+  if (m.score === null)
+    return (
+      <span title={title}>
+        <Badge tone="white">warmup: no score</Badge>
+      </span>
+    );
+  const tone = warmupFlat
+    ? "white"
+    : m.score >= 85 ? "mint" : m.score >= 70 ? "sky" : m.score >= 50 ? "sun" : "danger";
+  return (
+    <span title={title}>
+      <Badge tone={tone}>warmup {m.score}</Badge>
+    </span>
+  );
+}
+
+/** The composite "real health" score badge — bounce/placement/status, not warmup. */
+function HealthBadge({ m }: { m: MailboxHealth }) {
+  if (m.healthScore === null)
+    return (
+      <span title={m.healthReasons.join(" · ") || "Not enough real deliverability data yet"}>
+        <Badge tone="white">health —</Badge>
+      </span>
+    );
+  const tone =
+    m.healthBand === "good" ? "mint" : m.healthBand === "watch" ? "sky" : m.healthBand === "warn" ? "sun" : "danger";
+  return (
+    <span title={m.healthReasons.join(" · ") || undefined}>
+      <Badge tone={tone}>health {m.healthScore}</Badge>
+    </span>
+  );
 }
 
 /** Inbox-vs-spam rate. Renders nothing when unmeasured — silence beats a zero. */
@@ -609,6 +641,13 @@ export function CampaignMaintenance({
   if (!m) return null;
 
   const totalBoxes = m.mailboxes.length;
+  // When Instantly's warmup score has gone flat, the tab must not pretend health
+  // is known from it. These drive the honest banner + the campaign-bounce fallback.
+  const warmupFlat = !m.warmupSignal.discriminating;
+  const sendsSupported = m.mailboxes.some((mb) => mb.sentLast30 !== null);
+  const bounceCampaigns = plan.campaigns
+    .filter((c) => c.active && c.bounceRate > 3)
+    .sort((a, b) => b.bounceRate - a.bounceRate);
 
   return (
     <div className="space-y-4">
@@ -759,9 +798,46 @@ export function CampaignMaintenance({
         <StatCard label="Warming" value={m.stats.ramping} sublabel="low score, but still new" tone="lavender" />
       </div>
 
-      {m.proposals.length === 0 && m.shortfall === 0 ? (
+      {/* Honesty first: never claim "all healthy" off a warmup score that has
+          gone flat. When it's flat, say so and point at the real signals. */}
+      {warmupFlat ? (
+        <Card className="flex items-start gap-2 border-ink bg-sun/30 p-4 text-sm">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0" />
+          <div>
+            <p className="font-bold">Warmup score isn&apos;t a usable health signal right now.</p>
+            <p className="mt-1">{m.warmupSignal.reason}</p>
+            <p className="mt-1 text-ink/70">
+              The <b>Health</b> column and the flags below use <b>bounce rate</b> and{" "}
+              <b>inbox placement</b> instead — the signals a flat warmup number can&apos;t fake.
+            </p>
+          </div>
+        </Card>
+      ) : m.proposals.length === 0 && m.shortfall === 0 ? (
         <Card className="flex items-center gap-2 border-mint bg-mint/10 p-6 text-sm font-bold">
           <Check size={18} /> Every mailbox in a live campaign is healthy.
+        </Card>
+      ) : null}
+
+      {/* When Instantly won't break bounces down per mailbox, campaign-level
+          bounce is still real — surface the worst so they're not invisible. */}
+      {!sendsSupported && bounceCampaigns.length > 0 ? (
+        <Card className="border-ink bg-coral/10 p-4 text-sm">
+          <p className="flex items-center gap-2 font-bold">
+            <AlertTriangle size={16} className="shrink-0" /> High bounce rate on{" "}
+            {bounceCampaigns.length} campaign{bounceCampaigns.length === 1 ? "" : "s"}
+          </p>
+          <p className="mt-1 text-xs text-ink/70">
+            Instantly doesn&apos;t report per-mailbox bounces for this workspace, so check these
+            campaigns&apos; inboxes by hand — a high bounce rate burns reputation fast.
+          </p>
+          <ul className="mt-2 space-y-1">
+            {bounceCampaigns.slice(0, 8).map((c) => (
+              <li key={c.id} className="flex items-center justify-between gap-2">
+                <span className="truncate">{c.name}</span>
+                <Badge tone={c.bounceRate >= 5 ? "danger" : "sun"}>{c.bounceRate.toFixed(1)}%</Badge>
+              </li>
+            ))}
+          </ul>
         </Card>
       ) : null}
 
@@ -774,7 +850,8 @@ export function CampaignMaintenance({
               <div className="min-w-0">
                 <p className="truncate font-bold">{p.bad.box.email}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-1">
-                  <ScoreBadge m={p.bad} />
+                  <HealthBadge m={p.bad} />
+                  <ScoreBadge m={p.bad} warmupFlat={warmupFlat} />
                   <PlaceBadge email={p.bad.box.email} placement={placement} />
                   {p.bad.issues
                     .filter((i) => i.triggersReplacement)
@@ -789,7 +866,8 @@ export function CampaignMaintenance({
               <div className="min-w-0">
                 <p className="truncate font-bold">{to.box.email}</p>
                 <div className="mt-1 flex flex-wrap items-center gap-1">
-                  <ScoreBadge m={to} />
+                  <HealthBadge m={to} />
+                  <ScoreBadge m={to} warmupFlat={warmupFlat} />
                   <PlaceBadge email={to.box.email} placement={placement} />
                   <span className="text-[11px] text-muted">{p.reasons.join(" · ")}</span>
                 </div>

@@ -164,6 +164,35 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
   deploys. If the branch carrying this code is a branch deploy rather than the
   production branch, the cron never fires however the env vars are set.
 
+### Real inbox health (not the warmup score)
+
+Instantly's warmup score can go **flat at 100 for every account** — and when it
+does, judging health from it alone paints the whole fleet green while burned
+inboxes hide in plain sight. So health is a **composite** built from signals a
+flat warmup number can't fake:
+
+- **Bounce rate** on real sends — per mailbox when Instantly's `account-analytics`
+  reports it (only counted once there are at least ~20 real sends behind the
+  percentage, so a 1/2 fluke never flags), and per campaign otherwise. Above
+  `maintenance_max_bounce_rate` (default **5%**) a mailbox is flagged for
+  replacement — even at warmup 100.
+- **Inbox-vs-spam placement** from warmup analytics — a mailbox landing in spam
+  is flagged regardless of its score.
+- **Account status** (broken / paused / setup-pending) and **stalled sending** (in
+  a live campaign but nothing sent in 30 days).
+- **Domain** auth (DNS verified) and expiry.
+
+The blend is shown as a **Health** column on the first Planner tab's mailbox list
+(green/amber/red, with the exact reasons on hover) and refreshes daily. The
+warmup number is still shown, but labelled as *Instantly warmup* so a flat 100
+never reads as a deliverability guarantee. When the warmup signal has gone flat,
+the Maintenance tab replaces its green "all healthy" banner with a plain warning
+that says so and points at the real signals. Mailboxes the composite marks bad
+become ordinary swap proposals — **Apply** writes them out and files them in
+Recovery / the Swap archive, exactly like any other swap. (This drives the
+Maintenance tab's proposals; the daily auto-swapper is unchanged and does not act
+on the bounce signal on its own.)
+
 ### Test a swap (Maintenance tab)
 
 To prove the automation end-to-end, the Maintenance tab has a **Test a swap**
