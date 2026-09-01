@@ -174,11 +174,14 @@ function bandOf(score: number | null): HealthBand {
 }
 
 /**
- * The composite "real health" score. Blends only the signals that reflect
- * genuine deliverability — inbox placement and real-send bounce rate — with the
- * warmup score demoted to a minor input, and dropped entirely when it has gone
- * flat (see WarmupSignal). Never penalises an unmeasured signal; returns null
- * only when there is nothing real to go on.
+ * The composite "real health" score. The rule that makes it honest: a signal
+ * only earns a *high* score if it actually proves real-recipient deliverability
+ * — real-send bounce rate, or a warmup score that is still discriminating.
+ * Warmup-network inbox placement can only ever LOWER the score (landing in spam
+ * even on the warmup network is a real red flag); a ~100% warmup placement is
+ * NOT proof that real recipients see you in the inbox, so it never props the
+ * score up. With no real-send signal and nothing proving a problem, the answer
+ * is an honest "unverified" (null), never a reassuring 100.
  */
 export function computeHealthScore(args: {
   inActive: boolean;
@@ -201,45 +204,43 @@ export function computeHealthScore(args: {
   }
 
   const stalled = args.inActive && args.sendsSupported && (args.sentLast30 ?? 0) === 0;
+  const bounceMeasured = args.bounceRate !== null && (args.sentLast30 ?? 0) >= MIN_BOUNCE_SAMPLE;
+  const spamPlacement = args.inboxRate !== null && args.inboxRate < DEF.minInboxRate;
 
-  const parts: { v: number; w: number }[] = [];
-  if (args.inboxRate !== null) {
-    parts.push({ v: args.inboxRate, w: 0.5 });
-    reasons.push(`${Math.round(args.inboxRate)}% inbox placement`);
-  }
-  const bounceMeasured =
-    args.bounceRate !== null && (args.sentLast30 ?? 0) >= MIN_BOUNCE_SAMPLE;
+  // --- Positive evidence: the only things that earn a HIGH score ---
+  const pos: { v: number; w: number }[] = [];
   if (bounceMeasured) {
-    parts.push({ v: clamp(100 - args.bounceRate! * 10, 0, 100), w: 0.4 });
-    reasons.push(`${args.bounceRate!.toFixed(1)}% bounce`);
+    pos.push({ v: clamp(100 - args.bounceRate! * 10, 0, 100), w: 0.7 });
+    reasons.push(`${args.bounceRate!.toFixed(1)}% bounce on ${args.sentLast30} real sends`);
   }
   if (args.warmupUsable && args.warmupScore !== null) {
-    parts.push({ v: args.warmupScore, w: 0.1 });
+    pos.push({ v: args.warmupScore, w: 0.3 });
+    if (!bounceMeasured) reasons.push(`warmup score ${args.warmupScore}`);
+  }
+  const wsum = pos.reduce((n, p) => n + p.w, 0);
+  let base: number | null = pos.length ? Math.round(pos.reduce((n, p) => n + p.v * p.w, 0) / wsum) : null;
+
+  // --- Negative caps: real problems that hold the score down even with no proof of health ---
+  const caps: { max: number; reason: string }[] = [];
+  if (spamPlacement) {
+    caps.push({ max: Math.round(args.inboxRate!), reason: `only ${Math.round(args.inboxRate!)}% landing in inbox (warmup network)` });
+  }
+  if (stalled) caps.push({ max: 30, reason: "in a live campaign but hasn't sent in 30 days" });
+  if (args.domainExpired) caps.push({ max: 20, reason: "domain expired" });
+  else if (args.dnsUnverified) caps.push({ max: 60, reason: "DNS not verified" });
+
+  let score = base;
+  for (const c of caps) {
+    score = score === null ? c.max : Math.min(score, c.max);
+    reasons.push(c.reason);
   }
 
-  let score: number | null;
-  if (parts.length === 0) {
-    if (stalled) {
-      score = 30;
-      reasons.unshift("in a live campaign but not sending");
-    } else {
-      score = null;
-      reasons.push("no real deliverability data yet — Instantly's warmup score is flat");
-    }
-  } else {
-    const wsum = parts.reduce((n, p) => n + p.w, 0);
-    score = Math.round(parts.reduce((n, p) => n + p.v * p.w, 0) / wsum);
-    if (stalled) {
-      score = Math.min(score, 40);
-      reasons.push("in a live campaign but not sending");
-    }
-    if (args.domainExpired) {
-      score = Math.max(0, score - 40);
-      reasons.push("domain expired");
-    } else if (args.dnsUnverified) {
-      score = Math.max(0, score - 15);
-      reasons.push("DNS not verified");
-    }
+  if (score === null) {
+    reasons.push(
+      args.sendsSupported
+        ? "no bounce sample yet — real deliverability unverified"
+        : "deliverability unverified — Instantly reports no per-mailbox bounce data, and warmup-network placement can't prove real-recipient inbox placement",
+    );
   }
 
   return { score, band: bandOf(score), reasons };

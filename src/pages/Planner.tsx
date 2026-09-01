@@ -444,10 +444,14 @@ export default function Planner() {
   const notConfigured = queries.some((q) => q.data?.configured === false);
   const loading = queries.some((q) => q.isLoading);
   const allFailed = queries.every((q) => q.data && !q.data.ok);
+  // Everything the Health column is computed from — so the Refresh button spins
+  // until the real health signals (accounts, placement, per-mailbox bounce) have
+  // actually re-pulled, not just the first three.
+  const healthFetching = [acctQ, campQ, statsQ, placeQ, inboxQ].some((q) => q.isFetching);
 
   function refresh() {
     qc.invalidateQueries({ queryKey: ["inst"] });
-    toast.push("Refreshing Instantly data…", "info");
+    toast.push("Re-pulling live accounts, placement and bounce data…", "info");
   }
 
   async function patchSettings(patch: Partial<AppSettings>) {
@@ -541,8 +545,14 @@ export default function Planner() {
         <Link to="/instantly" className="btn-ghost btn-sm">
           Instantly
         </Link>
-        <button className="btn-ghost btn-sm" onClick={refresh}>
-          <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Refresh
+        <button
+          className="btn-primary btn-sm"
+          onClick={refresh}
+          disabled={healthFetching}
+          title="Re-pull live Instantly data now and recompute the mailbox Health column"
+        >
+          <RefreshCw size={14} className={healthFetching ? "animate-spin" : ""} />{" "}
+          {healthFetching ? "Refreshing…" : "Refresh health"}
         </button>
       </div>
     </Card>
@@ -1107,7 +1117,11 @@ export default function Planner() {
           <div className="max-h-96 overflow-auto">
             {inboxSends && !inboxSends.supported ? (
               <p className="border-b border-ink/10 bg-sun/20 px-3 py-2 text-[11px]">
-                <b>Sending shows n/a:</b> {inboxSends.reason}
+                <b>Sending &amp; per-mailbox bounce show n/a:</b> {inboxSends.reason} Without real
+                bounce data, <b>Health</b> reads <b>“—” (unverified)</b> for inboxes that show no
+                other problem — a flat warmup score and warmup-network placement can’t prove real
+                inbox placement, so the tool won’t fake a green score. Provably-bad inboxes (spam
+                placement, broken, stalled, expired domain) still score red/amber.
               </p>
             ) : null}
             <table className="w-full min-w-[720px] border-collapse text-left text-sm">
