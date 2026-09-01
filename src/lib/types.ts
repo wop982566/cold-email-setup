@@ -313,6 +313,28 @@ export interface TestSwapRecord extends BaseRow {
   status: "active" | "reverted" | "failed";
 }
 
+// --- Autopopulate runs -----------------------------------------------------
+/**
+ * One Autopopulate run: which idle inboxes were appended to which campaigns to
+ * fill their daily sending capacity. Durable so "which emails were populated"
+ * is a copyable audit trail, not a toast that vanishes. Per-campaign `outcome`
+ * mirrors WriteResult's three states — an unconfirmed write is never success.
+ */
+export interface PopulateRun extends BaseRow {
+  ran_at: string;
+  campaigns: {
+    campaignId: string;
+    campaignName: string;
+    added: string[];
+    beforeCount: number;
+    afterCount: number;
+    outcome: "applied" | "unconfirmed" | "failed";
+    error?: string;
+  }[];
+  totalAdded: number;
+  log?: string[];
+}
+
 // --- Mailbox recovery ------------------------------------------------------
 // "recovered" and "restored" are deliberately separate: the first releases a
 // mailbox back into the spare pool for FUTURE swaps, the second puts it back
@@ -473,6 +495,7 @@ export const TABLES = {
   recovery: "mailbox_recovery",
   autoSwapRuns: "auto_swap_runs",
   testSwaps: "test_swaps",
+  populateRuns: "populate_runs",
   setupBatches: "setup_batches",
   mailboxTags: "mailbox_tags",
   mailProfiles: "mail_profiles",

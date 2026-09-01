@@ -265,6 +265,14 @@ export const instantly = {
     payload: { campaignId: string; remove: string; add: string; expectedList?: string[] },
     dryRun = false,
   ) => write({ op: "set-campaign-emails", ...payload, dryRun }),
+
+  // Append inboxes to a campaign without removing any — autopopulate. `add` is a
+  // list; the server skips ones already attached, verifies the read-back, and
+  // `expectedList` aborts if the campaign changed since the page loaded.
+  addCampaignEmails: (
+    payload: { campaignId: string; add: string[]; expectedList?: string[] },
+    dryRun = false,
+  ) => write({ op: "add-campaign-emails", ...payload, dryRun }),
 };
 
 // Pull a numeric stat from a record trying several known Instantly field names.

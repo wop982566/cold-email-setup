@@ -193,6 +193,33 @@ Recovery / the Swap archive, exactly like any other swap. (This drives the
 Maintenance tab's proposals; the daily auto-swapper is unchanged and does not act
 on the bounce signal on its own.)
 
+### Autopopulate campaigns (Plan tab)
+
+A campaign that isn't attached to enough inboxes can't hit its daily sending
+limit. **Autopopulate** fills the gap: for every active campaign below its limit
+it adds **idle** inboxes (attached to no campaign) whose **niche tag matches the
+campaign's** — an AEO-tagged idle inbox goes to an AEO campaign, never a CBD one —
+until the campaign's attached daily capacity reaches its limit. It reuses the
+swapper's exact rules: niche gating (`eligibleFor`), one inbox to one campaign
+(a global reservation, worst-gap-first), and an idle inbox's full daily limit
+(an idle box shares with nothing, so no contention split).
+
+Nothing is written blind. The button computes a **preview** (pure
+`src/lib/autopopulate.ts` `planAutopopulate`) showing, per campaign, which inboxes
+it would add and the capacity before → after, plus the campaigns it *can't* fill
+and why (no niche tag, or idle inboxes free but none tagged for that niche).
+Confirm, and each campaign's additions are appended through a new verified write
+(`add-campaign-emails` — the swap op only substitutes, it can't grow a list),
+read back to confirm, with `expectedList` aborting if the campaign changed under
+you. Immature (still-warming) inboxes are included but flagged in the preview so
+you can back out.
+
+Every run is logged to `populate_runs` and rendered on the Plan tab: which inboxes
+went to which campaign, before/after counts, and per-campaign `applied` /
+`unconfirmed` / `failed` — so "which emails were populated" is a durable,
+copyable record, never a toast that vanishes. Requires `INSTANTLY_WRITE_ENABLED`;
+the button is disabled with the reason shown when writes are off.
+
 ### Test a swap (Maintenance tab)
 
 To prove the automation end-to-end, the Maintenance tab has a **Test a swap**

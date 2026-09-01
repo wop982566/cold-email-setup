@@ -61,6 +61,7 @@ import {
 import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
+import { AutopopulatePanel } from "../components/planner/AutopopulatePanel";
 import { AccountsTab } from "../components/planner/AccountsTab";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
@@ -1006,6 +1007,17 @@ export default function Planner() {
           </div>
         )}
       </Card>
+
+      {/* Fill campaigns short of their daily limit with matching-niche idle
+          inboxes, and keep a log of exactly what was populated. */}
+      <AutopopulatePanel
+        plan={p}
+        tagMap={tagMap}
+        campaignTagsById={tagAssignments.byCampaign}
+        overrides={settings.campaign_group_overrides ?? {}}
+        healthByEmail={healthByEmail}
+        onApplied={refresh}
+      />
 
       {/* What actually went out, against what the mailboxes could carry. */}
       {sends ? (
