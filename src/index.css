@@ -1,0 +1,95 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-display font-extrabold tracking-tight;
+  }
+
+  /* Custom scrollbar to match the chunky aesthetic */
+  ::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #000;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    border-radius: 999px;
+  }
+}
+
+@layer components {
+  /* The signature Gumroad "card": white, hard black border, hard shadow. */
+  .card {
+    @apply rounded-xl border-2 border-ink bg-paper shadow-hard;
+  }
+  .card-flat {
+    @apply rounded-xl border-2 border-ink bg-paper;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border-2 border-ink px-4 py-2 text-sm font-bold
+      transition-all duration-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-pink text-ink shadow-hard hover:bg-pink-dark;
+  }
+  .btn-dark {
+    @apply btn bg-ink text-paper shadow-hard hover:bg-[#1a1a1a];
+  }
+  .btn-ghost {
+    @apply btn bg-paper text-ink shadow-hard hover:bg-canvas;
+  }
+  .btn-sun {
+    @apply btn bg-sun text-ink shadow-hard hover:brightness-95;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+
+  .input {
+    @apply w-full rounded-xl border-2 border-ink bg-paper px-3 py-2 text-sm font-medium
+      placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-pink focus:ring-offset-0;
+  }
+  .label {
+    @apply mb-1 block text-xs font-bold uppercase tracking-wide text-muted;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full border-2 border-ink px-2.5 py-0.5 text-xs font-bold;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-ink/40 bg-canvas px-2 py-0.5 text-xs font-semibold;
+  }
+
+  .table-cell {
+    @apply whitespace-nowrap px-3 py-2 text-sm;
+  }
+}

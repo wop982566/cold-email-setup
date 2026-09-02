@@ -1,0 +1,733 @@
+// Server-side proxy for the Instantly.ai API v2 — keeps INSTANTLY_API_KEY off
+// the browser. Whitelists read endpoints so a leaked frontend can't do damage.
+// Docs: https://developer.instantly.ai/api/v2/
+
+const BASE = "https://api.instantly.ai/api/v2";
+
+// resource key -> Instantly path (all GET, read-only)
+const GET_RESOURCES: Record<string, string> = {
+  accounts: "/accounts",
+  campaigns: "/campaigns",
+  "analytics-overview": "/campaigns/analytics/overview",
+  "analytics-campaigns": "/campaigns/analytics",
+  // Per-day send buckets — powers the sending-health metric. Deliberately kept
+  // out of the auto-limit branch below: a `limit` on a date-range endpoint
+  // would silently truncate the series.
+  "analytics-daily": "/campaigns/analytics/daily",
+};
+
+// Per-mailbox send counts. Instantly has moved this around between API
+// revisions and some workspaces don't expose it at all, so several documented
+// paths are tried in order and the caller is told plainly when none answers —
+// far better than inventing a per-inbox number by dividing campaign totals.
+const ACCOUNT_ANALYTICS_PATHS = [
+  "/accounts/analytics",
+  "/analytics/accounts",
+  "/accounts/campaign-mappings",
+];
+
+// Custom tags. Instantly has moved these between revisions and the docs were
+// unreachable when this was written, so the paths are probed in order and the
+// caller is told which one answered — the same approach used above for
+// per-account analytics, for the same reason.
+const TAG_PATHS = [
+  "/custom-tags",
+  "/tags",
+  "/custom-tag",
+  "/workspaces/current/tags",
+];
+
+const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", "starting_after"];
+
+// The only three mutations this function can perform. Deleting anything,
+// pausing or starting a campaign, and everything to do with leads are absent
+// on purpose — there is no code path to them.
+const WRITE_OPS = ["create-account", "update-account", "set-campaign-emails", "add-campaign-emails"] as const;
+type WriteOp = (typeof WRITE_OPS)[number];
+
+function tokenOk(req: Request): boolean {
+  const required = process.env.APP_FUNCTION_TOKEN;
+  if (!required) return true;
+  return req.headers.get("x-app-token") === required;
+}
+
+function writesEnabled(): boolean {
+  return String(process.env.INSTANTLY_WRITE_ENABLED ?? "").toLowerCase() === "true";
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+/**
+ * Strip anything password-shaped before a payload is echoed back to the
+ * browser or into an error. Instantly's validation errors quote the offending
+ * request, so without this a rejected create would put SMTP credentials in a
+ * toast and in the browser's network log.
+ */
+function scrub(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(scrub);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = /pass|secret|token|credential/i.test(k) ? "***" : scrub(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function str(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+function int(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+function normEmail(v: unknown): string {
+  return str(v).toLowerCase();
+}
+
+/** The mailbox list attached to a campaign, normalised. */
+function emailListOf(campaign: unknown): string[] {
+  const list = (campaign as { email_list?: unknown })?.email_list;
+  if (!Array.isArray(list)) return [];
+  return list.map((e) => normEmail(e)).filter(Boolean);
+}
+
+function sameSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
+}
+
+export default async (req: Request): Promise<Response> => {
+  if (!tokenOk(req)) return json({ ok: false, error: "Unauthorized" }, 401);
+
+  const key = process.env.INSTANTLY_API_KEY;
+  if (!key) {
+    return json(
+      {
+        ok: false,
+        configured: false,
+        error:
+          "Instantly is not connected. Add INSTANTLY_API_KEY in Netlify env vars (a v2 key with read scopes).",
+      },
+      400,
+    );
+  }
+
+  const url = new URL(req.url);
+  const resource = url.searchParams.get("resource") || "";
+  const auth = { Authorization: `Bearer ${key}`, Accept: "application/json" };
+
+  try {
+    // Pull every lead/contact in the workspace (optionally one campaign) and
+    // return a COMPACT projection — email + campaign + status only — for
+    // duplicate-checking against the tool's leads. Paginates the v2
+    // POST /leads/list endpoint within a time budget so the function returns
+    // promptly even on large workspaces (flags `truncated` if it stops early).
+    if (resource === "leads") {
+      const campaignId = url.searchParams.get("campaign_id") || undefined;
+      const out: { email: string; campaign?: string; status?: number; contacted: boolean }[] = [];
+      const seen = new Set<string>();
+      let startingAfter: string | undefined;
+      let truncated = false;
+      const started = Date.now();
+      const MAX_PAGES = 400; // up to ~40k leads
+      const num = (v: unknown) => (typeof v === "number" ? v : 0);
+      for (let i = 0; i < MAX_PAGES; i++) {
+        const body: Record<string, unknown> = { limit: 100 };
+        if (startingAfter) body.starting_after = startingAfter;
+        if (campaignId) body.campaign = campaignId;
+        const res = await fetch(`${BASE}/leads/list`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+        const items: Array<Record<string, unknown>> = Array.isArray(data?.items) ? data.items : [];
+        for (const it of items) {
+          const email = String(it.email ?? "").trim().toLowerCase();
+          if (!email || seen.has(email)) continue;
+          seen.add(email);
+          // "Contacted" = Instantly has actually sent at least one email to
+          // this lead. The cleanest signal is a last-contact timestamp; we
+          // also treat any open/reply/click or a completed sequence as proof
+          // of contact, since those can't happen without a send.
+          const lastContact =
+            it.timestamp_last_contact ?? it.timestamp_last_touch ?? it.last_contacted ?? null;
+          const contacted =
+            Boolean(lastContact) ||
+            num(it.email_reply_count) > 0 ||
+            num(it.email_open_count) > 0 ||
+            num(it.email_click_count) > 0 ||
+            it.status === 3; // 3 = Completed sequence
+          out.push({
+            email,
+            campaign: typeof it.campaign === "string" ? it.campaign : undefined,
+            status: typeof it.status === "number" ? it.status : undefined,
+            contacted,
+          });
+        }
+        startingAfter = typeof data?.next_starting_after === "string" ? data.next_starting_after : undefined;
+        if (!startingAfter || items.length === 0) break;
+        if (Date.now() - started > 8000) {
+          truncated = true;
+          break;
+        }
+        if (i === MAX_PAGES - 1) truncated = true;
+      }
+      return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
+    // Per-mailbox sends, if this workspace reports them. Tries each known path
+    // and returns `supported: false` rather than an error when none does, so
+    // the UI can say "Instantly doesn't report this" instead of looking broken.
+    if (resource === "account-analytics") {
+      const qs = new URLSearchParams();
+      for (const p of ["start_date", "end_date"]) {
+        const v = url.searchParams.get(p);
+        if (v) qs.set(p, v);
+      }
+      const attempts: { path: string; status: number }[] = [];
+      for (const path of ACCOUNT_ANALYTICS_PATHS) {
+        try {
+          const res = await fetch(`${BASE}${path}${qs.toString() ? `?${qs}` : ""}`, { headers: auth });
+          attempts.push({ path, status: res.status });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const empty =
+            data == null ||
+            (Array.isArray(data) && data.length === 0) ||
+            (Array.isArray(data?.items) && data.items.length === 0);
+          if (empty) continue;
+          return json({ ok: true, supported: true, path, data });
+        } catch {
+          attempts.push({ path, status: 0 });
+        }
+      }
+      return json({
+        ok: true,
+        supported: false,
+        attempts,
+        data: null,
+      });
+    }
+
+    // Custom tags, so a mailbox tagged AEO in Instantly is eligible for every
+    // AEO campaign without being re-tagged here. The response reports the path
+    // that answered and the raw payload, because the shape is unverified and a
+    // sample from the real workspace is what settles it.
+    if (resource === "tags") {
+      const attempts: { path: string; status: number }[] = [];
+      for (const path of TAG_PATHS) {
+        try {
+          const res = await fetch(`${BASE}${path}?limit=100`, { headers: auth });
+          attempts.push({ path, status: res.status });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const empty =
+            data == null ||
+            (Array.isArray(data) && data.length === 0) ||
+            (Array.isArray(data?.items) && data.items.length === 0);
+          // An empty list is a real answer from a real endpoint — keep the path
+          // but say it returned nothing, rather than falling through and
+          // reporting the endpoint as missing.
+          if (empty) return json({ ok: true, supported: true, path, empty: true, data });
+          return json({ ok: true, supported: true, path, empty: false, data: scrub(data) });
+        } catch {
+          attempts.push({ path, status: 0 });
+        }
+      }
+      return json({ ok: true, supported: false, attempts, data: null });
+    }
+
+    // Single campaign, by path id. Used as a fallback when the /campaigns list
+    // payload omits email_list (the campaign -> mailbox linkage).
+    if (resource === "campaign-detail") {
+      const id = url.searchParams.get("id");
+      if (!id) return json({ ok: false, error: "Missing id" }, 400);
+      const res = await fetch(`${BASE}/campaigns/${encodeURIComponent(id)}`, { headers: auth });
+      const data = await res.json();
+      if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+      return json({ ok: true, data });
+    }
+
+    // Full settings for one inbox — the account list is a summary, and the
+    // bulk-update preview needs the fields the settings screen shows (tracking
+    // domain, warmup filter tag, tags). Scrubbed so no credential can leak into
+    // the preview or the browser network log.
+    if (resource === "account-detail") {
+      const em = url.searchParams.get("email");
+      if (!em) return json({ ok: false, error: "Missing email" }, 400);
+      const res = await fetch(`${BASE}/accounts/${encodeURIComponent(em)}`, { headers: auth });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data: scrub(data) }, res.status);
+      return json({ ok: true, data: scrub(data) });
+    }
+
+    // Accounts and campaigns paginate at 100/page. The planner counts mailboxes
+    // per campaign, so a silent truncation would tell the operator to buy
+    // inboxes they already own — page through the whole list instead.
+    if (resource === "accounts" || resource === "campaigns") {
+      const path = GET_RESOURCES[resource];
+      const out: unknown[] = [];
+      let startingAfter: string | undefined;
+      let truncated = false;
+      const started = Date.now();
+      const MAX_PAGES = 50; // 5k records
+      for (let i = 0; i < MAX_PAGES; i++) {
+        const qs = new URLSearchParams({ limit: "100" });
+        if (startingAfter) qs.set("starting_after", startingAfter);
+        const res = await fetch(`${BASE}${path}?${qs}`, { headers: auth });
+        const data = await res.json();
+        if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+        const items: unknown[] = Array.isArray(data) ? data : (data?.items ?? []);
+        out.push(...items);
+        startingAfter =
+          typeof data?.next_starting_after === "string" ? data.next_starting_after : undefined;
+        if (!startingAfter || items.length === 0) break;
+        if (Date.now() - started > 8000 || i === MAX_PAGES - 1) {
+          truncated = true;
+          break;
+        }
+      }
+      return json({ ok: true, data: { items: out, count: out.length, truncated } });
+    }
+
+    // ---------------------------------------------------------------------
+    // Writes. Gated twice: the env flag, and a fixed op whitelist.
+    // ---------------------------------------------------------------------
+    if (resource === "write") {
+      if (req.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
+
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body" }, 400);
+      }
+
+      // Cheapest possible question: are writes permitted at all? Answered
+      // without touching Instantly, so the UI can disable its buttons and
+      // explain why BEFORE anyone clicks one.
+      if (str(body.op) === "capabilities") {
+        return json({
+          ok: true,
+          writesEnabled: writesEnabled(),
+          hint: writesEnabled()
+            ? null
+            : "Writes to Instantly are turned off. Add INSTANTLY_WRITE_ENABLED=true to your Netlify environment variables (Functions scope) and redeploy.",
+        });
+      }
+
+      const op = str(body.op) as WriteOp;
+      if (!WRITE_OPS.includes(op)) {
+        return json({ ok: false, error: `Unknown or forbidden write op: ${op || "(none)"}` }, 400);
+      }
+
+      const dryRun = body.dryRun === true;
+
+      if (!writesEnabled() && !dryRun) {
+        return json(
+          {
+            ok: false,
+            writesDisabled: true,
+            error:
+              "Writes to Instantly are turned off. Set INSTANTLY_WRITE_ENABLED=true in Netlify env vars to enable them.",
+          },
+          403,
+        );
+      }
+
+      const post = (path: string, payload: unknown, method = "POST") =>
+        fetch(`${BASE}${path}`, {
+          method,
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+      // --- create a mailbox ------------------------------------------------
+      if (op === "create-account") {
+        const a = (body.account ?? {}) as Record<string, unknown>;
+        const email = normEmail(a.email);
+        if (!email.includes("@")) return json({ ok: false, error: "A valid email is required" }, 400);
+
+        // Built field by field rather than spread, so nothing unexpected from
+        // the browser reaches Instantly.
+        const payload: Record<string, unknown> = {
+          email,
+          first_name: str(a.first_name),
+          last_name: str(a.last_name),
+          provider_code: int(a.provider_code, 2),
+          // No `|| email` fallback: for a shared-account setup (one Gmail IMAP,
+          // an SES access key for SMTP) the login is NOT the mailbox address, and
+          // silently substituting it produced "IMAP connection failed". A blank
+          // username is caught below and reported, not papered over.
+          smtp_username: str(a.smtp_username),
+          smtp_password: str(a.smtp_password),
+          smtp_host: str(a.smtp_host),
+          smtp_port: int(a.smtp_port, 587),
+          imap_username: str(a.imap_username),
+          imap_password: str(a.imap_password),
+          imap_host: str(a.imap_host),
+          imap_port: int(a.imap_port, 993),
+          daily_limit: int(a.daily_limit, 30),
+          warmup: {
+            limit: int(a.warmup_limit, 20),
+            increment: int(a.warmup_increment, 1),
+            reply_rate: int(a.warmup_reply_rate, 30),
+          },
+        };
+        const tracking = str(a.tracking_domain_name);
+        if (tracking) payload.tracking_domain_name = tracking;
+
+        const missing = [
+          "smtp_username", "smtp_password", "smtp_host",
+          "imap_username", "imap_password", "imap_host",
+        ].filter((k) => !payload[k]);
+        if (missing.length) {
+          return json(
+            {
+              ok: false,
+              email,
+              error: `Missing required field(s): ${missing.join(", ")}`,
+              hint: /username/.test(missing.join())
+                ? "Set the SMTP/IMAP username in the credential profile — it's the login, e.g. your SES access key and the shared IMAP address. For per-mailbox Google, use {prefix}@{domain}."
+                : undefined,
+            },
+            400,
+          );
+        }
+
+        if (dryRun) return json({ ok: true, dryRun: true, email, payload: scrub(payload) });
+
+        const res = await post("/accounts", payload);
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          return json(
+            { ok: false, email, error: `Instantly ${res.status}`, data: scrub(data), sent: scrub(payload) },
+            res.status,
+          );
+        }
+        return json({ ok: true, email, data: scrub(data) });
+      }
+
+      // --- warmup / limit settings on an existing mailbox ------------------
+      if (op === "update-account") {
+        const email = normEmail(body.email);
+        if (!email) return json({ ok: false, error: "email is required" }, 400);
+
+        // Still cannot rewrite credentials — no smtp_/imap_ passwords or hosts
+        // here, on purpose. The client sends a `patch` object it built from the
+        // enabled fields (see inboxUpdate.ts); we forward a WHITELISTED subset,
+        // so the browser can never smuggle a credential field into a PATCH.
+        const incoming = (body.patch ?? {}) as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+
+        if (incoming.first_name != null) patch.first_name = str(incoming.first_name);
+        if (incoming.last_name != null) patch.last_name = str(incoming.last_name);
+        if (incoming.tracking_domain_name != null) {
+          patch.tracking_domain_name = str(incoming.tracking_domain_name);
+        }
+        if (incoming.daily_limit != null) patch.daily_limit = int(incoming.daily_limit, 30);
+
+        const w = (incoming.warmup ?? body.warmup ?? null) as Record<string, unknown> | null;
+        if (w) {
+          const warmup: Record<string, number> = {};
+          if (w.limit != null) warmup.limit = int(w.limit, 20);
+          if (w.increment != null) warmup.increment = int(w.increment, 1);
+          if (w.reply_rate != null) warmup.reply_rate = int(w.reply_rate, 30);
+          if (Object.keys(warmup).length) patch.warmup = warmup;
+        }
+
+        // Discovered-key fields: the client already resolved the real key name
+        // from the live account, so anything left in `incoming` that isn't a
+        // credential and isn't already mapped is passed through verbatim. The
+        // credential guard below is belt-and-braces.
+        for (const [k, v] of Object.entries(incoming)) {
+          if (k in patch || k === "warmup") continue;
+          if (/pass|secret|smtp_|imap_|credential/i.test(k)) continue;
+          patch[k] = v;
+        }
+
+        // Back-compat: older callers sent daily_limit/warmup at the top level.
+        if (incoming.daily_limit == null && body.daily_limit != null) {
+          patch.daily_limit = int(body.daily_limit, 30);
+        }
+
+        if (Object.keys(patch).length === 0) {
+          return json({ ok: false, error: "Nothing to update" }, 400);
+        }
+
+        if (dryRun) return json({ ok: true, dryRun: true, email, payload: patch });
+
+        const res = await post(`/accounts/${encodeURIComponent(email)}`, patch, "PATCH");
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          return json(
+            { ok: false, email, error: `Instantly ${res.status}`, data: scrub(data), sent: scrub(patch) },
+            res.status,
+          );
+        }
+        return json({ ok: true, email, data: scrub(data) });
+      }
+
+      // --- swap a mailbox on a live campaign -------------------------------
+      // Read-modify-write with verification at both ends. A campaign that
+      // changed underneath us aborts rather than being overwritten blind —
+      // this is the one op that touches something actively sending.
+      if (op === "set-campaign-emails") {
+        const campaignId = str(body.campaignId);
+        const remove = normEmail(body.remove);
+        const add = normEmail(body.add);
+        if (!campaignId) return json({ ok: false, error: "campaignId is required" }, 400);
+        if (!remove || !add) return json({ ok: false, error: "remove and add are required" }, 400);
+        if (remove === add) return json({ ok: false, error: "remove and add are the same address" }, 400);
+
+        const readRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
+        const campaign = await readRes.json().catch(() => null);
+        if (!readRes.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${readRes.status} reading campaign`, data: scrub(campaign) },
+            readRes.status,
+          );
+        }
+
+        const current = emailListOf(campaign);
+        if (current.length === 0) {
+          return json(
+            { ok: false, campaignId, error: "Campaign returned no email_list — refusing to write one from scratch." },
+            409,
+          );
+        }
+        if (!current.includes(remove)) {
+          return json(
+            { ok: false, campaignId, error: `${remove} is not attached to this campaign any more.`, current },
+            409,
+          );
+        }
+        if (current.includes(add)) {
+          return json(
+            { ok: false, campaignId, error: `${add} is already attached to this campaign.`, current },
+            409,
+          );
+        }
+        // Optimistic concurrency: the UI sends what it believed the list was.
+        const expected = Array.isArray(body.expectedList)
+          ? (body.expectedList as unknown[]).map(normEmail).filter(Boolean)
+          : null;
+        if (expected && !sameSet(expected, current)) {
+          return json(
+            {
+              ok: false,
+              campaignId,
+              error: "This campaign's mailbox list changed since the page loaded. Refresh and try again.",
+              current,
+              expected,
+            },
+            409,
+          );
+        }
+
+        const next = current.map((e) => (e === remove ? add : e));
+        const path = `/campaigns/${encodeURIComponent(campaignId)}`;
+
+        if (dryRun) {
+          return json({ ok: true, dryRun: true, campaignId, before: current, after: next });
+        }
+
+        // Every attempt is recorded and returned. The API contract here could
+        // not be verified against Instantly's docs when this was written, so
+        // the response has to carry enough for a human to see what happened
+        // rather than leaving it to a toast that vanishes.
+        const attempts: { method: string; path: string; status: number; body: unknown }[] = [];
+
+        const tryWrite = async (method: string) => {
+          const r = await post(path, { email_list: next }, method);
+          const body = await r.json().catch(() => null);
+          attempts.push({ method, path, status: r.status, body: scrub(body) });
+          return r;
+        };
+
+        let res = await tryWrite("PATCH");
+        // 404/405 mean specifically "wrong path or wrong method", so one retry
+        // with POST is principled. A 400/422 means the payload was rejected,
+        // where retrying a different verb would only add noise.
+        if (res.status === 404 || res.status === 405) {
+          res = await tryWrite("POST");
+        }
+
+        if (!res.ok) {
+          return json(
+            {
+              ok: false,
+              campaignId,
+              error: `Instantly ${res.status}`,
+              attempts,
+              before: current,
+              attempted: next,
+            },
+            res.status,
+          );
+        }
+
+        // Confirm from the server rather than trusting the write's response.
+        const verifyRes = await fetch(`${BASE}${path}`, { headers: auth });
+        const verifyOk = verifyRes.ok;
+        const verified = verifyOk ? emailListOf(await verifyRes.json().catch(() => null)) : null;
+        const applied = verified === null ? null : verified.includes(add) && !verified.includes(remove);
+
+        return json({
+          ok: true,
+          campaignId,
+          before: current,
+          after: next,
+          verified,
+          verifyStatus: verifyRes.status,
+          attempts,
+          // true = confirmed applied. false = confirmed NOT applied.
+          // null = the confirming read failed, so we genuinely do not know —
+          // callers must not treat this as success.
+          applied,
+        });
+      }
+
+      // Append inboxes to a campaign WITHOUT removing any — the autopopulate
+      // path. Same read-modify-verify discipline as the swap, but the list
+      // GROWS, so `remove` has no place here.
+      if (op === "add-campaign-emails") {
+        const campaignId = str(body.campaignId);
+        const toAdd = Array.isArray(body.add)
+          ? [...new Set((body.add as unknown[]).map(normEmail).filter(Boolean))]
+          : [];
+        if (!campaignId) return json({ ok: false, error: "campaignId is required" }, 400);
+        if (toAdd.length === 0) {
+          return json({ ok: false, error: "add must be a non-empty list of emails" }, 400);
+        }
+
+        const readRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
+        const campaign = await readRes.json().catch(() => null);
+        if (!readRes.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${readRes.status} reading campaign`, data: scrub(campaign) },
+            readRes.status,
+          );
+        }
+
+        const current = emailListOf(campaign);
+        if (current.length === 0) {
+          return json(
+            { ok: false, campaignId, error: "Campaign returned no email_list — refusing to write one from scratch." },
+            409,
+          );
+        }
+        // Optimistic concurrency: abort if the list moved under the page.
+        const expected = Array.isArray(body.expectedList)
+          ? (body.expectedList as unknown[]).map(normEmail).filter(Boolean)
+          : null;
+        if (expected && !sameSet(expected, current)) {
+          return json(
+            {
+              ok: false,
+              campaignId,
+              error: "This campaign's mailbox list changed since the page loaded. Refresh and try again.",
+              current,
+              expected,
+            },
+            409,
+          );
+        }
+
+        // Only the genuinely-new addresses; if every one is already attached
+        // there is nothing to write (and nothing to verify against).
+        const fresh = toAdd.filter((e) => !current.includes(e));
+        if (fresh.length === 0) {
+          return json({ ok: true, campaignId, before: current, after: current, added: [], verified: current, applied: true, noop: true });
+        }
+        const next = [...current, ...fresh];
+        const path = `/campaigns/${encodeURIComponent(campaignId)}`;
+
+        if (dryRun) {
+          return json({ ok: true, dryRun: true, campaignId, before: current, after: next, added: fresh });
+        }
+
+        const attempts: { method: string; path: string; status: number; body: unknown }[] = [];
+        const tryWrite = async (method: string) => {
+          const r = await post(path, { email_list: next }, method);
+          const b = await r.json().catch(() => null);
+          attempts.push({ method, path, status: r.status, body: scrub(b) });
+          return r;
+        };
+
+        let res = await tryWrite("PATCH");
+        if (res.status === 404 || res.status === 405) res = await tryWrite("POST");
+
+        if (!res.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${res.status}`, attempts, before: current, attempted: next },
+            res.status,
+          );
+        }
+
+        const verifyRes = await fetch(`${BASE}${path}`, { headers: auth });
+        const verified = verifyRes.ok ? emailListOf(await verifyRes.json().catch(() => null)) : null;
+        const applied = verified === null ? null : fresh.every((e) => verified.includes(e));
+
+        return json({
+          ok: true,
+          campaignId,
+          before: current,
+          after: next,
+          added: fresh,
+          verified,
+          verifyStatus: verifyRes.status,
+          attempts,
+          applied,
+        });
+      }
+    }
+
+    // Warmup analytics is a POST with a body of emails (1-100).
+    if (resource === "warmup") {
+      let emails: string[] = [];
+      try {
+        const body = (await req.json()) as { emails?: string[] };
+        emails = (body.emails ?? []).slice(0, 100);
+      } catch {
+        /* no body */
+      }
+      if (emails.length === 0) return json({ ok: true, data: { items: [] } });
+      const res = await fetch(`${BASE}/accounts/warmup-analytics`, {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ emails }),
+      });
+      const data = await res.json();
+      if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+      return json({ ok: true, data });
+    }
+
+    const path = GET_RESOURCES[resource];
+    if (!path) return json({ ok: false, error: `Unknown resource: ${resource}` }, 400);
+
+    const qs = new URLSearchParams();
+    for (const p of ALLOWED_PARAMS) {
+      const v = url.searchParams.get(p);
+      if (v) qs.set(p, v);
+    }
+
+    const res = await fetch(`${BASE}${path}${qs.toString() ? `?${qs}` : ""}`, { headers: auth });
+    const data = await res.json();
+    if (!res.ok) return json({ ok: false, error: `Instantly ${res.status}`, data }, res.status);
+    return json({ ok: true, data });
+  } catch (e) {
+    return json({ ok: false, error: e instanceof Error ? e.message : "Network error" }, 502);
+  }
+};
