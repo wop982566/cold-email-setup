@@ -193,12 +193,14 @@ export function Details({
   summary,
   children,
   className,
+  defaultOpen = false,
 }: {
   summary: string;
   children: ReactNode;
   className?: string;
+  defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <div className={cn("mt-1.5", className)}>
       <button

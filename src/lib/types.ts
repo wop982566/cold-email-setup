@@ -420,6 +420,8 @@ export interface SendBlast extends BaseRow {
   status: "queued" | "sending" | "done" | "failed";
   started_at: string;
   results: { email: string; outcome: "sent" | "failed" | "skipped"; error?: string }[];
+  /** Set when the whole run threw before any per-inbox result was recorded. */
+  error?: string;
 }
 
 // --- Mailbox recovery ------------------------------------------------------

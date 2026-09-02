@@ -69,6 +69,29 @@ async function patchRow(table: string, id: string, patch: Record<string, unknown
   await writeTable(table, next);
 }
 
+/** Newest-first by `started_at`. */
+function byStartedDesc<T extends { started_at?: string }>(a: T, b: T): number {
+  return (b.started_at ?? "").localeCompare(a.started_at ?? "");
+}
+
+/**
+ * Keep only the newest `perMailbox` tests for each mailbox; older ones are
+ * dropped (auto-deleted) so the table can't grow without bound. The placement
+ * rollup only ever looks at the last 10 per mailbox, so this never loses data
+ * the UI would show.
+ */
+function trimTests(tests: InboxTest[], perMailbox = 10): InboxTest[] {
+  const byMailbox = new Map<string, InboxTest[]>();
+  for (const t of tests) {
+    const arr = byMailbox.get(t.mailbox) ?? [];
+    arr.push(t);
+    byMailbox.set(t.mailbox, arr);
+  }
+  const kept: InboxTest[] = [];
+  for (const arr of byMailbox.values()) kept.push(...arr.sort(byStartedDesc).slice(0, perMailbox));
+  return kept;
+}
+
 // --- SMTP send + verify ----------------------------------------------------
 
 function transporterFor(smtp: ResolvedSmtp) {
@@ -470,9 +493,25 @@ export async function handleAction(req: Request): Promise<Response> {
       summary: null,
     };
     const tests = await readTable<InboxTest>("inbox_tests");
-    await writeTable("inbox_tests", [...tests, row]);
-    await drainQueues().catch(() => ({}));
-    return json({ ok: true, id: row.id });
+    // Trim to the newest 10 per mailbox on every insert so the table stays bounded.
+    await writeTable("inbox_tests", trimTests([...tests, row]));
+    // Run the send phase now. If it throws, record it on the row so the button
+    // reports the real reason instead of a false "reading".
+    try {
+      await drainQueues();
+    } catch (e) {
+      await patchRow("inbox_tests", row.id, {
+        status: "failed",
+        error: e instanceof Error ? e.message : "send failed",
+      });
+    }
+    const after = (await readTable<InboxTest>("inbox_tests")).find((t) => t.id === row.id);
+    return json({
+      ok: true,
+      id: row.id,
+      status: after?.status ?? "queued",
+      ...(after?.error ? { error: after.error } : {}),
+    });
   }
 
   // Queue a custom blast and kick the first chunk now.
@@ -501,9 +540,36 @@ export async function handleAction(req: Request): Promise<Response> {
       results: [],
     };
     const blasts = await readTable<SendBlast>("send_blasts");
-    await writeTable("send_blasts", [...blasts, row]);
-    await processBlasts(settings).catch(() => 0);
-    return json({ ok: true, id: row.id });
+    // Keep only the last 5 blasts (newest first); older ones are auto-deleted.
+    await writeTable("send_blasts", [...blasts, row].sort(byStartedDesc).slice(0, 5));
+    // Send the first chunk synchronously so a preview deploy (no scheduled
+    // worker) still sends, and surface the real outcome instead of swallowing it.
+    let sendError: string | undefined;
+    try {
+      await processBlasts(settings);
+    } catch (e) {
+      sendError = e instanceof Error ? e.message : "blast send failed";
+      await patchRow("send_blasts", row.id, { status: "failed", error: sendError });
+    }
+    // Re-read the row to report what actually happened.
+    const after = (await readTable<SendBlast>("send_blasts")).find((b) => b.id === row.id);
+    const results = after?.results ?? [];
+    const sent = results.filter((r) => r.outcome === "sent").length;
+    const failed = results.filter((r) => r.outcome === "failed").length;
+    const skipped = results.filter((r) => r.outcome === "skipped").length;
+    // Surface a reason when nothing sent: the thrown error, a recorded row error,
+    // or the first failed/skipped inbox's reason.
+    const firstBad = results.find((r) => r.outcome !== "sent");
+    const error = sendError ?? after?.error ?? (sent === 0 ? firstBad?.error : undefined);
+    return json({
+      ok: true,
+      id: row.id,
+      status: after?.status ?? "queued",
+      sent,
+      failed,
+      skipped,
+      ...(error ? { error } : {}),
+    });
   }
 
   return json({ ok: false, error: `unknown action "${action}"` }, 400);

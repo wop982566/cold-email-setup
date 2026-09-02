@@ -43,8 +43,14 @@ export function resolveSmtp(inbox: SendInbox, profiles: MailProfile[]): ResolveR
     if (!p) return { ok: false, reason: "linked mail profile not found" };
     if (!p.smtp_host) return { ok: false, reason: "profile has no SMTP host" };
     if (!p.smtp_password) return { ok: false, reason: "profile has no SMTP password" };
-    const user = usernameFor(p.smtp_username, prefix, domain);
-    if (!user) return { ok: false, reason: "profile has no SMTP username (template blank)" };
+    // Resolve the login. usernameFor expands {prefix}/{domain}; a per-mailbox
+    // login is written as {email} (what the Connect modal suggests), which we
+    // substitute here, and a blank template falls back to the mailbox address —
+    // the same default the inline path uses. So an SES access key (explicit
+    // username), an {email} template, and a blank field all yield a real login
+    // instead of failing SMTP auth on the literal "{email}" or an empty user.
+    const user = usernameFor(p.smtp_username, prefix, domain).replace(/\{email\}/g, inbox.email).trim() || inbox.email.trim();
+    if (!user) return { ok: false, reason: "profile has no SMTP username and no mailbox address to fall back to" };
     return {
       ok: true,
       smtp: {

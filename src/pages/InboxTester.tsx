@@ -666,7 +666,12 @@ function PlacementSection({ sends, tests, toast }: { sends: SendInbox[]; tests: 
     setStarting(true);
     const r = await mailTester.testNow(active);
     setStarting(false);
-    if (!r.ok) toast.push(`Couldn't start: ${r.error}`, "error");
+    if (!r.ok) { toast.push(`Couldn't start: ${r.error}`, "error"); return; }
+    // The send phase runs synchronously; a "failed" status means it couldn't
+    // send to any seed, and the error says why.
+    const status = typeof r.status === "string" ? r.status : undefined;
+    const err = typeof r.error === "string" ? r.error : undefined;
+    if (status === "failed" || err) toast.push(`Test failed: ${err ?? "couldn't send to any seed"}`, "error");
     else toast.push("Test sent to the seed panel — reading placement after the wait", "success");
   }
 
@@ -742,7 +747,11 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [sending, setSending] = useState(false);
 
-  const latest = [...blasts].sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? ""))[0];
+  // The last 5 runs, newest first — older ones are auto-deleted server-side.
+  const recent = useMemo(
+    () => [...blasts].sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? "")).slice(0, 5),
+    [blasts],
+  );
 
   // Comma/space/newline-separated recipients → deduped real addresses.
   const targets = useMemo(
@@ -763,8 +772,21 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
     setSending(true);
     const r = await mailTester.blast({ targets, subject: subject.trim(), body, fromEmails: from });
     setSending(false);
-    if (!r.ok) toast.push(`Couldn't start blast: ${r.error}`, "error");
-    else toast.push(`Blasting from ${from.length} inbox${from.length === 1 ? "" : "es"} to ${targets.length} recipient${targets.length === 1 ? "" : "s"}`, "success");
+    if (!r.ok) { toast.push(`Couldn't start blast: ${r.error}`, "error"); return; }
+    // The first chunk sends synchronously; report what actually went out so a
+    // bad credential shows failed/skipped instead of a false "sent".
+    const sent = Number(r.sent ?? 0);
+    const failed = Number(r.failed ?? 0);
+    const skipped = Number(r.skipped ?? 0);
+    const err = typeof r.error === "string" ? r.error : undefined;
+    const more = r.status === "sending" ? " (more queued)" : "";
+    if (sent === 0) {
+      toast.push(`Nothing sent yet — ${err ?? `${failed} failed, ${skipped} skipped`}${more}`, "error");
+    } else if (failed > 0 || skipped > 0) {
+      toast.push(`Sent from ${sent}; ${failed} failed, ${skipped} skipped${more}`, "info");
+    } else {
+      toast.push(`Sent from ${sent} inbox${sent === 1 ? "" : "es"} to ${targets.length} recipient${targets.length === 1 ? "" : "s"}${more}`, "success");
+    }
   }
 
   return (
@@ -817,31 +839,42 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
         </div>
       </div>
 
-      {latest ? (
-        <div className="mt-3 rounded-lg border-2 border-ink p-3 text-sm">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-bold">{fmtDateShort(latest.started_at)} → {(latest.targets ?? []).join(", ")}</span>
-            <Badge tone={latest.status === "done" ? "mint" : "sun"}>{latest.status}</Badge>
-            <span className="text-muted">
-              {latest.results.filter((r) => r.outcome === "sent").length}/{latest.from_emails.length} sent
-            </span>
-            <button className="btn-ghost btn-sm ml-auto" onClick={() => copy(latest.results.map((r) => `${r.email}: ${r.outcome}${r.error ? " — " + r.error : ""}`).join("\n"), toast)}>
-              <Copy size={12} /> Copy results
-            </button>
-          </div>
-          {latest.results.length > 0 ? (
-            <Details summary={`Per-inbox results (${latest.results.length})`}>
-              <ul className="space-y-0.5 text-[11px]">
-                {latest.results.map((r, i) => (
-                  <li key={i} className="flex items-center gap-1">
-                    {r.outcome === "sent" ? <Check size={11} className="text-mint" /> : r.outcome === "failed" ? <X size={11} className="text-danger" /> : <AlertTriangle size={11} className="text-sun-dark" />}
-                    <span className="font-mono">{r.email}</span>
-                    <span className="text-muted">{r.outcome}{r.error ? ` — ${r.error}` : ""}</span>
-                  </li>
-                ))}
-              </ul>
-            </Details>
-          ) : null}
+      {recent.length > 0 ? (
+        <div className="mt-3 space-y-2">
+          <div className="text-xs font-bold uppercase text-muted">Recent blasts (last 5)</div>
+          {recent.map((b) => {
+            const sent = b.results.filter((r) => r.outcome === "sent").length;
+            const notSent = b.results.filter((r) => r.outcome !== "sent").length;
+            const anyBad = notSent > 0 || b.status === "failed";
+            return (
+              <div key={b.id} className="rounded-lg border-2 border-ink p-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-bold">{fmtDateShort(b.started_at)} → {(b.targets ?? []).join(", ")}</span>
+                  <Badge tone={b.status === "failed" ? "danger" : b.status === "done" ? (anyBad ? "sun" : "mint") : "sun"}>{b.status}</Badge>
+                  <span className="text-muted">
+                    {sent}/{b.from_emails.length} sent{notSent > 0 ? ` · ${notSent} not sent` : ""}
+                  </span>
+                  <button className="btn-ghost btn-sm ml-auto" onClick={() => copy(b.results.map((r) => `${r.email}: ${r.outcome}${r.error ? " — " + r.error : ""}`).join("\n"), toast)}>
+                    <Copy size={12} /> Copy results
+                  </button>
+                </div>
+                {b.error ? <p className="mt-1 text-xs text-danger">{b.error}</p> : null}
+                {b.results.length > 0 ? (
+                  <Details summary={`Per-inbox results (${b.results.length})`} defaultOpen={anyBad}>
+                    <ul className="space-y-0.5 text-[11px]">
+                      {b.results.map((r, i) => (
+                        <li key={i} className="flex items-center gap-1">
+                          {r.outcome === "sent" ? <Check size={11} className="text-mint" /> : r.outcome === "failed" ? <X size={11} className="text-danger" /> : <AlertTriangle size={11} className="text-sun-dark" />}
+                          <span className="font-mono">{r.email}</span>
+                          <span className="text-muted">{r.outcome}{r.error ? ` — ${r.error}` : ""}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </Details>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       ) : null}
     </Card>

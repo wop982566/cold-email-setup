@@ -212,18 +212,29 @@ that gap with a seed panel:
   landed — **Primary / tab / Spam / Missing** — per provider, with SPF/DKIM/DMARC
   from the headers. One test is noisy, so health is a **time-decayed average** of
   recent tests (half-life ~10 days, `seed_min_samples` before it's trusted).
-- **Custom blast** — type a subject/body and a target address, pick **all or a
-  selection** of connected inboxes, and send — for eyeballing placement yourself.
+- **Custom blast** — type a subject/body and one or more comma-separated target
+  addresses, pick **all or a selection** of connected inboxes, and send — for
+  eyeballing placement yourself. The panel keeps the **last 5 runs** (older ones
+  are auto-deleted) and shows the real per-inbox outcome — a run auto-expands its
+  results when any inbox failed/skipped, with the exact SMTP error.
 
 The seed **Primary-inbox rate** becomes the **top-priority Health signal**: a
 mailbox failing the seed test is flagged for replacement even at warmup 100, and
 the Health column shows the real number. Sending and reading happen server-side
 in a scheduled worker (`mail-tester.mts`, runs on the production deploy) plus an
 on-demand trigger (`mail-tester-run.mts`); the browser only ever posts the form
-values. All seed IMAP and sender SMTP passwords live in the **gated** blob store
-(`APP_FUNCTION_TOKEN`) — write-only in the UI, never returned to the client,
-never in the repo. **The libraries `nodemailer` and `imapflow` are used only in
-the functions**, never the client bundle.
+values. The on-demand trigger sends the **first chunk synchronously** and returns
+the real outcome (`sent`/`failed`/`skipped` with the SMTP error), so a bad or
+missing credential shows a **failure**, not a false success — a blast of up to
+`blast_max_per_run` senders lands even on a branch/preview deploy, where the
+scheduled worker (the seed *read* phase and any later chunks) does not run.
+Per-mailbox SMTP logins resolve from the profile's username template: an SES
+access key stays literal, `{email}` becomes the mailbox address, and a blank
+template falls back to the address, so a template that isn't a real login can't
+silently fail auth. All seed IMAP and sender SMTP passwords live in the **gated**
+blob store (`APP_FUNCTION_TOKEN`) — write-only in the UI, never returned to the
+client, never in the repo. **The libraries `nodemailer` and `imapflow` are used
+only in the functions**, never the client bundle.
 
 > Honest limit: over IMAP, Gmail's Primary-vs-Promotions is read from its category
 > labels, but Outlook's Focused-vs-Other both live under INBOX, so Outlook is
