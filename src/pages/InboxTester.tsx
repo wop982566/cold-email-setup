@@ -744,35 +744,44 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
 
   const latest = [...blasts].sort((a, b) => (b.started_at ?? "").localeCompare(a.started_at ?? ""))[0];
 
+  // Comma/space/newline-separated recipients → deduped real addresses.
+  const targets = useMemo(
+    () => [...new Set(target.split(/[,\s]+/).map((t) => t.trim().toLowerCase()).filter((t) => t.includes("@")))],
+    [target],
+  );
+
   function toggle(email: string) {
     setChosen((s) => { const n = new Set(s); n.has(email) ? n.delete(email) : n.add(email); return n; });
   }
 
   async function send() {
     const from = chosen.size > 0 ? [...chosen] : connected.map((s) => s.email);
-    if (!target.trim() || !subject.trim() || from.length === 0) {
-      toast.push("Target, subject and at least one sender are required", "error");
+    if (targets.length === 0 || !subject.trim() || from.length === 0) {
+      toast.push("At least one recipient, a subject and one sender are required", "error");
       return;
     }
     setSending(true);
-    const r = await mailTester.blast({ target: target.trim(), subject: subject.trim(), body, fromEmails: from });
+    const r = await mailTester.blast({ targets, subject: subject.trim(), body, fromEmails: from });
     setSending(false);
     if (!r.ok) toast.push(`Couldn't start blast: ${r.error}`, "error");
-    else toast.push(`Blasting from ${from.length} inbox${from.length === 1 ? "" : "es"} to ${target}`, "success");
+    else toast.push(`Blasting from ${from.length} inbox${from.length === 1 ? "" : "es"} to ${targets.length} recipient${targets.length === 1 ? "" : "s"}`, "success");
   }
 
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-center gap-2">
         <h2 className="text-lg font-extrabold">4 · Custom blast</h2>
-        <span className="text-xs text-muted">Send a custom email from your inboxes to one address you can check yourself.</span>
+        <span className="text-xs text-muted">Send a custom email from your inboxes to one or more addresses you can check yourself.</span>
       </div>
 
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <div className="space-y-2">
           <label className="block">
-            <span className="text-xs font-bold uppercase text-muted">Send to (any address)</span>
-            <input className="input mt-1 w-full" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="you@gmail.com" />
+            <span className="text-xs font-bold uppercase text-muted">Send to (comma-separated)</span>
+            <input className="input mt-1 w-full" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="you@gmail.com, you@outlook.com" />
+            <span className="mt-0.5 block text-[11px] text-muted">
+              {targets.length > 0 ? `${targets.length} recipient${targets.length === 1 ? "" : "s"}` : "Add one or more addresses, separated by commas."}
+            </span>
           </label>
           <label className="block">
             <span className="text-xs font-bold uppercase text-muted">Subject</span>
@@ -782,7 +791,7 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
             <span className="text-xs font-bold uppercase text-muted">Body</span>
             <textarea className="input mt-1 h-28 w-full" value={body} onChange={(e) => setBody(e.target.value)} placeholder="Your test message…" />
           </label>
-          <button className="btn-primary btn-sm" onClick={() => void send()} disabled={sending}>
+          <button className="btn-primary btn-sm" onClick={() => void send()} disabled={sending || targets.length === 0 || !subject.trim()}>
             {sending ? <Spinner /> : <Send size={14} />} Send from {chosen.size > 0 ? `${chosen.size} selected` : `all ${connected.length}`}
           </button>
         </div>
@@ -811,7 +820,7 @@ function BlastSection({ sends, blasts, toast }: { sends: SendInbox[]; blasts: Se
       {latest ? (
         <div className="mt-3 rounded-lg border-2 border-ink p-3 text-sm">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-bold">{fmtDateShort(latest.started_at)} → {latest.target}</span>
+            <span className="font-bold">{fmtDateShort(latest.started_at)} → {(latest.targets ?? []).join(", ")}</span>
             <Badge tone={latest.status === "done" ? "mint" : "sun"}>{latest.status}</Badge>
             <span className="text-muted">
               {latest.results.filter((r) => r.outcome === "sent").length}/{latest.from_emails.length} sent

@@ -411,9 +411,9 @@ export interface InboxTest extends BaseRow {
   error?: string;
 }
 
-/** A custom "send this body from all my inboxes to one address" run. */
+/** A custom "send this body from all my inboxes to these addresses" run. */
 export interface SendBlast extends BaseRow {
-  target: string;
+  targets: string[];
   subject: string;
   body: string;
   from_emails: string[];

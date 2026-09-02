@@ -368,7 +368,8 @@ async function processBlasts(settings: AppSettings): Promise<number> {
         continue;
       }
       try {
-        await sendOne(sender.smtp, b.target, b.subject, b.body);
+        // One message per sender, addressed to every target (comma-joined To).
+        await sendOne(sender.smtp, (b.targets ?? []).join(", "), b.subject, b.body);
         results.push({ email, outcome: "sent" });
       } catch (e) {
         results.push({ email, outcome: "failed", error: e instanceof Error ? e.message : "send failed" });
@@ -476,18 +477,22 @@ export async function handleAction(req: Request): Promise<Response> {
 
   // Queue a custom blast and kick the first chunk now.
   if (action === "blast") {
-    const target = String(body.target ?? "").trim();
+    // Accept an array or a comma/space-separated string; keep only real addresses.
+    const rawTargets = Array.isArray(body.targets)
+      ? (body.targets as unknown[]).map((t) => String(t))
+      : String(body.targets ?? body.target ?? "").split(/[,\s]+/);
+    const targets = [...new Set(rawTargets.map((t) => t.trim().toLowerCase()).filter((t) => t.includes("@")))];
     const subject = String(body.subject ?? "").trim();
     const bodyText = String(body.body ?? "");
     const fromEmails = Array.isArray(body.fromEmails)
       ? [...new Set((body.fromEmails as string[]).map((e) => String(e).trim().toLowerCase()).filter(Boolean))]
       : [];
-    if (!target || !subject || fromEmails.length === 0) {
-      return json({ ok: false, error: "target, subject and at least one sending inbox are required" }, 400);
+    if (targets.length === 0 || !subject || fromEmails.length === 0) {
+      return json({ ok: false, error: "at least one recipient, a subject and one sending inbox are required" }, 400);
     }
     const row: SendBlast = {
       id: uid(),
-      target,
+      targets,
       subject,
       body: bodyText,
       from_emails: fromEmails,

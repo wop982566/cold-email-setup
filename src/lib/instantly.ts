@@ -299,7 +299,7 @@ async function mailTesterPost(
 export const mailTester = {
   verify: (payload: { seedIds?: string[]; sendIds?: string[] }) => mailTesterPost({ action: "verify", ...payload }),
   testNow: (mailbox: string) => mailTesterPost({ action: "test-now", mailbox }),
-  blast: (payload: { target: string; subject: string; body: string; fromEmails: string[] }) =>
+  blast: (payload: { targets: string[]; subject: string; body: string; fromEmails: string[] }) =>
     mailTesterPost({ action: "blast", ...payload }),
 };
 
