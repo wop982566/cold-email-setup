@@ -335,6 +335,93 @@ export interface PopulateRun extends BaseRow {
   log?: string[];
 }
 
+// --- Inbox tester: seeds, senders, placement tests, blasts -----------------
+export type MailProvider = "gmail" | "gworkspace" | "outlook" | "o365" | "yahoo" | "icloud" | "other";
+export type ConnState = "unknown" | "ok" | "failed";
+
+/**
+ * A seed inbox we READ over IMAP to see where a test email landed. Credentials
+ * (imap_password) are live — this table is gated behind APP_FUNCTION_TOKEN.
+ */
+export interface SeedInbox extends BaseRow {
+  provider: MailProvider;
+  email: string;
+  imap_host: string;
+  imap_port: number;
+  imap_secure: boolean;
+  imap_user: string;
+  imap_password: string;
+  active: boolean;
+  connected: ConnState;
+  last_error?: string;
+  verified_at?: string;
+  note?: string;
+}
+
+/**
+ * A sending inbox we SEND from over SMTP (the accounts under test). When
+ * `profile_id` is set the SMTP creds come from that MailProfile with the
+ * username template applied to this email; otherwise the inline fields are used.
+ * Holds live credentials — gated behind APP_FUNCTION_TOKEN.
+ */
+export interface SendInbox extends BaseRow {
+  email: string;
+  source: "instantly" | "manual";
+  profile_id?: string;
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_secure?: boolean;
+  smtp_user?: string;
+  smtp_password?: string;
+  from_name?: string;
+  connected: ConnState;
+  last_error?: string;
+  verified_at?: string;
+}
+
+export type SeedFolder = "primary" | "tab" | "spam" | "missing";
+
+export interface InboxTestResult {
+  seed: string;
+  provider: MailProvider;
+  folder: SeedFolder;
+  auth?: { spf?: string; dkim?: string; dmarc?: string };
+}
+
+export interface InboxTestSummary {
+  primaryRate: number;
+  tabRate: number;
+  spamRate: number;
+  missing: number;
+  placementScore: number;
+  perProvider: Record<string, { primary: number; tab: number; spam: number; missing: number; total: number }>;
+}
+
+/** One placement test: send from `mailbox` to the seed panel, then read each seed. */
+export interface InboxTest extends BaseRow {
+  mailbox: string;
+  token: string;
+  status: "queued" | "sending" | "reading" | "done" | "failed";
+  trigger: "manual" | "rotation" | "event";
+  started_at: string;
+  read_after: string; // ISO — don't read the seeds before this
+  seeds: { email: string; provider: MailProvider }[];
+  results: InboxTestResult[];
+  summary: InboxTestSummary | null;
+  error?: string;
+}
+
+/** A custom "send this body from all my inboxes to one address" run. */
+export interface SendBlast extends BaseRow {
+  target: string;
+  subject: string;
+  body: string;
+  from_emails: string[];
+  status: "queued" | "sending" | "done" | "failed";
+  started_at: string;
+  results: { email: string; outcome: "sent" | "failed" | "skipped"; error?: string }[];
+}
+
 // --- Mailbox recovery ------------------------------------------------------
 // "recovered" and "restored" are deliberately separate: the first releases a
 // mailbox back into the spare pool for FUTURE swaps, the second puts it back
@@ -365,7 +452,7 @@ export interface RecoveryEntry extends BaseRow {
   reason: string; // what triggered the swap, in the words the UI used
   // Sampled whenever the planner loads, so the trend is real history rather
   // than a single before/after pair.
-  history: { at: string; score: number | null; inbox_rate: number | null }[];
+  history: { at: string; score: number | null; inbox_rate: number | null; seed_primary?: number | null }[];
 }
 
 // --- Mailbox credential profiles -------------------------------------------
@@ -447,6 +534,16 @@ export interface AppSettings {
   auto_swap_min_bad_days: number;
   auto_swap_notify_email: string; // where run summaries go
   auto_swap_from_email: string; // verified Resend sender
+  // --- Inbox tester (seed panel) -------------------------------------------
+  seed_test_wait_minutes: number; // wait this long after sending before reading the seeds
+  seed_daily_test_budget: number; // max placement tests per day (protects the seed panel)
+  seed_rotation_days: number; // retest each mailbox at least this often
+  seed_min_primary_rate: number; // below this % primary-inbox placement, a mailbox needs replacing
+  seed_halflife_days: number; // exponential decay half-life for the rolled-up score
+  seed_min_samples: number; // tests needed before the seed score is "confirmed"
+  seed_test_subject: string; // template for the placement-test subject ({token} substituted)
+  seed_test_body: string; // template for the placement-test body
+  blast_max_per_run: number; // custom-blast sends per worker tick (chunks a big fleet)
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -477,6 +574,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   auto_swap_min_bad_days: 1,
   auto_swap_notify_email: "webofpicasso@gmail.com",
   auto_swap_from_email: "info@webofpicasso.net",
+  seed_test_wait_minutes: 6,
+  seed_daily_test_budget: 12,
+  seed_rotation_days: 4,
+  seed_min_primary_rate: 50,
+  seed_halflife_days: 10,
+  seed_min_samples: 2,
+  seed_test_subject: "Quick question {token}",
+  seed_test_body:
+    "Hi,\n\nJust reaching out to see if this is something you'd be open to exploring.\n\nWould a short chat next week work?\n\nBest,\nThe team\n\nref {token}",
+  blast_max_per_run: 25,
 };
 
 // Table name constants — single source of truth.
@@ -496,6 +603,10 @@ export const TABLES = {
   autoSwapRuns: "auto_swap_runs",
   testSwaps: "test_swaps",
   populateRuns: "populate_runs",
+  seedInboxes: "seed_inboxes",
+  sendInboxes: "send_inboxes",
+  inboxTests: "inbox_tests",
+  sendBlasts: "send_blasts",
   setupBatches: "setup_batches",
   mailboxTags: "mailbox_tags",
   mailProfiles: "mail_profiles",
@@ -503,6 +614,10 @@ export const TABLES = {
 } as const;
 
 /** Tables holding credentials — gated behind APP_FUNCTION_TOKEN server-side. */
-export const SECRET_TABLES: readonly string[] = [TABLES.mailProfiles];
+export const SECRET_TABLES: readonly string[] = [
+  TABLES.mailProfiles,
+  TABLES.seedInboxes,
+  TABLES.sendInboxes,
+];
 
 export type TableName = (typeof TABLES)[keyof typeof TABLES];

@@ -46,6 +46,8 @@ import {
   type PlacementMap,
 } from "../lib/placement";
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
+import { rollupAll } from "../lib/inboxPlacement";
+import type { InboxTest } from "../lib/types";
 import { buildTagMap, mergeTagMaps, normaliseTag, parseTagPayload, tagsFor } from "../lib/tags";
 import {
   accountCredentials,
@@ -252,6 +254,16 @@ export default function Planner() {
     return m;
   }, [inboxSends]);
 
+  // Seed-panel placement (the Inbox Tester ground truth) rolled up per mailbox,
+  // fed into health as the top-priority signal when a mailbox has been tested.
+  const inboxTestsQ = useCollection<InboxTest>(TABLES.inboxTests);
+  const seedPlacement = useMemo(() => {
+    const roll = rollupAll(inboxTestsQ.data ?? []);
+    const m = new Map<string, { primaryRate: number | null; samples: number; testedAt: string | null }>();
+    for (const [email, r] of roll) m.set(email, { primaryRate: r.primaryRate, samples: r.samples, testedAt: r.lastTestedAt });
+    return m.size ? m : undefined;
+  }, [inboxTestsQ.data]);
+
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
   const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
@@ -389,12 +401,14 @@ export default function Planner() {
       // Real per-mailbox sends/bounce — flags a burned inbox even when its
       // warmup score reads a flat 100.
       sends: mailboxSends,
+      // Seed-panel Primary-inbox rate — the ground truth, when tested.
+      seedPlacement,
       // Supplying this at all turns niche gating on, so the tab refuses
       // cross-niche swaps exactly as the cron does.
       tagMap,
       campaignTagsById: tagAssignments.byCampaign,
     });
-  }, [plan, domains, settings, placementHealthInput, recovering, mailboxSends, tagMap, tagAssignments]);
+  }, [plan, domains, settings, placementHealthInput, recovering, mailboxSends, seedPlacement, tagMap, tagAssignments]);
 
   // The growth calculator: sizes the whole fleet (campaigns, sending inboxes,
   // per-niche spares, domains) for the goal, against what already exists. The

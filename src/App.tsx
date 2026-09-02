@@ -8,6 +8,7 @@ const Domains = lazy(() => import("./pages/Domains"));
 const SetupBatch = lazy(() => import("./pages/SetupBatch"));
 const Capacity = lazy(() => import("./pages/Capacity"));
 const Planner = lazy(() => import("./pages/Planner"));
+const InboxTester = lazy(() => import("./pages/InboxTester"));
 const Leads = lazy(() => import("./pages/Leads"));
 const Sequences = lazy(() => import("./pages/Sequences"));
 const Instantly = lazy(() => import("./pages/Instantly"));
@@ -65,6 +66,14 @@ export default function App() {
           element={
             <Suspense fallback={<Loading />}>
               <Planner />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/inbox-tester"
+          element={
+            <Suspense fallback={<Loading />}>
+              <InboxTester />
             </Suspense>
           }
         />

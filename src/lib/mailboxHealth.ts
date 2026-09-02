@@ -25,6 +25,7 @@ export type IssueCode =
   | "warmup_off"
   | "warmup_unknown"
   | "spam_placement"
+  | "seed_low"
   | "bounce_critical"
   | "bounce_high"
   | "stalled"
@@ -76,6 +77,8 @@ export interface MailboxHealth {
   inboxRate: number | null; // from warmup analytics, when available
   /** Real bounce rate on real sends, when account-analytics reports it. */
   bounceRate: number | null;
+  /** Seed-panel Primary-inbox rate (the Inbox Tester ground truth), when tested. */
+  seedPrimaryRate: number | null;
   /** Real sends in the analytics window; null when the workspace doesn't report per-mailbox sends. */
   sentLast30: number | null;
   /** Composite deliverability score, 0-100 — the "real health" the warmup score can't fake. */
@@ -142,6 +145,11 @@ export interface MaintenanceInput {
    * (stalled). Omitted ⇒ no real-send judgments are made.
    */
   sends?: Map<string, MailboxSendStat>;
+  /**
+   * Seed-panel placement per mailbox, from the Inbox Tester — the strongest,
+   * ground-truth health signal (did real mail reach a real Primary inbox).
+   */
+  seedPlacement?: Map<string, { primaryRate: number | null; samples: number; testedAt: string | null }>;
   settings: AppSettings;
   today?: Date;
 }
@@ -193,6 +201,8 @@ export function computeHealthScore(args: {
   sendsSupported: boolean;
   warmupScore: number | null;
   warmupUsable: boolean;
+  /** Seed-panel Primary-inbox rate — real-recipient placement, when tested. */
+  seedPrimary: number | null;
   domainExpired: boolean;
   dnsUnverified: boolean;
 }): { score: number | null; band: HealthBand; reasons: string[] } {
@@ -209,13 +219,19 @@ export function computeHealthScore(args: {
 
   // --- Positive evidence: the only things that earn a HIGH score ---
   const pos: { v: number; w: number }[] = [];
+  // The seed test measures real mail reaching a real Primary inbox — the closest
+  // thing to ground truth, so it dominates when present.
+  if (args.seedPrimary !== null) {
+    pos.push({ v: args.seedPrimary, w: 0.8 });
+    reasons.push(`${Math.round(args.seedPrimary)}% seed inbox placement`);
+  }
   if (bounceMeasured) {
-    pos.push({ v: clamp(100 - args.bounceRate! * 10, 0, 100), w: 0.7 });
+    pos.push({ v: clamp(100 - args.bounceRate! * 10, 0, 100), w: 0.5 });
     reasons.push(`${args.bounceRate!.toFixed(1)}% bounce on ${args.sentLast30} real sends`);
   }
   if (args.warmupUsable && args.warmupScore !== null) {
-    pos.push({ v: args.warmupScore, w: 0.3 });
-    if (!bounceMeasured) reasons.push(`warmup score ${args.warmupScore}`);
+    pos.push({ v: args.warmupScore, w: 0.2 });
+    if (!bounceMeasured && args.seedPrimary === null) reasons.push(`warmup score ${args.warmupScore}`);
   }
   const wsum = pos.reduce((n, p) => n + p.w, 0);
   let base: number | null = pos.length ? Math.round(pos.reduce((n, p) => n + p.v * p.w, 0) / wsum) : null;
@@ -314,6 +330,7 @@ export function computeMaintenance({
   tagMap,
   campaignTagsById,
   sends,
+  seedPlacement,
   settings,
   today,
 }: MaintenanceInput): Maintenance {
@@ -328,6 +345,8 @@ export function computeMaintenance({
   const maturityDays = num(s.maintenance_new_mailbox_days, DEF.maturityDays);
   const minInboxRate = num(s.maintenance_min_inbox_rate, DEF.minInboxRate);
   const maxBounce = num(s.maintenance_max_bounce_rate, DEF.maxBounce);
+  const seedMinPrimary = num(s.seed_min_primary_rate, 50);
+  const seedMinSamples = num(s.seed_min_samples, 2);
   const expiryWindow = num(settings.reminder_window_days, 30);
   // Supplying the map at all means this workspace reports per-mailbox sends, so
   // a live-campaign mailbox absent from it has genuinely sent nothing.
@@ -349,6 +368,12 @@ export function computeMaintenance({
     const stat = sends?.get(box.email);
     const sentLast30 = sendsSupported ? (stat?.sentLast30 ?? 0) : null;
     const bounceRate = stat?.bounceRate ?? null;
+
+    // Seed-panel placement — the Inbox Tester ground truth, when this mailbox
+    // has been tested enough to trust the number.
+    const seed = seedPlacement?.get(box.email.toLowerCase());
+    const seedPrimaryRate =
+      seed && seed.primaryRate !== null && seed.samples >= seedMinSamples ? seed.primaryRate : null;
 
     const ageDays = box.createdAt ? Math.max(0, -(daysUntil(box.createdAt) ?? 0)) : null;
     const hasSent = Boolean(box.lastUsedAt);
@@ -409,6 +434,17 @@ export function computeMaintenance({
       }
     }
 
+    // --- seed placement: the ground truth beats every proxy ---
+    if (seedPrimaryRate !== null && seedPrimaryRate < seedMinPrimary) {
+      const crit = seedPrimaryRate < 25;
+      add(
+        "seed_low",
+        crit ? "critical" : "warn",
+        `Only ${Math.round(seedPrimaryRate)}% reaching the Primary inbox (seed test)`,
+        true,
+      );
+    }
+
     // --- stalled: in a live campaign yet sending nothing ---
     // Suspicious rather than proven-bad (a campaign may be legitimately paused),
     // so it flags for the operator's attention without forcing a swap.
@@ -453,6 +489,7 @@ export function computeMaintenance({
       score,
       inboxRate,
       bounceRate,
+      seedPrimaryRate,
       sentLast30,
       healthScore: null, // filled below (needs the fleet-wide warmup signal)
       healthBand: "unknown" as HealthBand,
@@ -485,6 +522,7 @@ export function computeMaintenance({
       sendsSupported,
       warmupScore: m.score,
       warmupUsable: warmupSignal.discriminating,
+      seedPrimary: m.seedPrimaryRate,
       domainExpired: days !== null && days < 0,
       dnsUnverified: m.domain?.dns_status === "No",
     });

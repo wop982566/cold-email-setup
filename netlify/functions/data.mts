@@ -23,7 +23,7 @@ function tokenOk(req: Request): boolean {
 // passwords, and without APP_FUNCTION_TOKEN this endpoint answers to anyone
 // who learns the URL. So they are served only when the token is configured —
 // an unauthenticated deployment simply cannot read or write them.
-const SECRET_TABLES = new Set(["mail_profiles"]);
+const SECRET_TABLES = new Set(["mail_profiles", "seed_inboxes", "send_inboxes"]);
 
 function secretsAllowed(): boolean {
   return Boolean(process.env.APP_FUNCTION_TOKEN);

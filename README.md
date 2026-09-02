@@ -193,6 +193,44 @@ Recovery / the Swap archive, exactly like any other swap. (This drives the
 Maintenance tab's proposals; the daily auto-swapper is unchanged and does not act
 on the bounce signal on its own.)
 
+### Inbox Tester — real Primary-inbox placement
+
+The honest ceiling of the passive signals above is that none proves a message
+reaches a real recipient's **Primary inbox**. The **Inbox Tester** page closes
+that gap with a seed panel:
+
+- **Seeds** — inboxes you own (Gmail, Google Workspace, Outlook/Office 365,
+  Yahoo, iCloud) added over IMAP. The Add-seed form pre-fills each provider's
+  host/port and shows the exact steps + link to create an app password.
+- **Senders** — the accounts under test. **Fetch from Instantly** auto-populates
+  every account (all 121), flags which are already connected, and lets you
+  **select all → connect with one SMTP detail** (an SES key + `{email}` template,
+  or a saved mail profile). A bulk **Verify** does a real SMTP login and reports
+  the true error per inbox.
+- **Placement test** — pick a sender, **Test now**: it sends a token-tagged email
+  to the whole seed panel, then reads each seed over IMAP and scores where it
+  landed — **Primary / tab / Spam / Missing** — per provider, with SPF/DKIM/DMARC
+  from the headers. One test is noisy, so health is a **time-decayed average** of
+  recent tests (half-life ~10 days, `seed_min_samples` before it's trusted).
+- **Custom blast** — type a subject/body and a target address, pick **all or a
+  selection** of connected inboxes, and send — for eyeballing placement yourself.
+
+The seed **Primary-inbox rate** becomes the **top-priority Health signal**: a
+mailbox failing the seed test is flagged for replacement even at warmup 100, and
+the Health column shows the real number. Sending and reading happen server-side
+in a scheduled worker (`mail-tester.mts`, runs on the production deploy) plus an
+on-demand trigger (`mail-tester-run.mts`); the browser only ever posts the form
+values. All seed IMAP and sender SMTP passwords live in the **gated** blob store
+(`APP_FUNCTION_TOKEN`) — write-only in the UI, never returned to the client,
+never in the repo. **The libraries `nodemailer` and `imapflow` are used only in
+the functions**, never the client bundle.
+
+> Honest limit: over IMAP, Gmail's Primary-vs-Promotions is read from its category
+> labels, but Outlook's Focused-vs-Other both live under INBOX, so Outlook is
+> scored inbox-vs-junk. Live SMTP/IMAP behaviour is validated by the built-in
+> **Verify** on your real accounts — the pure scoring/matching logic is unit-tested,
+> but talking to Gmail/Outlook can only be proven against your live credentials.
+
 ### Autopopulate campaigns (Plan tab)
 
 A campaign that isn't attached to enough inboxes can't hit its daily sending

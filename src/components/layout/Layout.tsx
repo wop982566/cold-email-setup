@@ -20,6 +20,7 @@ import {
   AlertTriangle,
   Target,
   Layers,
+  MailCheck,
 } from "lucide-react";
 import { authEnabled, signOut } from "../../lib/auth";
 import { cn } from "../../lib/utils";
@@ -34,6 +35,7 @@ const NAV = [
   { to: "/setup-batch", label: "Bulk Setup", icon: Layers },
   { to: "/capacity", label: "Sending Capacity", icon: Gauge },
   { to: "/planner", label: "Campaign Planner", icon: Target },
+  { to: "/inbox-tester", label: "Inbox Tester", icon: MailCheck },
   { to: "/leads", label: "Leads", icon: Users },
   { to: "/sequences", label: "Sequences", icon: Mail },
   { to: "/instantly", label: "Instantly", icon: Plug },

@@ -275,4 +275,32 @@ export const instantly = {
   ) => write({ op: "add-campaign-emails", ...payload, dryRun }),
 };
 
+// --- Inbox tester ----------------------------------------------------------
+// The buttons on the Inbox Tester page reach the mail-tester-run function
+// (verify SMTP/IMAP, queue a placement test, kick a custom blast). Same
+// x-app-token header as every other write.
+async function mailTesterPost(
+  body: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string; [k: string]: unknown }> {
+  try {
+    const res = await fetch("/.netlify/functions/mail-tester-run", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (!res.ok) return { ok: false, error: data.error ?? `HTTP ${res.status}` };
+    return { ok: true, ...data };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Network error (functions only run on Netlify)" };
+  }
+}
+
+export const mailTester = {
+  verify: (payload: { seedIds?: string[]; sendIds?: string[] }) => mailTesterPost({ action: "verify", ...payload }),
+  testNow: (mailbox: string) => mailTesterPost({ action: "test-now", mailbox }),
+  blast: (payload: { target: string; subject: string; body: string; fromEmails: string[] }) =>
+    mailTesterPost({ action: "blast", ...payload }),
+};
+
 // Pull a numeric stat from a record trying several known Instantly field names.
