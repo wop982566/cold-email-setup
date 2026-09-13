@@ -1,0 +1,16 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.netlify
+.DS_Store
+*.log
+.vite
+coverage
+
+*.tsbuildinfo
+
+cold-email-command-center.zip
+*.zip
+package-lock.json
