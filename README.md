@@ -23,7 +23,7 @@ for domain-expiry lookups and AI enrichment.
 | **Costs** | Track domains, SES, Instantly, hosting, AI, etc. Monthly/annual totals, cost-per-domain, cost-per-1k-emails, spend-by-category, upcoming renewals. |
 | **Setup Playbooks** | Named, dated, step-by-step record of how a setup was built — registrar → DNS → SES → forwarding → sites → Gmail send-as → Instantly → warmup, with platforms, accounts and links. Seeded with your current 2026 setup. |
 | **Insights** | Domain-health score, lead funnel, leads-per-campaign, expiry-by-month, capacity utilisation, and an **Opportunities** list that nudges you to use your full capacity. |
-| **Settings** | Workspace config, currency, reminder window, campaigns, **custom fields**, AI toggle, Supabase connection guide, JSON export, reset. |
+| **Settings** | Workspace config, currency, reminder window, campaigns, **custom fields**, AI toggle, Supabase connection guide, JSON export, **live Instantly CSV export** (accounts + tags + settings, campaigns + connected inboxes, and a flat campaign↔account map — passwords excluded), reset. |
 
 Everything is customisable — provider limits, costs, campaigns and custom
 fields are all editable in the UI.

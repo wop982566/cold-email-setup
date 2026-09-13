@@ -12,9 +12,13 @@ import {
   Download,
   RotateCcw,
   KeyRound,
+  RefreshCw,
+  FileDown,
 } from "lucide-react";
-import { Card, Badge, Toggle } from "../components/ui/primitives";
+import { Card, Badge, Toggle, Spinner } from "../components/ui/primitives";
 import { Modal, ConfirmDialog } from "../components/ui/Modal";
+import { instantly, asItems } from "../lib/instantly";
+import { buildInstantlyExport, type InstantlyExport } from "../lib/exportData";
 import { Field, TextField, SelectField, TextArea, NumberField } from "../components/ui/Field";
 import { useToast } from "../components/ui/toast";
 import {
@@ -200,7 +204,140 @@ export default function Settings() {
           ) : null}
         </div>
       </Card>
+
+      <InstantlyExportSection />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Export the LIVE Instantly workspace to CSV: accounts (with tags + settings +
+// the campaigns each is connected to), campaigns (with their connected inboxes
+// + tags), and a flat campaign↔account map. Fetches through the same read-only
+// proxy the rest of the app uses; the CSV build (exportData.ts) is pure/tested.
+// Passwords are never included.
+// ---------------------------------------------------------------------------
+function InstantlyExportSection() {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const [built, setBuilt] = useState<InstantlyExport | null>(null);
+  const stamp = new Date().toISOString().slice(0, 10);
+
+  async function fetchAndBuild() {
+    setBusy(true);
+    setBuilt(null);
+    setStatus("Fetching accounts, campaigns and tags from Instantly…");
+    try {
+      const [accRes, campRes, tagRes] = await Promise.all([
+        instantly.accounts(),
+        instantly.campaigns(),
+        instantly.tags(),
+      ]);
+      if (!accRes.ok) {
+        toast.push(
+          accRes.configured === false
+            ? "Instantly isn't connected — add INSTANTLY_API_KEY in Netlify."
+            : `Couldn't fetch accounts: ${accRes.error ?? "failed"}`,
+          "error",
+        );
+        return;
+      }
+      const accounts = asItems<Record<string, unknown>>(accRes.data);
+      let campaigns = campRes.ok ? asItems<Record<string, unknown>>(campRes.data) : [];
+      if (!campRes.ok) toast.push(`Campaigns didn't load: ${campRes.error ?? "failed"} — exporting accounts only.`, "info");
+
+      // The /campaigns list may omit email_list (the campaign→inbox linkage).
+      // Fetch the detail for any campaign missing it so the connections are complete.
+      const idOf = (c: Record<string, unknown>) =>
+        String(c.id ?? c.campaign_id ?? "").trim();
+      const missing = campaigns.filter((c) => {
+        const l = (c as { email_list?: unknown }).email_list;
+        return (!Array.isArray(l) || l.length === 0) && idOf(c);
+      });
+      if (missing.length) {
+        setStatus(`Resolving connected inboxes for ${missing.length} campaign(s)…`);
+        const details = await Promise.all(missing.map((c) => instantly.campaignDetail(idOf(c))));
+        const byId = new Map<string, Record<string, unknown>>();
+        details.forEach((d, i) => {
+          if (d.ok && d.data && typeof d.data === "object") byId.set(idOf(missing[i]), d.data as Record<string, unknown>);
+        });
+        campaigns = campaigns.map((c) => {
+          const det = byId.get(idOf(c));
+          const l = det?.email_list;
+          return Array.isArray(l) ? { ...c, email_list: l } : c;
+        });
+      }
+
+      const tagsPayload = tagRes.ok ? (tagRes as { data?: unknown }).data ?? null : null;
+      setStatus("Building CSVs…");
+      const out = buildInstantlyExport({ accounts, campaigns, tagsPayload });
+      setBuilt(out);
+      toast.push(
+        `Ready: ${out.counts.accounts} accounts, ${out.counts.campaigns} campaigns, ${out.counts.connections} connections`,
+        "success",
+      );
+    } catch (e) {
+      toast.push(`Export failed: ${e instanceof Error ? e.message : "unknown error"}`, "error");
+    } finally {
+      setBusy(false);
+      setStatus("");
+    }
+  }
+
+  function downloadAll() {
+    if (!built) return;
+    download(`instantly-accounts-${stamp}.csv`, built.accountsCsv);
+    download(`instantly-campaigns-${stamp}.csv`, built.campaignsCsv);
+    download(`instantly-campaign-account-map-${stamp}.csv`, built.mapCsv);
+  }
+
+  return (
+    <Card className="p-5">
+      <h2 className="mb-1 flex items-center gap-2 text-lg">
+        <Database size={18} /> Export Instantly data (CSV)
+      </h2>
+      <p className="mb-3 text-sm text-muted">
+        Pulls your live Instantly workspace: every email account with its tags, settings and connected
+        campaigns; every campaign with its connected inboxes; and a flat campaign↔account map. Passwords
+        are never included.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button className="btn-primary" onClick={() => void fetchAndBuild()} disabled={busy}>
+          {busy ? <Spinner /> : <RefreshCw size={16} />} {built ? "Refresh from Instantly" : "Fetch from Instantly"}
+        </button>
+        {status ? <span className="text-sm text-muted">{status}</span> : null}
+      </div>
+
+      {built ? (
+        <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap gap-2 text-sm">
+            <Badge tone="mint">{built.counts.accounts} accounts</Badge>
+            <Badge tone="sky">{built.counts.campaigns} campaigns</Badge>
+            <Badge tone="lavender">{built.counts.connections} connections</Badge>
+            <Badge tone="white">{built.counts.taggedAccounts} tagged</Badge>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button className="btn-ghost btn-sm" onClick={() => download(`instantly-accounts-${stamp}.csv`, built.accountsCsv)}>
+              <FileDown size={14} /> accounts.csv
+            </button>
+            <button className="btn-ghost btn-sm" onClick={() => download(`instantly-campaigns-${stamp}.csv`, built.campaignsCsv)}>
+              <FileDown size={14} /> campaigns.csv
+            </button>
+            <button className="btn-ghost btn-sm" onClick={() => download(`instantly-campaign-account-map-${stamp}.csv`, built.mapCsv)}>
+              <FileDown size={14} /> campaign-account-map.csv
+            </button>
+            <button className="btn-primary btn-sm" onClick={downloadAll}>
+              <Download size={14} /> Download all 3
+            </button>
+          </div>
+          {built.counts.accounts === 0 ? (
+            <p className="text-xs text-danger">Instantly returned no accounts — check the API key's read scopes.</p>
+          ) : null}
+        </div>
+      ) : null}
+    </Card>
   );
 }
 
