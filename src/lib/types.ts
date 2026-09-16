@@ -335,6 +335,43 @@ export interface PopulateRun extends BaseRow {
   log?: string[];
 }
 
+// --- Periodic rotation swap ------------------------------------------------
+// A durability strategy independent of health: each rotation-managed campaign
+// keeps two FIXED same-niche cohorts and alternates the whole connected set
+// every `interval_days`. While one cohort sends, its partner rests and re-warms
+// (warmup is already enabled on every account), then they swap back — forever.
+
+/** Per-campaign rotation state. The row id IS the campaign id. */
+export interface RotationState extends BaseRow {
+  campaign_id: string;
+  campaign_name: string;
+  enabled: boolean;
+  interval_days: number; // per-campaign; defaults from settings.rotation_interval_days
+  niche: string[]; // campaign tags captured at setup, for display
+  cohort_a: string[]; // the campaign's actual connected set when rotation was enabled
+  cohort_b: string[]; // auto-picked idle same-niche spares, locked (may be smaller than A)
+  active: "A" | "B"; // which cohort is connected right now
+  last_rotated_at: string | null; // set to enable-time on setup, so the first swap is +interval
+  next_due_at: string | null;
+}
+
+/** One rotation-swap run, per campaign. Newest kept, older auto-deleted. */
+export interface RotationRun extends BaseRow {
+  ran_at: string;
+  campaign_id: string;
+  campaign_name: string;
+  direction: "A→B" | "B→A";
+  // Paired by index for the notification; a surplus outgoing inbox (unequal
+  // cohorts) pairs with an empty `in` — it rests with no replacement.
+  pairs: { out: string; in: string }[];
+  swapped_in: string[];
+  swapped_out: string[];
+  outcome: "applied" | "unconfirmed" | "failed" | "skipped";
+  failures: { email: string; reason: string }[];
+  notification: string;
+  log?: string[];
+}
+
 // --- Inbox tester: seeds, senders, placement tests, blasts -----------------
 export type MailProvider = "gmail" | "gworkspace" | "outlook" | "o365" | "yahoo" | "icloud" | "other";
 export type ConnState = "unknown" | "ok" | "failed";
@@ -536,6 +573,13 @@ export interface AppSettings {
   auto_swap_min_bad_days: number;
   auto_swap_notify_email: string; // where run summaries go
   auto_swap_from_email: string; // verified Resend sender
+  // --- Periodic rotation swap ----------------------------------------------
+  // The master mode switch. When true, the health-based auto-swapper is turned
+  // OFF entirely and only the 15-day rotation runs (on the campaigns it's
+  // enabled for). The env var ROTATION_SWAP_ENABLED is the production kill
+  // switch for the rotation cron, mirroring AUTO_SWAP_ENABLED.
+  rotation_swap_enabled: boolean;
+  rotation_interval_days: number; // days a cohort sends before it rotates out (default 15)
   // --- Inbox tester (seed panel) -------------------------------------------
   seed_test_wait_minutes: number; // wait this long after sending before reading the seeds
   seed_daily_test_budget: number; // max placement tests per day (protects the seed panel)
@@ -576,6 +620,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   auto_swap_min_bad_days: 1,
   auto_swap_notify_email: "webofpicasso@gmail.com",
   auto_swap_from_email: "info@webofpicasso.net",
+  rotation_swap_enabled: false,
+  rotation_interval_days: 15,
   seed_test_wait_minutes: 6,
   seed_daily_test_budget: 12,
   seed_rotation_days: 4,
@@ -612,6 +658,8 @@ export const TABLES = {
   setupBatches: "setup_batches",
   mailboxTags: "mailbox_tags",
   mailProfiles: "mail_profiles",
+  rotationState: "rotation_state",
+  rotationRuns: "rotation_swap_runs",
   settings: "app_settings",
 } as const;
 

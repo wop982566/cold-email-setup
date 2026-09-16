@@ -94,7 +94,8 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
 | `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
 | `INSTANTLY_WRITE_ENABLED` | functions | **Required for any write.** Set to `true` to let the planner create mailboxes and swap them on campaigns. Unset, every write returns 403 and the Maintenance tab shows a banner saying so. Reads are unaffected. |
-| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`, logic in `_autoSwapRun.ts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. |
+| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`, logic in `_autoSwapRun.ts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. Automatically stands down when rotation mode is on (below). |
+| `ROTATION_SWAP_ENABLED` | functions | Kill switch for the daily **periodic rotation swap** (`netlify/functions/rotation-swap.mts`, logic in `_rotationRun.ts`). The scheduled run also needs the in-app master toggle (`rotation_swap_enabled`) and `INSTANTLY_WRITE_ENABLED`. Unset or not `true`, no unattended rotation happens (the Planner's **Rotate now** button still works). |
 | `RESEND_API_KEY` | functions | Resend key for run-summary emails. Without it the swapper still runs and still logs — it just can't email you. The sending domain must be verified in Resend or sends fail with 403. |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
@@ -414,6 +415,38 @@ details** backfills from `account-detail` on demand. The `mail_profiles` source
 needs `APP_FUNCTION_TOKEN` (the table is gated); without it, only the live value
 shows. The Plan tab's **Accounts by IMAP** card renders the same grouping as a
 clean table.
+
+---
+
+## 🔁 Periodic rotation swap (Planner → Rotation tab)
+
+A durability strategy that doesn't depend on health scores (Instantly reports a
+flat 100% warmup, so the health-based swapper has little to act on). For a chosen
+campaign it keeps **two fixed same-niche cohorts** and **alternates the whole
+connected set every 15 days**: while one cohort sends, its partner rests and
+re-warms (warmup is already on for every account), then they swap back — forever,
+so no inbox sends continuously past ~15 days.
+
+- **Enable** on a campaign captures **cohort A** = its live inbox set, and
+  **auto-picks cohort B** = idle, same-niche spares (previewed, then *locked* as
+  the fixed partner). If there aren't enough same-niche idle spares, it rotates
+  with what's available and the preview warns that capacity dips on B's turn.
+- A **daily** scheduled worker (`rotation-swap.mts` → `_rotationRun.ts`) rotates
+  each campaign whose 15-day interval has elapsed (per-campaign state, so the
+  cadence is configurable). Each swap is one guarded write — a new
+  `replace-campaign-emails` op sets the whole `email_list` and verifies it by
+  read-back — and if the live list has drifted from the active cohort (a manual
+  edit), it's **skipped**, not clobbered.
+- **One email per campaign rotation** (Resend) lists every out→in pair and any
+  failure; the Rotation tab shows the full run **log** and a **Rotate now**
+  button that drives one on demand (scheduled functions fire only on the
+  production deploy).
+- The master toggle (`rotation_swap_enabled`) **replaces the health-based
+  swapper**: when it's on, `_autoSwapRun.ts` stands down entirely, and inboxes
+  locked to a rotation cohort are withheld from autopopulate so a resting cohort
+  is never handed to another campaign. Gated by `ROTATION_SWAP_ENABLED` +
+  `INSTANTLY_WRITE_ENABLED` for any unattended write. The pure decision logic
+  lives in `src/lib/rotationSwap.ts`.
 
 ---
 

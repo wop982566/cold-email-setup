@@ -36,6 +36,7 @@ export function AutopopulatePanel({
   overrides,
   healthByEmail,
   onApplied,
+  reservedEmails,
 }: {
   plan: Plan;
   tagMap: TagMap;
@@ -43,6 +44,8 @@ export function AutopopulatePanel({
   overrides: Record<string, string>;
   healthByEmail: Map<string, MailboxHealth>;
   onApplied: () => void;
+  /** Inboxes locked to a rotation cohort — never offered here (they're resting). */
+  reservedEmails?: Set<string>;
 }) {
   const toast = useToast();
 
@@ -71,7 +74,8 @@ export function AutopopulatePanel({
     setPreview(
       planAutopopulate({
         campaigns: plan.campaigns,
-        idle: plan.idleMailboxes,
+        // Idle inboxes locked to a rotation cohort are resting — never populate with them.
+        idle: reservedEmails ? plan.idleMailboxes.filter((b) => !reservedEmails.has(b.email.toLowerCase())) : plan.idleMailboxes,
         tagMap,
         campaignTagsById,
         overrides,

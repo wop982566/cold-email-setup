@@ -226,6 +226,22 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     return new Response("disabled", { status: 200 });
   }
 
+  // Rotation mode replaces health-based swapping. When the operator turns on the
+  // periodic 15-day rotation (settings.rotation_swap_enabled), this swapper steps
+  // aside entirely so the two can never both act on the same campaign.
+  if (settingsForEmail?.rotation_swap_enabled === true) {
+    log("rotation mode is active — health-based swapping is disabled");
+    if (mode === "dryRun") {
+      return json({
+        ok: false,
+        mode,
+        error: "Rotation mode is on (rotation_swap_enabled), so the health-based swapper is disabled. Use the Rotation tab instead.",
+        writesEnabled: false,
+      });
+    }
+    return new Response("disabled — rotation mode is active", { status: 200 });
+  }
+
   try {
     const settings = await readSettings();
     const domains = (await readTable("domains")) as unknown as Domain[];

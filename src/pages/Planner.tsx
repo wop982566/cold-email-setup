@@ -30,7 +30,7 @@ import {
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
 import { useCollection, useInsert, useSettings, useSaveSettings, useUpdate } from "../lib/hooks";
-import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch } from "../lib/types";
+import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch, RotationState } from "../lib/types";
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
 import { computePlan, perUnitMonthly, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
@@ -64,6 +64,8 @@ import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
 import { AutopopulatePanel } from "../components/planner/AutopopulatePanel";
+import { RotationPanel } from "../components/planner/RotationPanel";
+import { reservedEmails as rotationReservedEmails } from "../lib/rotationSwap";
 import { AccountsTab } from "../components/planner/AccountsTab";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
@@ -110,6 +112,7 @@ export default function Planner() {
   const { data: domains = [] } = useCollection<Domain>(TABLES.domains);
   const { data: costs = [] } = useCollection<CostItem>(TABLES.costs);
   const { data: recovery = [] } = useCollection<RecoveryEntry>(TABLES.recovery);
+  const { data: rotationStates = [] } = useCollection<RotationState>(TABLES.rotationState);
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
@@ -118,7 +121,7 @@ export default function Planner() {
   const [exactCounts, setExactCounts] = useState<Map<string, LeadStatusCounts>>(new Map());
   const [loadingExact, setLoadingExact] = useState(false);
   const [exactProgress, setExactProgress] = useState("");
-  const [tab, setTab] = useState<"plan" | "maintenance" | "accounts">("plan");
+  const [tab, setTab] = useState<"plan" | "maintenance" | "accounts" | "rotation">("plan");
 
   // Same keys as the Instantly page and the Sending Health card, so all three
   // share one fetch and the Instantly Refresh button invalidates them.
@@ -267,6 +270,9 @@ export default function Planner() {
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
   const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
+  // Inboxes locked to an enabled rotation cohort — resting, so autopopulate must
+  // not offer them to another campaign (health-swap is off in rotation mode).
+  const rotationReserved = useMemo(() => rotationReservedEmails(rotationStates), [rotationStates]);
 
   // Computed once here and shared: the Maintenance tab and the per-campaign
   // Mailbox niches. Built here and passed down so the table, the maintenance
@@ -641,7 +647,7 @@ export default function Planner() {
       ) : null}
 
       <div className="flex rounded-xl border-2 border-ink">
-        {([["plan", "Plan"], ["maintenance", "Maintenance"], ["accounts", "Accounts"]] as const).map(([k, label]) => (
+        {([["plan", "Plan"], ["maintenance", "Maintenance"], ["accounts", "Accounts"], ["rotation", "Rotation"]] as const).map(([k, label]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
@@ -686,6 +692,17 @@ export default function Planner() {
           onLoadImap={() => void loadImapDetails()}
           loadingImap={loadingImap}
           canLoadImap={!hasImapDetail(creds) || emailsMissingImap(creds).length > 0}
+        />
+      ) : tab === "rotation" ? (
+        <RotationPanel
+          plan={p}
+          settings={settings}
+          patchSettings={patchSettings}
+          tagMap={tagMap}
+          campaignTagsById={tagAssignments.byCampaign}
+          overrides={settings.campaign_group_overrides ?? {}}
+          healthByEmail={healthByEmail}
+          onApplied={refresh}
         />
       ) : (
       <>
@@ -1031,6 +1048,7 @@ export default function Planner() {
         overrides={settings.campaign_group_overrides ?? {}}
         healthByEmail={healthByEmail}
         onApplied={refresh}
+        reservedEmails={rotationReserved}
       />
 
       {/* What actually went out, against what the mailboxes could carry. */}
