@@ -176,11 +176,6 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     return json({ ok: false, error: "Unauthorized" }, 401);
   }
 
-  // Safety backstop: revert any test swap the operator left running (real runs
-  // only — a dry run must never write). Done before anything else so a stale
-  // test swap can't skew the health read that follows.
-  if (mode === "scheduled") await revertOverdueTestSwaps(log);
-
   const settingsForEmail = await readSettings().catch(() => null);
 
   // --- Does Resend work? Asked on its own, so a broken key is distinguishable
@@ -212,6 +207,29 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     });
   }
 
+  // Rotation mode REPLACES health-based swapping. When the operator turns on the
+  // periodic 15-day rotation (settings.rotation_swap_enabled), this swapper stands
+  // down ENTIRELY — checked before the test-swap backstop below so it can't issue
+  // even that write to a rotation-managed campaign.
+  if (settingsForEmail?.rotation_swap_enabled === true) {
+    log("rotation mode is active — health-based swapping is disabled");
+    if (mode === "dryRun") {
+      return json({
+        ok: false,
+        mode,
+        error: "Rotation mode is on (rotation_swap_enabled), so the health-based swapper is disabled. Use the Rotation tab instead.",
+        writesEnabled: false,
+      });
+    }
+    return new Response("disabled — rotation mode is active", { status: 200 });
+  }
+
+  // Safety backstop: revert any test swap the operator left running (real runs
+  // only — a dry run must never write). Before the health read so a stale test
+  // swap can't skew it; after the rotation standdown so it never touches a
+  // rotation-managed campaign.
+  if (mode === "scheduled") await revertOverdueTestSwaps(log);
+
   if (!enabled()) {
     log("AUTO_SWAP_ENABLED is not true — nothing done");
     // A dry run still deserves a real answer about why nothing would happen.
@@ -224,22 +242,6 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
       });
     }
     return new Response("disabled", { status: 200 });
-  }
-
-  // Rotation mode replaces health-based swapping. When the operator turns on the
-  // periodic 15-day rotation (settings.rotation_swap_enabled), this swapper steps
-  // aside entirely so the two can never both act on the same campaign.
-  if (settingsForEmail?.rotation_swap_enabled === true) {
-    log("rotation mode is active — health-based swapping is disabled");
-    if (mode === "dryRun") {
-      return json({
-        ok: false,
-        mode,
-        error: "Rotation mode is on (rotation_swap_enabled), so the health-based swapper is disabled. Use the Rotation tab instead.",
-        writesEnabled: false,
-      });
-    }
-    return new Response("disabled — rotation mode is active", { status: 200 });
   }
 
   try {

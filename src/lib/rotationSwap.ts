@@ -68,15 +68,16 @@ export function selectCohortB(input: SelectCohortBInput): CohortBResult {
     if (a.dailyLimit !== b.dailyLimit) return b.dailyLimit - a.dailyLimit;
     return norm(a.email).localeCompare(norm(b.email));
   });
-  // Dedupe while preserving rank order.
+  // Dedupe while preserving rank order. Check the limit BEFORE pushing so size 0
+  // yields no picks (rather than one).
   const picks: string[] = [];
   const seen = new Set<string>();
   for (const b of ranked) {
+    if (picks.length >= size) break;
     const e = norm(b.email);
     if (seen.has(e)) continue;
     seen.add(e);
     picks.push(e);
-    if (picks.length >= size) break;
   }
   return { picks, shortfall: Math.max(0, size - picks.length), poolSize: eligible.length };
 }

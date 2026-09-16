@@ -42,7 +42,10 @@ function store() {
   return getStore(STORE);
 }
 async function readTable<T = Row>(table: string): Promise<T[]> {
-  const data = (await store().get(table, { type: "json" })) as T[] | null;
+  // Strong consistency: rotateOne does a read-modify-write of rotation_state per
+  // campaign inside the due loop, so an eventual read would let a later campaign
+  // clobber an earlier campaign's cohort flip (mirrors data.mts's reasoning).
+  const data = (await store().get(table, { type: "json", consistency: "strong" })) as T[] | null;
   return Array.isArray(data) ? data : [];
 }
 async function writeTable(table: string, rows: unknown[]): Promise<void> {
@@ -127,31 +130,40 @@ async function rotateOne(state: RotationState, settings: AppSettings): Promise<R
     failures: { email: string; reason: string }[],
     swapped_in: string[],
     swapped_out: string[],
+    opts: { flip?: boolean; advance?: boolean; email?: boolean } = {},
   ): Promise<RotateOutcome> => {
-    // One email per rotation: campaign, every out→in pair, and any failure.
+    // `advance` moves the 15-day clock forward so a stuck campaign retries at the
+    // NEXT interval, not every daily run (drift/rejected/unconfirmed are genuine
+    // attempts). `email` gates the notification. Environmental pre-conditions
+    // (writes off, campaign unreadable) set both false: they retry next run and
+    // don't email, so they can't spam. `flip` swaps the active cohort — applied only.
+    const { flip = false, advance = true, email = true } = opts;
     const pairs = pairSwaps(swapped_out, swapped_in);
-    const to = String(settings.auto_swap_notify_email ?? "").trim();
-    const from = String(settings.auto_swap_from_email ?? "").trim();
-    const subject =
-      outcome === "applied"
-        ? `Rotation: ${campaign} — ${swapped_in.length} in / ${swapped_out.length} out (${plan.direction})`
-        : `Rotation: ${campaign} — ${outcome} (${plan.direction})`;
-    const body = [
-      `${plan.direction} rotation for ${campaign} — ${outcome}.`,
-      "",
-      ...pairs.map((p) =>
-        p.out && p.in
-          ? `SWAPPED  ${p.out} → ${p.in}`
-          : p.out
-            ? `RESTED   ${p.out} (no replacement — smaller partner cohort)`
-            : `ADDED    ${p.in}`,
-      ),
-      ...(failures.length ? ["", ...failures.map((f) => `FAILED   ${f.email || campaign}: ${f.reason}`)] : []),
-      "",
-      `Run at ${ranAt}.`,
-    ].join("\n");
-    const emailed = await notify({ to, from, subject, body });
-    log(`notification: ${emailed.detail}`);
+    let detail = "not attempted";
+    if (email) {
+      const to = String(settings.auto_swap_notify_email ?? "").trim();
+      const from = String(settings.auto_swap_from_email ?? "").trim();
+      const subject =
+        outcome === "applied"
+          ? `Rotation: ${campaign} — ${swapped_in.length} in / ${swapped_out.length} out (${plan.direction})`
+          : `Rotation: ${campaign} — ${outcome} (${plan.direction})`;
+      const body = [
+        `${plan.direction} rotation for ${campaign} — ${outcome}.`,
+        "",
+        ...pairs.map((p) =>
+          p.out && p.in
+            ? `SWAPPED  ${p.out} → ${p.in}`
+            : p.out
+              ? `RESTED   ${p.out} (no replacement — smaller partner cohort)`
+              : `ADDED    ${p.in}`,
+        ),
+        ...(failures.length ? ["", ...failures.map((f) => `FAILED   ${f.email || campaign}: ${f.reason}`)] : []),
+        "",
+        `Run at ${ranAt}.`,
+      ].join("\n");
+      detail = (await notify({ to, from, subject, body })).detail;
+      log(`notification: ${detail}`);
+    }
 
     const runs = await readTable(RUNS_TABLE);
     runs.push({
@@ -165,18 +177,36 @@ async function rotateOne(state: RotationState, settings: AppSettings): Promise<R
       swapped_out,
       outcome,
       failures,
-      notification: emailed.detail,
+      notification: detail,
       log: lines,
     } as RotationRun);
     await writeTable(RUNS_TABLE, runs.slice(-KEEP_RUNS));
-    return { campaignId, campaign, direction: plan.direction, outcome, swapped_in, swapped_out, failures, notification: emailed.detail };
+
+    if (advance) {
+      const interval = state.interval_days && state.interval_days > 0 ? state.interval_days : settings.rotation_interval_days;
+      const nowMs = Date.parse(ranAt);
+      const states = await readTable<RotationState>(STATE_TABLE);
+      const updated = states.map((s) =>
+        s.id === state.id
+          ? {
+              ...s,
+              ...(flip ? { active: state.active === "A" ? "B" : "A" } : {}),
+              last_rotated_at: ranAt,
+              next_due_at: new Date(nextDueMs(nowMs, interval)).toISOString(),
+            }
+          : s,
+      );
+      await writeTable(STATE_TABLE, updated);
+    }
+
+    return { campaignId, campaign, direction: plan.direction, outcome, swapped_in, swapped_out, failures, notification: detail };
   };
 
   // Read the live list and guard against drift from the active cohort.
   const detail = await callInstantly(`resource=campaign-detail&id=${encodeURIComponent(campaignId)}`);
   if (detail.ok !== true) {
     log(`could not read campaign: ${String(detail.error ?? "unknown")}`);
-    return record("failed", [{ email: "", reason: `couldn't read campaign: ${String(detail.error ?? "unknown")}` }], [], []);
+    return record("failed", [{ email: "", reason: `couldn't read campaign: ${String(detail.error ?? "unknown")}` }], [], [], { advance: false, email: false });
   }
   const live = emailListOf(detail.data);
   if (!sameSet(live, plan.resting)) {
@@ -198,27 +228,35 @@ async function rotateOne(state: RotationState, settings: AppSettings): Promise<R
   });
   if (res.writesDisabled) {
     log("INSTANTLY_WRITE_ENABLED is not true — nothing was written");
-    return record("failed", [{ email: "", reason: "INSTANTLY_WRITE_ENABLED is not true — nothing was written" }], [], []);
+    return record("failed", [{ email: "", reason: "INSTANTLY_WRITE_ENABLED is not true — nothing was written" }], [], [], { advance: false, email: false });
   }
   if (res.ok === true && res.applied === true) {
-    // Flip the cohort and reschedule.
-    const nowIso = new Date().toISOString();
-    const interval = state.interval_days && state.interval_days > 0 ? state.interval_days : settings.rotation_interval_days;
-    const nextDue = new Date(nextDueMs(Date.now(), interval)).toISOString();
-    const states = await readTable<RotationState>(STATE_TABLE);
-    const updated = states.map((s) =>
-      s.id === state.id
-        ? { ...s, active: state.active === "A" ? "B" : "A", last_rotated_at: nowIso, next_due_at: nextDue }
-        : s,
-    );
-    await writeTable(STATE_TABLE, updated);
     log(`rotated ${plan.direction}: connected ${plan.target.length}, rested ${plan.resting.length}`);
-    return record("applied", [], plan.target, plan.resting);
+    return record("applied", [], plan.target, plan.resting, { flip: true });
   }
 
   const reason = res.applied === null ? "sent but could not confirm the read-back" : String(res.error ?? "rejected");
   log(`rotation not confirmed: ${reason}`);
   return record(res.applied === null ? "unconfirmed" : "failed", [{ email: "", reason }], [], []);
+}
+
+/** rotateOne, but a THROWN error (e.g. a transient blob failure) becomes a
+ * failed result for THIS campaign rather than unwinding the whole due loop. */
+async function safeRotate(state: RotationState, settings: AppSettings): Promise<RotateOutcome> {
+  try {
+    return await rotateOne(state, settings);
+  } catch (err) {
+    return {
+      campaignId: state.campaign_id,
+      campaign: state.campaign_name || state.campaign_id,
+      direction: state.active === "A" ? "A→B" : "B→A",
+      outcome: "failed",
+      swapped_in: [],
+      swapped_out: [],
+      failures: [{ email: "", reason: `rotation crashed: ${err instanceof Error ? err.message : "unknown error"}` }],
+      notification: "not attempted",
+    };
+  }
 }
 
 export async function runRotation(req?: Request): Promise<Response> {
@@ -292,7 +330,7 @@ export async function runRotation(req?: Request): Promise<Response> {
         return json({ ok: false, error: campaignId ? "no rotation state for that campaign — enable rotation first" : "no rotation-enabled campaigns" }, 404);
       }
       const results: RotateOutcome[] = [];
-      for (const s of targets) results.push(await rotateOne(s, settings));
+      for (const s of targets) results.push(await safeRotate(s, settings));
       return json({ ok: true, mode: "rotateNow", forced: true, results });
     }
 
@@ -306,7 +344,7 @@ export async function runRotation(req?: Request): Promise<Response> {
     if (due.length === 0) return new Response("no rotations due", { status: 200 });
 
     const results: RotateOutcome[] = [];
-    for (const s of due) results.push(await rotateOne(s, settings));
+    for (const s of due) results.push(await safeRotate(s, settings));
     const applied = results.filter((r) => r.outcome === "applied").length;
     return new Response(`${applied}/${results.length} campaign rotation(s) applied`, { status: 200 });
   } catch (err) {

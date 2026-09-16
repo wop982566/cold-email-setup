@@ -37,6 +37,7 @@ export function AutopopulatePanel({
   healthByEmail,
   onApplied,
   reservedEmails,
+  reservedCampaignIds,
 }: {
   plan: Plan;
   tagMap: TagMap;
@@ -46,6 +47,8 @@ export function AutopopulatePanel({
   onApplied: () => void;
   /** Inboxes locked to a rotation cohort — never offered here (they're resting). */
   reservedEmails?: Set<string>;
+  /** Campaigns under rotation — never filled here, or their fixed cohort grows and the next rotation drift-skips. */
+  reservedCampaignIds?: Set<string>;
 }) {
   const toast = useToast();
 
@@ -73,7 +76,9 @@ export function AutopopulatePanel({
   function openPreview() {
     setPreview(
       planAutopopulate({
-        campaigns: plan.campaigns,
+        // Rotation-managed campaigns have a FIXED cohort — filling them would grow
+        // the live list past it and make the next rotation drift-skip. Skip them.
+        campaigns: reservedCampaignIds ? plan.campaigns.filter((c) => !reservedCampaignIds.has(c.id)) : plan.campaigns,
         // Idle inboxes locked to a rotation cohort are resting — never populate with them.
         idle: reservedEmails ? plan.idleMailboxes.filter((b) => !reservedEmails.has(b.email.toLowerCase())) : plan.idleMailboxes,
         tagMap,

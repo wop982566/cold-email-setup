@@ -12,7 +12,7 @@
 // log. The scheduled worker (_rotationRun.ts) does the unattended 15-day swaps.
 // ---------------------------------------------------------------------------
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Repeat,
   Power,
@@ -81,6 +81,7 @@ export function RotationPanel({
   onApplied: () => void;
 }) {
   const toast = useToast();
+  const qc = useQueryClient();
   const statesQ = useCollection<RotationState>(TABLES.rotationState);
   const runsQ = useCollection<RotationRun>(TABLES.rotationRuns);
   const upsertStates = useUpsertMany<RotationState>(TABLES.rotationState);
@@ -228,6 +229,11 @@ export function RotationPanel({
       toast.push(`Rotate now failed: ${err instanceof Error ? err.message : "error"}`, "error");
     } finally {
       setRotating(null);
+      // The worker mutates rotation_state + rotation_swap_runs server-side; these
+      // db-hook queries aren't auto-invalidated by a raw function call, so refresh
+      // them or the panel keeps showing the pre-rotation cohort and log.
+      qc.invalidateQueries({ queryKey: [TABLES.rotationState] });
+      qc.invalidateQueries({ queryKey: [TABLES.rotationRuns] });
     }
   }
 

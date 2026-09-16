@@ -273,6 +273,10 @@ export default function Planner() {
   // Inboxes locked to an enabled rotation cohort — resting, so autopopulate must
   // not offer them to another campaign (health-swap is off in rotation mode).
   const rotationReserved = useMemo(() => rotationReservedEmails(rotationStates), [rotationStates]);
+  const rotationCampaignIds = useMemo(
+    () => new Set(rotationStates.filter((s) => s.enabled).map((s) => s.campaign_id)),
+    [rotationStates],
+  );
 
   // Computed once here and shared: the Maintenance tab and the per-campaign
   // Mailbox niches. Built here and passed down so the table, the maintenance
@@ -1049,6 +1053,7 @@ export default function Planner() {
         healthByEmail={healthByEmail}
         onApplied={refresh}
         reservedEmails={rotationReserved}
+        reservedCampaignIds={rotationCampaignIds}
       />
 
       {/* What actually went out, against what the mailboxes could carry. */}
