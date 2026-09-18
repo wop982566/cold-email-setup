@@ -437,12 +437,16 @@ so no inbox sends continuously past ~15 days.
   *"This account has been used. Please select another account."* Editing the
   **resting** cohort is a metadata change; editing the **active** (currently
   sending) cohort pushes the change **live** to Instantly with a verified read-back.
-- **Correct niche resolution.** Instantly references a mailbox by internal id, so
-  `parseTagPayload` takes an id→email map (from the accounts payload) to recover
-  each inbox's real niche, and per-inbox tags resolve by **precedence** —
-  Instantly wins, the app's `mailbox_tags` fill in only where Instantly is silent
-  (`resolveTagMap`) — so a stale app tag can't add a wrong niche and get an inbox
-  auto-picked into the wrong campaign.
+- **Correct niche resolution.** Per-inbox tags resolve by **precedence, not
+  union** (`resolveTagMap`): the operator's **app tags win** (the niche you set
+  and see in the Accounts tab), and Instantly fills in only inboxes the app
+  hasn't tagged — so a stale/auto tag from the other source can't add a second
+  niche and pull an AEO inbox into a CBD campaign. The Accounts tab, the rotation
+  picker and the cron all use this one resolver, so what you see is what the
+  picker matches on. `parseTagPayload` also maps Instantly's internal account
+  id→email (from the accounts payload) so an inbox's Instantly niche is a usable
+  fallback. Both cohort previews and the manual editor show each inbox's resolved
+  niche and flag a mismatch, so a wrong pick is visible, not a mystery.
 - A **daily** scheduled worker (`rotation-swap.mts` → `_rotationRun.ts`) rotates
   each campaign whose 15-day interval has elapsed (per-campaign state, so the
   cadence is configurable). Each swap is one guarded write — a new

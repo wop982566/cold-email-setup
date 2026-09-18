@@ -304,27 +304,30 @@ export function mergeTagMaps(...maps: (TagMap | undefined)[]): TagMap {
 /**
  * Per-mailbox niche with PRECEDENCE, not union.
  *
- * Instantly's per-inbox tags are authoritative and WIN; the app's `mailbox_tags`
- * fill in only for inboxes Instantly doesn't tag. This mirrors `campaignTagsOf`
- * (Instantly wins over the override) and is the fix for the wrong-niche bug: a
- * stale/duplicate `mailbox_tags` row can no longer add a second niche to an inbox
- * that Instantly has already tagged, so it can't be matched into the wrong
- * campaign. (Where Instantly has no per-inbox tag, behaviour is unchanged.)
+ * The APP's `mailbox_tags` WIN — that's the niche the operator sets and sees in
+ * the Accounts tab, so it must be the one the swapper/rotation picker act on.
+ * Instantly's per-inbox tags fill in ONLY for inboxes the app hasn't tagged.
+ *
+ * This is the fix for the wrong-niche bug: previously the two sources were
+ * UNIONED, so a stale/auto Instantly (or duplicate app) tag added a SECOND niche
+ * to an inbox and let it match the wrong campaign — an inbox the operator tagged
+ * AEO could still be pulled into a CBD campaign. With precedence, one inbox has
+ * exactly one source of niche truth, and it's the one the operator controls.
  */
 export function resolveTagMap(
   instantlyByEmail: TagMap | undefined,
   appRows: readonly { email: string; tags: string[] }[],
 ): TagMap {
   const out: TagMap = new Map();
-  // App tags as the fallback layer.
-  for (const [email, tags] of buildTagMap(appRows)) out.set(email, tags);
-  // Instantly replaces (does not merge into) the app layer wherever it has tags.
+  // Instantly as the fallback layer (inboxes the app hasn't tagged).
   if (instantlyByEmail) {
     for (const [email, tags] of instantlyByEmail) {
       const n = normaliseTags(tags);
       if (n.length) out.set(email.trim().toLowerCase(), n);
     }
   }
+  // App tags WIN — they replace the Instantly layer for any inbox the app tags.
+  for (const [email, tags] of buildTagMap(appRows)) out.set(email, tags);
   return out;
 }
 

@@ -287,8 +287,8 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     // the UI uses, so the cron and the tab can't disagree about eligibility.
     const tagsRes = await callInstantly("resource=tags");
     // Instantly references a mailbox by its internal id — map id→email from the
-    // accounts payload so per-inbox tags are recognised, and let Instantly win
-    // over the app table (precedence), matching the UI exactly.
+    // accounts payload so per-inbox tags are recognised as a fallback, while the
+    // operator's app tags win (precedence), matching the UI exactly.
     const accItems = Array.isArray((accountsData.data as { items?: unknown[] })?.items)
       ? ((accountsData.data as { items: Record<string, unknown>[] }).items)
       : Array.isArray(accountsData.data)

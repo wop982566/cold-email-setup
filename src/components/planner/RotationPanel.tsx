@@ -138,6 +138,9 @@ export function RotationPanel({
     );
 
   const activeCampaigns = plan.campaigns.filter((c) => c.active);
+  // The niche the picker actually resolves for an inbox — shown in the UI so a
+  // mis-tag (why an inbox was matched) is visible, not a mystery.
+  const nicheOf = (email: string): string[] => tagsFor(tagMap, email);
   const campaignById = useMemo(() => new Map(plan.campaigns.map((c) => [c.id, c])), [plan.campaigns]);
   const campaignNameById = useMemo(() => new Map(plan.campaigns.map((c) => [c.id, c.name])), [plan.campaigns]);
   const mailboxByEmail = useMemo(() => {
@@ -186,7 +189,7 @@ export function RotationPanel({
       } else if (reason === "other-rotation") label = `used by rotation: ${rotationOwnerOf(email, campaignId) ?? "another campaign"}`;
       else if (reason === "not-ready") label = mb.setupPending ? "still setting up" : mb.excluded ? "excluded" : "inactive";
       else if (reason === "wrong-niche") label = explainIneligible(email, tags, campaignTags) ?? "different niche";
-      return { email, dailyLimit: mb.dailyLimit, status, label };
+      return { email, dailyLimit: mb.dailyLimit, status, label, niche: tags };
     });
   }
 
@@ -487,12 +490,16 @@ export function RotationPanel({
                         emails={s.cohort_a}
                         dailyLimitByEmail={dailyLimitByEmail}
                         activeTone={s.active === "A"}
+                        nicheOf={nicheOf}
+                        mismatchAgainst={tagsForCampaign(c)}
                       />
                       <CohortView
                         label={`Cohort B${s.active === "B" ? " (active)" : " (resting)"}`}
                         emails={s.cohort_b}
                         dailyLimitByEmail={dailyLimitByEmail}
                         activeTone={s.active === "B"}
+                        nicheOf={nicheOf}
+                        mismatchAgainst={tagsForCampaign(c)}
                       />
                       <p className="md:col-span-2 flex items-center gap-1 text-muted">
                         <Clock size={11} />
@@ -635,6 +642,8 @@ export function RotationPanel({
                 emails={enabling.cohortA}
                 dailyLimitByEmail={dailyLimitByEmail}
                 activeTone
+                nicheOf={nicheOf}
+                mismatchAgainst={enabling.campaignTags}
               />
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold uppercase text-muted">Cohort B — the locked partner</span>
@@ -643,10 +652,12 @@ export function RotationPanel({
                 </button>
               </div>
               <CohortView
-                label={`${enabling.cohortB?.picks.length ?? 0} inboxes, ${fmtNumber(capacityOf(enabling.cohortB?.picks ?? [], dailyLimitByEmail))}/day`}
+                label={`${enabling.cohortB?.picks.length ?? 0} inboxes, ${fmtNumber(capacityOf(enabling.cohortB?.picks ?? [], dailyLimitByEmail))}/day — niche shown per inbox`}
                 emails={enabling.cohortB?.picks ?? []}
                 dailyLimitByEmail={dailyLimitByEmail}
                 activeTone={false}
+                nicheOf={nicheOf}
+                mismatchAgainst={enabling.campaignTags}
               />
               {enabling.cohortB && enabling.cohortB.picks.length === 0 ? (
                 <p className="flex items-start gap-1.5 rounded-lg border-2 border-ink bg-danger/15 p-2 text-[11px]">
@@ -693,12 +704,19 @@ function CohortView({
   emails,
   dailyLimitByEmail,
   activeTone,
+  nicheOf,
+  mismatchAgainst,
 }: {
   label: string;
   emails: string[];
   dailyLimitByEmail: Map<string, number>;
   activeTone: boolean;
+  /** Resolved niche the picker sees for an inbox — shown so a mis-tag is visible. */
+  nicheOf?: (email: string) => string[];
+  /** The campaign niche; an inbox whose resolved niche doesn't overlap is flagged. */
+  mismatchAgainst?: string[];
 }) {
+  const overlaps = (a: string[], b: string[]) => a.some((t) => b.includes(t));
   return (
     <div className={"rounded-lg border-2 p-2 " + (activeTone ? "border-mint bg-mint/10" : "border-ink/30 bg-canvas")}>
       <p className="font-bold">{label}</p>
@@ -706,12 +724,28 @@ function CohortView({
         {emails.length === 0 ? (
           <span className="text-muted">— none —</span>
         ) : (
-          emails.map((e) => (
-            <span key={e} className="inline-flex items-center gap-1 rounded border border-ink/20 bg-white px-1.5 py-0.5 font-mono">
-              {e}
-              <span className="text-muted">{dailyLimitByEmail.get(e.toLowerCase()) ?? "?"}/d</span>
-            </span>
-          ))
+          emails.map((e) => {
+            const niche = nicheOf ? nicheOf(e) : [];
+            const mismatch = mismatchAgainst && mismatchAgainst.length > 0 && niche.length > 0 && !overlaps(niche, mismatchAgainst);
+            return (
+              <span
+                key={e}
+                className={
+                  "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono " +
+                  (mismatch ? "border-danger bg-danger/10" : "border-ink/20 bg-white")
+                }
+                title={niche.length ? `niche: ${niche.join(", ")}` : "no niche tag"}
+              >
+                {e}
+                <span className="text-muted">{dailyLimitByEmail.get(e.toLowerCase()) ?? "?"}/d</span>
+                {nicheOf ? (
+                  <Badge tone={mismatch ? "danger" : niche.length ? "lavender" : "white"}>
+                    {niche.length ? niche.join(",") : "untagged"}
+                  </Badge>
+                ) : null}
+              </span>
+            );
+          })
         )}
       </div>
     </div>

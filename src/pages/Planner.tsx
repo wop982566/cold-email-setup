@@ -282,9 +282,9 @@ export default function Planner() {
   // Mailbox niches. Built here and passed down so the table, the maintenance
   // tab and the swap decision all read one source.
   const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
-  // Tags set in Instantly are the source of truth; the app's own table covers
-  // mailboxes Instantly doesn't tag. Instantly WINS per inbox (precedence, not
-  // union) so a stale app tag can't add a wrong niche.
+  // The operator's app tags (Accounts tab) WIN per inbox; Instantly fills in only
+  // inboxes the app hasn't tagged (precedence, not union) so a stale/auto tag from
+  // the other source can't add a second niche and cause a wrong-niche match.
   const instTagsQ = useQuery({
     queryKey: ["inst", "tags"],
     queryFn: () => instantly.tags(),

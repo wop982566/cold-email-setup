@@ -23,6 +23,8 @@ export interface CandidateRow {
   status: CandidateStatus;
   /** Why it's blocked (used-by / wrong-niche), for the tooltip + inline note. */
   label?: string;
+  /** The inbox's resolved niche the picker sees — shown so matching is visible. */
+  niche?: string[];
 }
 
 const USED_MESSAGE = "This account has been used. Please select another account.";
@@ -198,6 +200,11 @@ export function CohortEditor({
                   />
                   <span className="font-mono text-xs">{r.email}</span>
                   <span className="text-[11px] text-muted">{r.dailyLimit}/d</span>
+                  {r.niche && r.niche.length ? (
+                    <Badge tone="lavender">{r.niche.join(",")}</Badge>
+                  ) : (
+                    <Badge tone="white">untagged</Badge>
+                  )}
                   <span className="ml-auto flex items-center gap-1">
                     {r.status === "available" ? (
                       <Badge tone="mint">available</Badge>
