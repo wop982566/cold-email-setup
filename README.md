@@ -503,36 +503,57 @@ scheduled functions don't run there. Press **Re-check** to refresh it.
 
 ---
 
-## 📈 Growth calculator
+## 📈 Growth calculator (rotation-sized)
 
-On the Planner's **Plan** tab, the growth calculator sizes the whole fleet for a
-daily-send goal against the structure you already run — all inputs dynamic and
-persisted. You give it four numbers: the **goal** (emails/day, or leads/day which
+On the Planner's **Plan** tab, the growth calculator sizes the whole **rotation
+fleet** for a daily-send goal against what you already run — all inputs dynamic and
+persisted. You give it three numbers: the **goal** (emails/day, or leads/day which
 it converts via your sends-per-lead), the **limit per campaign** (campaigns are
-capped, so a big goal needs several), the **inboxes per domain** (1–3 — you can
-safely stretch past the default 2), and the **healthy spares to keep per niche**.
+capped, so a big goal needs several), and the **inboxes per domain** (1–3).
+
+The model is the 15-day rotation strategy: every connected (sending) inbox needs a
+same-niche **rotation partner** to swap in every cycle, so you own **twice** the
+sending count — the connected set plus an equal set that rests and re-warms until
+its turn.
 
 It then reports, live (`src/lib/growthPlan.ts`, pure + tested):
 
 - **Campaigns** — `ceil(goal ÷ per-campaign limit)` and how many more than your
   active campaigns; plus the **emails/day gap** vs. what your active campaigns are
   already configured to allow (`plan.totalDemand`).
-- **Sending inboxes** — `ceil(goal ÷ per-mailbox limit)` at your observed
-  `perBoxCap`.
-- **Healthy spares, per niche** — a small table of each campaign niche, the
-  healthy spares you currently have tagged for it, the target you set, and how many
-  more to tag. A spare only replaces a mailbox in a campaign of its own niche, so
-  the buffer is per-niche; untagged spares count for none. Current spares come from
-  the same "healthy spare" pool the swapper uses (`maintenance.candidates`).
-- **Inboxes & domains to add** — sending inboxes + the spare buffer, minus what you
-  already have, divided across domains at your chosen inboxes/domain — with a
-  monthly-cost estimate from your Costs, a warmup lead-time, and the
-  **provider-ceiling** check (won't let the goal exceed your tightest SES/Instantly
-  daily cap). If your live mailbox supply is short of the goal even before new
-  campaigns, it says so.
+- **Connected inboxes** — sized **per campaign**: each campaign needs
+  `ceil(per-campaign limit ÷ per-mailbox limit)` inboxes to fill it (e.g. 200 ÷ 15 =
+  **14**), across every campaign the goal needs.
+- **Rotation inboxes** — an equal set (1:1 mirror of the connected inboxes) that
+  swaps in on schedule.
+- **Total to own (×2)** — connected + rotation partners; e.g. a single 200/day
+  campaign = 14 + 14 = **28** inboxes.
+- **Inboxes & domains to add** — the total minus the usable inboxes you already
+  have, divided across domains at your chosen inboxes/domain — with a monthly-cost
+  estimate from your Costs, a warmup lead-time, and the **provider-ceiling** check
+  (won't let the goal exceed your tightest SES/Instantly daily cap).
 
 (Domain records store two mailbox slots today, so 3/domain is a planning figure —
 the extra mailbox is created in Instantly but not yet tracked in the domain row.)
+
+### Rotation-aware Mailboxes list
+
+The Mailboxes card on the same tab reflects the rotation world:
+
+- **State** reads Instantly-first and rotation-aware — a resting rotation spare
+  shows `↻ B resting` (not a misleading `idle`), a live cohort shows `↻ A sending`,
+  and a genuinely unused inbox shows `free`. The **Campaigns** column names the
+  rotation (`<campaign> · cohort A/B (active/resting)`) for inboxes that aren't
+  directly connected, so you can always see *which* rotation holds an inbox.
+- **Warmup** column shows Instantly's own warmup score (`stat_warmup_score`)
+  straight from the account — the app no longer synthesizes its own health score on
+  the Plan tab (the health-based swapper and its Maintenance tab remain as a dormant
+  fallback, off while rotation mode is on).
+- **Filters** — a search box (email or niche) plus state segments
+  (`All · Free · In rotation · Sending · No campaign · Warming · Excluded`) with live
+  counts, so 120 rows can be sliced to the bird's-eye view.
+- A **Free inboxes** metric tile counts inboxes in **no campaign and no rotation** —
+  the real pool a new rotation can be built from.
 
 ---
 

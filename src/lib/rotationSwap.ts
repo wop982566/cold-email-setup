@@ -172,6 +172,40 @@ export function reservedByOtherCampaign(
   return s;
 }
 
+/** Which rotation cohort an inbox belongs to, if any. */
+export interface RotationMember {
+  campaignId: string;
+  campaignName: string;
+  cohort: "A" | "B";
+  /** True when this cohort is the one currently connected (sending); false = resting. */
+  active: boolean;
+}
+
+/**
+ * Map every inbox locked to an ENABLED rotation cohort to which campaign/cohort
+ * holds it and whether that cohort is currently sending. Lets the Mailboxes list
+ * tell a resting rotation spare apart from a truly free inbox — the same cohort
+ * data `reservedEmails` collapses to a boolean, kept as labels here. If an inbox
+ * somehow appears in more than one enabled cohort, the first wins (the "used"
+ * guard is meant to prevent that; this stays deterministic if it slips).
+ */
+export function rotationMembership(
+  states: Pick<RotationState, "enabled" | "campaign_id" | "campaign_name" | "cohort_a" | "cohort_b" | "active">[],
+): Map<string, RotationMember> {
+  const m = new Map<string, RotationMember>();
+  for (const st of states) {
+    if (!st.enabled) continue;
+    const add = (email: string, cohort: "A" | "B") => {
+      const e = norm(email);
+      if (!e || m.has(e)) return;
+      m.set(e, { campaignId: st.campaign_id, campaignName: st.campaign_name || st.campaign_id, cohort, active: st.active === cohort });
+    };
+    for (const e of st.cohort_a ?? []) add(e, "A");
+    for (const e of st.cohort_b ?? []) add(e, "B");
+  }
+  return m;
+}
+
 // --- Manual-picker classification (the "already used" guard) ----------------
 
 export type AccountUse = "available" | "used" | "wrong";
