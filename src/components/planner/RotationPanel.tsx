@@ -25,6 +25,7 @@ import {
   ArrowRight,
   Clock,
   Info,
+  RefreshCw,
 } from "lucide-react";
 import { Card, Badge, Spinner, Details, Toggle } from "../ui/primitives";
 import { Modal } from "../ui/Modal";
@@ -54,6 +55,24 @@ import { CohortEditor, type CandidateRow } from "./CohortEditor";
 function emailListOf(data: unknown): string[] {
   const list = (data as { email_list?: unknown })?.email_list;
   return Array.isArray(list) ? list.map((e) => String(e ?? "").trim().toLowerCase()).filter(Boolean) : [];
+}
+
+/** Shape of the rotation-swap-test dry-run response the status panel reads. */
+interface RotationStatus {
+  ok?: boolean;
+  /** True when the function couldn't be reached (e.g. a local/preview build). */
+  unreachable?: boolean;
+  error?: string;
+  /** In-app master toggle (settings.rotation_swap_enabled). */
+  rotationModeOn?: boolean;
+  /** ROTATION_SWAP_ENABLED env var on the deployed function. */
+  envEnabled?: boolean;
+  /** INSTANTLY_WRITE_ENABLED env var (via the write capabilities probe). */
+  writesEnabled?: boolean;
+  managedCampaigns?: number;
+  dueNow?: number;
+  /** Proof the scheduled cron is firing on production, from the run log. */
+  schedule?: { hasEverRun?: boolean | null; runsRecorded?: number; lastRunAt?: string | null; note?: string };
 }
 
 interface EnableState {
@@ -99,6 +118,17 @@ export function RotationPanel({
   });
   const writesEnabled = capsQ.data?.writesEnabled !== false;
   const writesHint = capsQ.data?.hint ?? null;
+
+  // Readiness probe. Reuses the rotation-swap-test dry-run endpoint (writes
+  // nothing) so the operator can *confirm* rotation is actually live — both
+  // Netlify env vars set, and the scheduled cron really firing on production —
+  // rather than trusting that the setup steps worked. Only meaningful on the
+  // deployed site (the function 404s locally, reported as `unreachable`).
+  const statusQ = useQuery({
+    queryKey: ["rotation", "status"],
+    queryFn: () => rotationSwap.dryRun() as Promise<RotationStatus>,
+    staleTime: 30_000,
+  });
 
   const [enabling, setEnabling] = useState<EnableState | null>(null);
   const [busy, setBusy] = useState(false);
@@ -425,6 +455,22 @@ export function RotationPanel({
         ) : null}
       </Card>
 
+      {/* Readiness status — proof rotation is actually live end-to-end */}
+      <Card className="p-4">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <h3 className="text-sm font-extrabold">Is rotation live?</h3>
+          <button
+            className="btn-ghost btn-sm ml-auto"
+            onClick={() => void statusQ.refetch()}
+            disabled={statusQ.isFetching}
+            title="Re-run the readiness check"
+          >
+            {statusQ.isFetching ? <Spinner /> : <RefreshCw size={13} />} Re-check
+          </button>
+        </div>
+        <RotationStatusView data={statusQ.data} loading={statusQ.isLoading} />
+      </Card>
+
       {/* Per-campaign controls */}
       <Card className="p-4">
         <h3 className="mb-3 text-sm font-extrabold">Campaigns</h3>
@@ -748,6 +794,126 @@ function CohortView({
           })
         )}
       </div>
+    </div>
+  );
+}
+
+/** One readiness row: green tick / amber wait / red fix, with a plain remedy. */
+function StatusGate({
+  state,
+  label,
+  detail,
+}: {
+  state: "ok" | "pending" | "bad";
+  label: string;
+  detail?: string;
+}) {
+  const Icon = state === "ok" ? Check : state === "pending" ? Clock : AlertTriangle;
+  const color = state === "ok" ? "text-mint" : state === "pending" ? "text-sun" : "text-danger";
+  return (
+    <div className="flex items-start gap-2 rounded-lg border-2 border-ink/30 bg-canvas p-2">
+      <Icon size={15} className={"mt-0.5 shrink-0 " + color} />
+      <div className="min-w-0">
+        <p className="font-bold">{label}</p>
+        {detail ? <p className="text-[11px] text-muted">{detail}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Renders the dry-run probe as a verdict banner + checklist. All fields come
+ * from rotation-swap-test (no server change): env vars, the in-app toggle, and
+ * `schedule.hasEverRun` — the only real proof the production cron is firing.
+ */
+function RotationStatusView({ data, loading }: { data?: RotationStatus; loading: boolean }) {
+  if (loading && !data)
+    return (
+      <p className="flex items-center gap-2 text-sm text-muted">
+        <Spinner /> Checking rotation status…
+      </p>
+    );
+  if (!data) return <p className="text-sm text-muted">No status yet — press Re-check.</p>;
+
+  if (data.unreachable) {
+    return (
+      <div className="rounded-lg border-2 border-ink bg-sun/30 p-3 text-sm">
+        <p className="flex items-start gap-1.5">
+          <Info size={14} className="mt-0.5 shrink-0" />
+          <span>
+            This check only works on the <b>deployed Netlify site</b> — the rotation function isn't reachable from
+            here (local/preview builds don't run scheduled functions).
+            {data.error ? <span className="mt-1 block text-[11px] text-muted">{data.error}</span> : null}
+          </span>
+        </p>
+      </div>
+    );
+  }
+
+  const mode = data.rotationModeOn === true;
+  const env = data.envEnabled === true;
+  const writes = data.writesEnabled === true;
+  const configured = mode && env && writes;
+  const everRan = data.schedule?.hasEverRun === true;
+  const logUnknown = data.schedule?.hasEverRun == null; // null or undefined
+  const live = configured && everRan;
+
+  const missing: string[] = [];
+  if (!mode) missing.push("master toggle on");
+  if (!env) missing.push("ROTATION_SWAP_ENABLED");
+  if (!writes) missing.push("INSTANTLY_WRITE_ENABLED");
+
+  const banner = live
+    ? { bg: "bg-mint/15", Icon: Check, text: "Rotation is live — the daily worker will swap due campaigns automatically." }
+    : configured
+      ? {
+          bg: "bg-sun/30",
+          Icon: Clock,
+          text: "Configured — waiting for the first scheduled run (production deploy only). Use “Rotate now” on a campaign to swap immediately.",
+        }
+      : { bg: "bg-danger/15", Icon: AlertTriangle, text: `Not live yet — still need: ${missing.join(", ")}.` };
+  const BannerIcon = banner.Icon;
+
+  return (
+    <div className="space-y-2 text-sm">
+      <div className={"flex items-start gap-2 rounded-lg border-2 border-ink p-3 " + banner.bg}>
+        <BannerIcon size={16} className="mt-0.5 shrink-0" />
+        <span className="font-bold">{banner.text}</span>
+      </div>
+      <div className="grid gap-2 md:grid-cols-2">
+        <StatusGate
+          state={mode ? "ok" : "bad"}
+          label="Rotation mode"
+          detail={mode ? "On — the health-based swapper is off; only rotation runs." : "Off — flip the master toggle above on."}
+        />
+        <StatusGate
+          state={env ? "ok" : "bad"}
+          label="Scheduled worker enabled"
+          detail={env ? "ROTATION_SWAP_ENABLED=true on the deploy." : "Set ROTATION_SWAP_ENABLED=true in Netlify → redeploy."}
+        />
+        <StatusGate
+          state={writes ? "ok" : "bad"}
+          label="Writes enabled"
+          detail={writes ? "INSTANTLY_WRITE_ENABLED=true — rotation can update campaigns." : "Set INSTANTLY_WRITE_ENABLED=true in Netlify → redeploy."}
+        />
+        <StatusGate
+          state={everRan ? "ok" : "pending"}
+          label="Daily worker firing"
+          detail={
+            everRan
+              ? `Last ran ${fmtDateShort(data.schedule?.lastRunAt)}${
+                  data.schedule?.runsRecorded ? ` · ${data.schedule.runsRecorded} run(s) logged` : ""
+                }.`
+              : logUnknown && data.schedule?.note
+                ? data.schedule.note
+                : "Hasn't run yet — the cron fires only on the production deploy (allow up to ~24h), or use “Rotate now” to prove it immediately."
+          }
+        />
+      </div>
+      <p className="flex items-center gap-1 text-[11px] text-muted">
+        <Info size={11} />
+        {fmtNumber(data.managedCampaigns ?? 0)} campaign(s) managed · {fmtNumber(data.dueNow ?? 0)} due to rotate now.
+      </p>
     </div>
   );
 }

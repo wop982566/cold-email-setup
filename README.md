@@ -464,6 +464,43 @@ so no inbox sends continuously past ~15 days.
   `INSTANTLY_WRITE_ENABLED` for any unattended write. The pure decision logic
   lives in `src/lib/rotationSwap.ts`.
 
+### Turn it on, and confirm it's actually live
+
+Unattended rotation only runs when **all four** of these are true, so set them in
+order:
+
+1. **Netlify env vars.** Site settings → **Environment variables** → add
+   `ROTATION_SWAP_ENABLED=true` and `INSTANTLY_WRITE_ENABLED=true` (Functions
+   scope), then **redeploy** — env changes only take effect on a new deploy.
+2. **Master toggle.** Planner → **Rotation** tab → turn the master switch **On**
+   (this also disables the health-based auto-swapper).
+3. **Per campaign.** Click **Enable rotation** on each campaign and confirm the
+   auto-picked cohort B (or edit it).
+4. **Production deploy.** The daily worker is a Netlify *scheduled function*, which
+   fires **only on the production deploy** — never on a branch deploy or preview.
+   Make sure the branch you configured these vars on is your Netlify **production**
+   branch.
+
+**Confirming it's live — the "Is rotation live?" panel.** The Rotation tab has a
+status card that calls the `rotation-swap-test` dry-run endpoint (it writes
+nothing) and shows a plain checklist, so you never have to guess whether the setup
+took:
+
+- **Rotation mode** — the in-app master toggle is on.
+- **Scheduled worker enabled** — `ROTATION_SWAP_ENABLED=true` reached the deploy.
+- **Writes enabled** — `INSTANTLY_WRITE_ENABLED=true` reached the deploy.
+- **Daily worker firing** — reads the `rotation_swap_runs` log: ✅ *"last ran …"*
+  once the production cron has actually fired (the real proof it's scheduled), or a
+  ⏳ *"hasn't run yet"* note otherwise. The first scheduled run can take up to ~24h;
+  **Rotate now** on a campaign drives one immediately and end-to-end (still
+  write-gated and verified), which flips this to ✅ without waiting.
+- **Coverage** — how many campaigns are managed and how many are due right now.
+
+A green banner (*"Rotation is live"*) appears only when the three config gates are
+on **and** the scheduled worker has fired at least once. The panel is only
+meaningful on the deployed site — on a local/preview build it says so, because
+scheduled functions don't run there. Press **Re-check** to refresh it.
+
 ---
 
 ## 📈 Growth calculator
