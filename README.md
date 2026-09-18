@@ -264,6 +264,13 @@ read back to confirm, with `expectedList` aborting if the campaign changed under
 you. Immature (still-warming) inboxes are included but flagged in the preview so
 you can back out.
 
+**Rotation cohorts are never offered.** Any inbox locked to a rotation cohort (A or
+B, active *or* resting) is withheld from the idle pool before autopopulate picks —
+including cohorts of **paused** rotations, so pausing keeps your A/B sets intact and
+off-limits; only **Forget** (delete) frees those inboxes back into the pool. The
+reservation is one map (`rotationMembership`), shared with the Mailboxes list's
+**Free inboxes** count, so what reads as free is exactly what autopopulate can use.
+
 Every run is logged to `populate_runs` and rendered on the Plan tab: which inboxes
 went to which campaign, before/after counts, and per-campaign `applied` /
 `unconfirmed` / `failed` — so "which emails were populated" is a durable,

@@ -65,7 +65,7 @@ import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
 import { AutopopulatePanel } from "../components/planner/AutopopulatePanel";
 import { RotationPanel } from "../components/planner/RotationPanel";
-import { reservedEmails as rotationReservedEmails, rotationMembership, type RotationMember } from "../lib/rotationSwap";
+import { rotationMembership, type RotationMember } from "../lib/rotationSwap";
 import { AccountsTab } from "../components/planner/AccountsTab";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
@@ -286,9 +286,10 @@ export default function Planner() {
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
   const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
-  // Inboxes locked to an enabled rotation cohort — resting, so autopopulate must
-  // not offer them to another campaign (health-swap is off in rotation mode).
-  const rotationReserved = useMemo(() => rotationReservedEmails(rotationStates), [rotationStates]);
+  // Campaigns whose rotation is ENABLED are hidden as auto-populate targets (a
+  // paused rotation's campaign is manually managed again, so it stays a target).
+  // The cohort INBOXES are withheld separately via rotationCohortReserved below,
+  // which covers paused rotations too.
   const rotationCampaignIds = useMemo(
     () => new Set(rotationStates.filter((s) => s.enabled).map((s) => s.campaign_id)),
     [rotationStates],
@@ -643,10 +644,14 @@ export default function Planner() {
   // Instantly links campaigns to mailboxes by address (email_list); resolve the
   // ids back to names so the mailbox table can name the campaigns it serves.
   const campaignName = new Map(p.campaigns.map((c) => [c.id, c.name]));
-  // Which rotation cohort (campaign + A/B, active/resting) holds each inbox — so
-  // a resting rotation spare reads as reserved, not as a free idle inbox.
+  // Which rotation cohort (campaign + A/B, active/resting/paused) holds each inbox
+  // — so a resting or paused rotation spare reads as reserved, not as a free idle
+  // inbox. Includes paused rotations: a cohort inbox stays reserved until Forget.
   const rotationByEmail = rotationMembership(rotationStates);
   const isReserved = (email: string) => rotationByEmail.has(email.trim().toLowerCase());
+  // Every inbox locked to any cohort (enabled OR paused) — auto-populate skips
+  // these entirely, so it only ever offers free, same-niche inboxes.
+  const rotationCohortReserved = new Set(rotationByEmail.keys());
   // Truly free = idle (in no campaign) AND not locked to any rotation cohort.
   // This is the real pool a new rotation can be built from.
   const freeMailboxes = p.idleMailboxes.filter((b) => !isReserved(b.email));
@@ -1072,7 +1077,7 @@ export default function Planner() {
         overrides={settings.campaign_group_overrides ?? {}}
         healthByEmail={healthByEmail}
         onApplied={refresh}
-        reservedEmails={rotationReserved}
+        reservedEmails={rotationCohortReserved}
         reservedCampaignIds={rotationCampaignIds}
       />
 
@@ -1336,9 +1341,9 @@ export default function Planner() {
                           {b.pausedOnly ? " (paused)" : ""}
                         </span>
                       ) : rot ? (
-                        <span className="inline-flex items-center gap-1 text-ink" title={`Reserved by rotation: ${rot.campaignName} · cohort ${rot.cohort} (${rot.active ? "active/sending" : "resting"})`}>
+                        <span className="inline-flex items-center gap-1 text-ink" title={`Reserved by rotation: ${rot.campaignName} · cohort ${rot.cohort} (${rot.paused ? "paused" : rot.active ? "active/sending" : "resting"})`}>
                           <Repeat size={11} className="shrink-0" />
-                          {rot.campaignName} · {rot.cohort} {rot.active ? "(active)" : "(resting)"}
+                          {rot.campaignName} · {rot.cohort} {rot.paused ? "(paused)" : rot.active ? "(active)" : "(resting)"}
                         </span>
                       ) : (
                         <span className="text-muted">not in any campaign</span>
@@ -1390,10 +1395,10 @@ export default function Planner() {
                         <Badge tone="white">not in use</Badge>
                       ) : rot ? (
                         <Badge
-                          tone={rot.active ? "mint" : "lavender"}
+                          tone={rot.paused ? "white" : rot.active ? "mint" : "lavender"}
                           className="whitespace-nowrap"
                         >
-                          <Repeat size={11} /> {rot.cohort} {rot.active ? "sending" : "resting"}
+                          <Repeat size={11} /> {rot.cohort} {rot.paused ? "paused" : rot.active ? "sending" : "resting"}
                         </Badge>
                       ) : b.pausedOnly ? (
                         <Badge tone="sky">parked</Badge>

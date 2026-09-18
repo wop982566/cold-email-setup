@@ -177,28 +177,38 @@ export interface RotationMember {
   campaignId: string;
   campaignName: string;
   cohort: "A" | "B";
-  /** True when this cohort is the one currently connected (sending); false = resting. */
+  /** True when this cohort is the one currently connected (sending). Always false while paused. */
   active: boolean;
+  /** True when the rotation is paused (config kept, not rotating). */
+  paused: boolean;
 }
 
 /**
- * Map every inbox locked to an ENABLED rotation cohort to which campaign/cohort
- * holds it and whether that cohort is currently sending. Lets the Mailboxes list
- * tell a resting rotation spare apart from a truly free inbox — the same cohort
- * data `reservedEmails` collapses to a boolean, kept as labels here. If an inbox
- * somehow appears in more than one enabled cohort, the first wins (the "used"
- * guard is meant to prevent that; this stays deterministic if it slips).
+ * Map every inbox locked to ANY existing rotation cohort — enabled OR paused — to
+ * which campaign/cohort holds it, whether it's currently sending, and whether the
+ * rotation is paused. A cohort inbox stays reserved (off-limits to auto-populate,
+ * not "free") as long as the rotation config exists; only Forget/delete frees it.
+ * Enabled states are processed first so an active/enabled membership wins over a
+ * paused one if the same email somehow appears in both (the "used" guard is meant
+ * to prevent that; this stays deterministic if it slips).
  */
 export function rotationMembership(
   states: Pick<RotationState, "enabled" | "campaign_id" | "campaign_name" | "cohort_a" | "cohort_b" | "active">[],
 ): Map<string, RotationMember> {
   const m = new Map<string, RotationMember>();
-  for (const st of states) {
-    if (!st.enabled) continue;
+  const ordered = [...states].sort((a, b) => Number(Boolean(b.enabled)) - Number(Boolean(a.enabled)));
+  for (const st of ordered) {
+    const paused = !st.enabled;
     const add = (email: string, cohort: "A" | "B") => {
       const e = norm(email);
       if (!e || m.has(e)) return;
-      m.set(e, { campaignId: st.campaign_id, campaignName: st.campaign_name || st.campaign_id, cohort, active: st.active === cohort });
+      m.set(e, {
+        campaignId: st.campaign_id,
+        campaignName: st.campaign_name || st.campaign_id,
+        cohort,
+        active: !paused && st.active === cohort,
+        paused,
+      });
     };
     for (const e of st.cohort_a ?? []) add(e, "A");
     for (const e of st.cohort_b ?? []) add(e, "B");
