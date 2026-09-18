@@ -28,8 +28,7 @@ import { useCollection, useUpsertMany, useRemoveMany } from "../../lib/hooks";
 import { MailboxTag, TABLES } from "../../lib/types";
 import { uuid } from "../../lib/utils";
 import {
-  buildTagMap,
-  mergeTagMaps,
+  resolveTagMap,
   knownTags,
   normaliseTag,
   normaliseTags,
@@ -103,9 +102,11 @@ export function AccountsTab({
   const removeTags = useRemoveMany(TABLES.mailboxTags);
   const TAGS_KEY = [TABLES.mailboxTags];
 
-  // App tags unioned with Instantly's — the exact map the swapper consults.
+  // The exact map the swapper/rotation picker consult: the operator's app tags
+  // WIN, Instantly fills in only untagged inboxes (resolveTagMap). Shown here so
+  // what you see is what the picker matches on — no hidden second niche.
   const tagMap = useMemo(
-    () => mergeTagMaps(buildTagMap(tagRowsQ.data ?? []), instantlyTagsByEmail),
+    () => resolveTagMap(instantlyTagsByEmail, tagRowsQ.data ?? []),
     [tagRowsQ.data, instantlyTagsByEmail],
   );
 

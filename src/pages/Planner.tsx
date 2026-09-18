@@ -23,18 +23,18 @@ import {
   Inbox,
   Zap,
   Ban,
-  Flame,
   HeartPulse,
   Activity,
+  Repeat,
+  Search,
 } from "lucide-react";
 import { Card, StatCard, Badge, Spinner, ProgressBar, EmptyState } from "../components/ui/primitives";
 import { useToast } from "../components/ui/toast";
 import { useCollection, useInsert, useSettings, useSaveSettings, useUpdate } from "../lib/hooks";
-import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch } from "../lib/types";
+import { AppSettings, CapacitySource, CostItem, Domain, RecoveryEntry, TABLES, MailboxTag, MailProfile, SetupBatch, RotationState } from "../lib/types";
 import { recoveringEmails } from "../lib/recovery";
 import { computeCapacity } from "../lib/capacity";
-import { computePlan, perUnitMonthly, type PlannerGroup, type HealthScore } from "../lib/campaignPlan";
-import { resolveCampaignTags } from "../lib/accountsTag";
+import { computePlan, perUnitMonthly, type PlannerGroup, type PlannerMailbox, type HealthScore } from "../lib/campaignPlan";
 import { computeGrowthPlan } from "../lib/growthPlan";
 import { aggregateLeadCounts, type LeadStatusCounts } from "../lib/leadStatus";
 import { instantly, asItems } from "../lib/instantly";
@@ -48,7 +48,7 @@ import {
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
 import { rollupAll } from "../lib/inboxPlacement";
 import type { InboxTest } from "../lib/types";
-import { buildTagMap, mergeTagMaps, normaliseTag, parseTagPayload, tagsFor } from "../lib/tags";
+import { normaliseTag, parseTagPayload, resolveTagMap, tagsFor } from "../lib/tags";
 import {
   accountCredentials,
   credsOf,
@@ -64,6 +64,8 @@ import { computeSendingHealth } from "../lib/sendingHealth";
 import { parseInboxSends, type InboxSendsResult } from "../lib/inboxSends";
 import { CampaignMaintenance } from "../components/planner/CampaignMaintenance";
 import { AutopopulatePanel } from "../components/planner/AutopopulatePanel";
+import { RotationPanel } from "../components/planner/RotationPanel";
+import { rotationMembership, type RotationMember } from "../lib/rotationSwap";
 import { AccountsTab } from "../components/planner/AccountsTab";
 import { CampaignMailboxTable } from "../components/planner/CampaignMailboxTable";
 import { fmtNumber, fmtPercent, fmtMoney, fmtDateShort } from "../lib/format";
@@ -101,6 +103,19 @@ function healthTitle(h: HealthScore): string {
   return lines.filter(Boolean).join("\n");
 }
 
+// Mailbox-list state filters. Lenses, not a partition — a free inbox is also
+// "no campaign", so counts can overlap. "free" = idle AND not in any rotation.
+type MailboxFilterKey = "all" | "free" | "rotation" | "sending" | "nocampaign" | "warming" | "excluded";
+const MAILBOX_FILTERS: { key: MailboxFilterKey; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "free", label: "Free" },
+  { key: "rotation", label: "In rotation" },
+  { key: "sending", label: "Sending" },
+  { key: "nocampaign", label: "No campaign" },
+  { key: "warming", label: "Warming" },
+  { key: "excluded", label: "Excluded" },
+];
+
 export default function Planner() {
   const toast = useToast();
   const qc = useQueryClient();
@@ -110,15 +125,19 @@ export default function Planner() {
   const { data: domains = [] } = useCollection<Domain>(TABLES.domains);
   const { data: costs = [] } = useCollection<CostItem>(TABLES.costs);
   const { data: recovery = [] } = useCollection<RecoveryEntry>(TABLES.recovery);
+  const { data: rotationStates = [] } = useCollection<RotationState>(TABLES.rotationState);
 
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [showMailboxes, setShowMailboxes] = useState(false);
+  // Mailbox-list filters (search + state segment) so 120 rows can be sliced.
+  const [mbQuery, setMbQuery] = useState("");
+  const [mbFilter, setMbFilter] = useState<MailboxFilterKey>("all");
   // Exact per-campaign lead counts, aggregated from the per-lead list on demand.
   // Empty until the operator asks — it's a heavier fetch than the analytics row.
   const [exactCounts, setExactCounts] = useState<Map<string, LeadStatusCounts>>(new Map());
   const [loadingExact, setLoadingExact] = useState(false);
   const [exactProgress, setExactProgress] = useState("");
-  const [tab, setTab] = useState<"plan" | "maintenance" | "accounts">("plan");
+  const [tab, setTab] = useState<"plan" | "maintenance" | "accounts" | "rotation">("plan");
 
   // Same keys as the Instantly page and the Sending Health card, so all three
   // share one fetch and the Instantly Refresh button invalidates them.
@@ -267,24 +286,50 @@ export default function Planner() {
   // A mailbox pulled out to heal must not be proposed as the spare for the
   // next campaign, so the recovery list gates the candidate pool.
   const recovering = useMemo(() => recoveringEmails(recovery), [recovery]);
+  // Campaigns whose rotation is ENABLED are hidden as auto-populate targets (a
+  // paused rotation's campaign is manually managed again, so it stays a target).
+  // The cohort INBOXES are withheld separately via rotationCohortReserved below,
+  // which covers paused rotations too.
+  const rotationCampaignIds = useMemo(
+    () => new Set(rotationStates.filter((s) => s.enabled).map((s) => s.campaign_id)),
+    [rotationStates],
+  );
 
   // Computed once here and shared: the Maintenance tab and the per-campaign
   // Mailbox niches. Built here and passed down so the table, the maintenance
   // tab and the swap decision all read one source.
   const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
-  // Tags set in Instantly are the source of truth; the app's own table covers
-  // workspaces (or mailboxes) Instantly doesn't tag. Union, not precedence.
+  // The operator's app tags (Accounts tab) WIN per inbox; Instantly fills in only
+  // inboxes the app hasn't tagged (precedence, not union) so a stale/auto tag from
+  // the other source can't add a second niche and cause a wrong-niche match.
   const instTagsQ = useQuery({
     queryKey: ["inst", "tags"],
     queryFn: () => instantly.tags(),
     staleTime: 5 * 60_000,
   });
+  // Instantly references a mailbox by its internal id, not its address, so give
+  // parseTagPayload an id→email map (from the accounts payload) or its per-inbox
+  // tags are lost and the niche falls back to the app's (possibly stale) table.
+  const accountIdToEmail = useMemo(() => {
+    const m = new Map<string, string>();
+    if (acctQ.data?.ok) {
+      for (const a of asItems<Record<string, unknown>>(acctQ.data.data)) {
+        const email = String(a.email ?? "").trim().toLowerCase();
+        if (!email) continue;
+        for (const idKey of ["id", "_id", "account_id", "uuid"]) {
+          const id = a[idKey];
+          if (typeof id === "string" && id.trim()) m.set(id.trim().toLowerCase(), email);
+        }
+      }
+    }
+    return m;
+  }, [acctQ.data]);
   const tagAssignments = useMemo(
-    () => parseTagPayload(instTagsQ.data?.data),
-    [instTagsQ.data],
+    () => parseTagPayload(instTagsQ.data?.data, accountIdToEmail),
+    [instTagsQ.data, accountIdToEmail],
   );
   const tagMap = useMemo(
-    () => mergeTagMaps(buildTagMap(tagRowsQ.data ?? []), tagAssignments.byEmail),
+    () => resolveTagMap(tagAssignments.byEmail, tagRowsQ.data ?? []),
     [tagRowsQ.data, tagAssignments],
   );
 
@@ -410,35 +455,17 @@ export default function Planner() {
     });
   }, [plan, domains, settings, placementHealthInput, recovering, mailboxSends, seedPlacement, tagMap, tagAssignments]);
 
-  // The growth calculator: sizes the whole fleet (campaigns, sending inboxes,
-  // per-niche spares, domains) for the goal, against what already exists. The
-  // niches and current spare counts come from the tag system; the rest are
-  // plain plan totals fed into the pure computeGrowthPlan.
+  // The growth calculator: sizes the whole rotation fleet (campaigns, connected
+  // sending inboxes, an equal rotation set, domains) for the goal, against what
+  // already exists. Pure computeGrowthPlan; only plain plan totals go in.
   const growth = useMemo(() => {
     if (!plan || !settings) return null;
     const activeCamps = plan.campaigns.filter((c) => c.active);
-    const resolvedCamps = resolveCampaignTags(
-      activeCamps,
-      settings.campaign_group_overrides ?? {},
-      tagAssignments.byCampaign,
-    );
-    const niches = [...new Set(resolvedCamps.flatMap((c) => c.tags))];
-    // A healthy spare tagged AEO counts toward the AEO buffer; untagged spares
-    // count toward no niche (they can't be swapped anywhere until tagged).
-    const currentSparesByNiche: Record<string, number> = {};
-    for (const cand of maintenance?.candidates ?? []) {
-      for (const t of tagsFor(tagMap, cand.box.email)) {
-        currentSparesByNiche[t] = (currentSparesByNiche[t] ?? 0) + 1;
-      }
-    }
     return computeGrowthPlan({
       goalPerDay: plan.goal.emailsPerDay,
       perCampaignLimit: Math.max(0, settings.planner_per_campaign_limit ?? 200),
       perMailboxLimit: plan.perBoxCap,
       mailboxesPerDomain: Math.max(1, settings.emails_per_domain || 1),
-      sparesPerNiche: Math.max(0, settings.planner_spares_per_niche ?? 2),
-      niches,
-      currentSparesByNiche,
       activeCampaigns: activeCamps.length,
       configuredDemand: plan.totalDemand,
       usableInboxes: plan.usableInboxes,
@@ -447,7 +474,7 @@ export default function Planner() {
       costPerDomainMonthly: perUnitMonthly(costs, "Domains"),
       costPerMailboxMonthly: perUnitMonthly(costs, "Email Infrastructure"),
     });
-  }, [plan, settings, tagMap, tagAssignments, maintenance, costs]);
+  }, [plan, settings, costs]);
 
   const healthByEmail = useMemo(() => {
     const m = new Map<string, MailboxHealth>();
@@ -617,6 +644,41 @@ export default function Planner() {
   // Instantly links campaigns to mailboxes by address (email_list); resolve the
   // ids back to names so the mailbox table can name the campaigns it serves.
   const campaignName = new Map(p.campaigns.map((c) => [c.id, c.name]));
+  // Which rotation cohort (campaign + A/B, active/resting/paused) holds each inbox
+  // — so a resting or paused rotation spare reads as reserved, not as a free idle
+  // inbox. Includes paused rotations: a cohort inbox stays reserved until Forget.
+  const rotationByEmail = rotationMembership(rotationStates);
+  const isReserved = (email: string) => rotationByEmail.has(email.trim().toLowerCase());
+  // Every inbox locked to any cohort (enabled OR paused) — auto-populate skips
+  // these entirely, so it only ever offers free, same-niche inboxes.
+  const rotationCohortReserved = new Set(rotationByEmail.keys());
+  // Truly free = idle (in no campaign) AND not locked to any rotation cohort.
+  // This is the real pool a new rotation can be built from.
+  const freeMailboxes = p.idleMailboxes.filter((b) => !isReserved(b.email));
+  const rotationReservedCount = p.mailboxes.filter((b) => isReserved(b.email)).length;
+  // Warmup straight from Instantly (stat_warmup_score) — the app no longer shows
+  // its own synthesized health on the Plan tab. Average across usable inboxes.
+  const warmupScored = p.mailboxes.filter((b) => !b.excluded && !b.beyondCount && b.warmupScoreKnown);
+  const avgWarmup = warmupScored.length
+    ? Math.round(warmupScored.reduce((s, b) => s + b.warmupScore, 0) / warmupScored.length)
+    : null;
+  const warmupTone = avgWarmup === null ? "white" : avgWarmup >= 90 ? "mint" : avgWarmup >= 70 ? "sky" : avgWarmup >= 40 ? "sun" : "danger";
+
+  // Mailbox-list filtering: one predicate per state segment (lenses, can overlap)
+  // plus a free-text match on email or niche tag.
+  const mbFilterPred: Record<MailboxFilterKey, (b: PlannerMailbox) => boolean> = {
+    all: () => true,
+    free: (b) => b.idle && !isReserved(b.email),
+    rotation: (b) => isReserved(b.email),
+    sending: (b) => b.campaignIds.length > 0,
+    nocampaign: (b) => b.allCampaignIds.length === 0,
+    warming: (b) => b.warmingUp,
+    excluded: (b) => b.excluded,
+  };
+  const mbQ = mbQuery.trim().toLowerCase();
+  const mbMatchesQuery = (b: PlannerMailbox) =>
+    !mbQ || b.email.toLowerCase().includes(mbQ) || tagsFor(tagMap, b.email).some((t) => t.toLowerCase().includes(mbQ));
+  const visibleMailboxes = p.mailboxes.filter((b) => mbFilterPred[mbFilter](b) && mbMatchesQuery(b));
 
   return (
     <div className="space-y-5">
@@ -641,7 +703,7 @@ export default function Planner() {
       ) : null}
 
       <div className="flex rounded-xl border-2 border-ink">
-        {([["plan", "Plan"], ["maintenance", "Maintenance"], ["accounts", "Accounts"]] as const).map(([k, label]) => (
+        {([["plan", "Plan"], ["maintenance", "Maintenance"], ["accounts", "Accounts"], ["rotation", "Rotation"]] as const).map(([k, label]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
@@ -687,6 +749,17 @@ export default function Planner() {
           loadingImap={loadingImap}
           canLoadImap={!hasImapDetail(creds) || emailsMissingImap(creds).length > 0}
         />
+      ) : tab === "rotation" ? (
+        <RotationPanel
+          plan={p}
+          settings={settings}
+          patchSettings={patchSettings}
+          tagMap={tagMap}
+          campaignTagsById={tagAssignments.byCampaign}
+          overrides={settings.campaign_group_overrides ?? {}}
+          healthByEmail={healthByEmail}
+          onApplied={refresh}
+        />
       ) : (
       <>
 
@@ -714,18 +787,18 @@ export default function Planner() {
           icon={<Target size={18} />}
         />
         <StatCard
-          label="Campaign health"
-          value={p.health.band === "unknown" ? "—" : String(p.health.score)}
-          sublabel={p.health.note}
-          tone={HEALTH_TONE[p.health.band]}
+          label="Warmup (Instantly)"
+          value={avgWarmup === null ? "—" : String(avgWarmup)}
+          sublabel={`Instantly warmup score · ${warmupScored.length} scored`}
+          tone={warmupTone}
           icon={<HeartPulse size={18} />}
         />
         <StatCard
-          label="Today's real supply"
-          value={fmtNumber(p.warmupAdjustedSupply)}
-          sublabel={`${p.mailboxes.filter((b) => b.warmingUp).length} still warming · ${p.excludedCount} excluded`}
-          tone="lavender"
-          icon={<Flame size={18} />}
+          label="Free inboxes"
+          value={fmtNumber(freeMailboxes.length)}
+          sublabel={`rotation-ready · ${rotationReservedCount} in rotation`}
+          tone={freeMailboxes.length > 0 ? "mint" : "white"}
+          icon={<Inbox size={18} />}
         />
       </div>
 
@@ -796,8 +869,9 @@ export default function Planner() {
           <Target size={18} /> Growth calculator
         </h3>
         <p className="mb-3 text-xs text-muted">
-          Size the whole fleet for your daily goal against what you already run — campaigns,
-          sending inboxes, per-niche spares, and the domains to host them.
+          Size the whole rotation fleet for your daily goal — campaigns, the connected (sending)
+          inboxes, and an <b>equal rotation set</b> to swap in every {settings.rotation_interval_days} days.
+          Every connected inbox needs a same-niche partner, so you own <b>twice</b> the sending count.
         </p>
         <div className="flex flex-wrap items-end gap-3">
           <div>
@@ -848,16 +922,6 @@ export default function Planner() {
               onBlur={(e) => void patchSettings({ emails_per_domain: Math.min(3, Math.max(1, Number(e.target.value) || 1)) })}
             />
           </div>
-          <div>
-            <p className="label">Spares / niche</p>
-            <input
-              type="number"
-              min={0}
-              className="input w-24"
-              defaultValue={settings.planner_spares_per_niche}
-              onBlur={(e) => void patchSettings({ planner_spares_per_niche: Math.max(0, Number(e.target.value) || 0) })}
-            />
-          </div>
         </div>
 
         {p.goal.value <= 0 || !growth ? (
@@ -879,7 +943,7 @@ export default function Planner() {
               .
             </div>
 
-            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
               <StatCard
                 label="Campaigns"
                 value={growth.campaignsRequired}
@@ -887,10 +951,22 @@ export default function Planner() {
                 tone="pink"
               />
               <StatCard
-                label="Sending inboxes"
-                value={growth.sendingMailboxesRequired}
-                sublabel={`at ${fmtNumber(p.perBoxCap)}/day each`}
+                label="Connected inboxes"
+                value={growth.connectedRequired}
+                sublabel={`${growth.inboxesPerCampaign} per campaign @ ${fmtNumber(p.perBoxCap)}/day`}
                 tone="sky"
+              />
+              <StatCard
+                label="Rotation inboxes"
+                value={growth.rotationRequired}
+                sublabel="equal set — swaps in on schedule"
+                tone="lavender"
+              />
+              <StatCard
+                label="Total to own (×2)"
+                value={growth.totalMailboxesRequired}
+                sublabel="connected + rotation partners"
+                tone="sun"
               />
               <StatCard
                 label="Inboxes to add"
@@ -898,52 +974,22 @@ export default function Planner() {
                 sublabel={
                   growth.mailboxesToAdd > 0
                     ? `~${growth.domainsToAdd} domain${growth.domainsToAdd === 1 ? "" : "s"} @ ${settings.emails_per_domain}/domain`
-                    : "your fleet is enough"
+                    : `have ${p.usableInboxes} — enough`
                 }
                 tone="mint"
               />
-              <StatCard
-                label="Healthy spares"
-                value={growth.spareMailboxesRequired}
-                sublabel={growth.spareShortfall > 0 ? `${growth.spareShortfall} more to tag` : "buffer met"}
-                tone="sun"
-              />
             </div>
 
-            {growth.spares.length > 0 ? (
-              <div className="overflow-hidden rounded-xl border-2 border-ink">
-                <table className="w-full border-collapse text-left text-sm">
-                  <thead>
-                    <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
-                      <th className="px-3 py-2">Niche</th>
-                      <th className="w-28 px-3 py-2">Healthy spares</th>
-                      <th className="w-20 px-3 py-2">Keep</th>
-                      <th className="w-20 px-3 py-2">Add</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {growth.spares.map((s) => (
-                      <tr key={s.niche} className="border-b border-ink/10">
-                        <td className="px-3 py-2"><Badge tone="sky">{s.niche}</Badge></td>
-                        <td className="px-3 py-2">{s.current}</td>
-                        <td className="px-3 py-2">{s.target}</td>
-                        <td className="px-3 py-2">
-                          {s.shortfall > 0 ? <b className="text-danger">+{s.shortfall}</b> : <span className="text-muted">—</span>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <p className="border-t border-ink/10 px-3 py-2 text-[11px] text-muted">
-                  A spare only replaces a mailbox in a campaign of its own niche, so keep a buffer
-                  per niche. Tag spares on the <b>Accounts</b> tab; untagged spares count for none.
-                </p>
-              </div>
-            ) : (
-              <p className="text-xs text-muted">
-                No campaign niches yet — tag your campaigns (Accounts tab) to size a per-niche spare buffer.
-              </p>
-            )}
+            <p className="flex items-start gap-1.5 rounded-lg border-2 border-ink bg-canvas p-2 text-[11px] text-muted">
+              <Repeat size={13} className="mt-0.5 shrink-0" />
+              <span>
+                Each campaign runs on <b>{growth.inboxesPerCampaign}</b> connected inboxes and keeps a
+                same-niche partner set of the same size resting; every {settings.rotation_interval_days} days
+                they swap. Own <b>{growth.totalMailboxesRequired}</b> inboxes in total ({growth.connectedRequired} sending
+                + {growth.rotationRequired} rotation). You have <b>{p.usableInboxes}</b> usable now
+                ({freeMailboxes.length} free to rotate in).
+              </span>
+            </p>
 
             <p className="text-xs text-muted">
               {growth.mailboxesToAdd > 0 && growth.monthlyCostAdd !== null
@@ -1031,6 +1077,8 @@ export default function Planner() {
         overrides={settings.campaign_group_overrides ?? {}}
         healthByEmail={healthByEmail}
         onApplied={refresh}
+        reservedEmails={rotationCohortReserved}
+        reservedCampaignIds={rotationCampaignIds}
       />
 
       {/* What actually went out, against what the mailboxes could carry. */}
@@ -1133,30 +1181,60 @@ export default function Planner() {
           <div>
             <h3 className="text-lg">Mailboxes ({p.mailboxes.length})</h3>
             <p className="text-xs text-muted">
-              {p.idleMailboxes.length} idle · {p.excludedCount} excluded — untick to stop counting a
-              mailbox everywhere in the planner
+              {freeMailboxes.length} free · {rotationReservedCount} in rotation · {p.excludedCount} excluded
+              — untick to stop counting a mailbox everywhere in the planner
             </p>
           </div>
           {showMailboxes ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
         </button>
         {showMailboxes ? (
-          <div className="max-h-96 overflow-auto">
+          <div className="max-h-[32rem] overflow-auto">
             {inboxSends && !inboxSends.supported ? (
               <p className="border-b border-ink/10 bg-sun/20 px-3 py-2 text-[11px]">
-                <b>Sending &amp; per-mailbox bounce show n/a:</b> {inboxSends.reason} Without real
-                bounce data, <b>Health</b> reads <b>“—” (unverified)</b> for inboxes that show no
-                other problem — a flat warmup score and warmup-network placement can’t prove real
-                inbox placement, so the tool won’t fake a green score. Provably-bad inboxes (spam
-                placement, broken, stalled, expired domain) still score red/amber.
+                <b>Sending &amp; per-mailbox bounce show n/a:</b> {inboxSends.reason} The <b>Warmup</b>{" "}
+                column shows Instantly's own warmup score straight from the account.
               </p>
             ) : null}
+            {/* Advanced filters — search + state segment. Counts ignore the text
+                box so they read as a legend of the fleet. */}
+            <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b-2 border-ink bg-paper px-3 py-2">
+              <div className="relative">
+                <Search size={13} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
+                <input
+                  className="input h-8 w-56 pl-7 text-xs"
+                  placeholder="Search email or niche…"
+                  value={mbQuery}
+                  onChange={(e) => setMbQuery(e.target.value)}
+                />
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {MAILBOX_FILTERS.map(({ key, label }) => {
+                  const count = key === "all" ? p.mailboxes.length : p.mailboxes.filter(mbFilterPred[key]).length;
+                  return (
+                    <button
+                      key={key}
+                      onClick={() => setMbFilter(key)}
+                      className={cn(
+                        "rounded-lg border-2 border-ink px-2 py-1 text-[11px] font-bold",
+                        mbFilter === key ? "bg-ink text-paper" : "bg-paper hover:bg-canvas",
+                      )}
+                    >
+                      {label} <span className={mbFilter === key ? "opacity-80" : "text-muted"}>{count}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="ml-auto text-[11px] text-muted">
+                {visibleMailboxes.length} of {p.mailboxes.length} shown
+              </span>
+            </div>
             <table className="w-full min-w-[720px] border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b-2 border-ink bg-canvas text-xs uppercase">
                   <th className="w-12 px-3 py-2">Use</th>
                   <th className="px-3 py-2">Mailbox</th>
-                  <th className="w-24 px-3 py-2" title="Composite deliverability score — bounce rate, inbox placement and account status, not the warmup number">
-                    Health
+                  <th className="w-24 px-3 py-2" title="Instantly's warmup score (stat_warmup_score), straight from the account">
+                    Warmup
                   </th>
                   <th className="w-20 px-3 py-2">Limit</th>
                   <th className="w-28 px-3 py-2">Sending</th>
@@ -1172,7 +1250,16 @@ export default function Planner() {
                     stacking context its children can't climb back out of, so
                     the old row-level opacity-50 dragged the checkbox down with
                     it and made a live control look permanently disabled. */}
-                {p.mailboxes.map((b) => (
+                {visibleMailboxes.length === 0 ? (
+                  <tr>
+                    <td colSpan={10} className="px-3 py-6 text-center text-sm text-muted">
+                      No mailboxes match this filter.
+                    </td>
+                  </tr>
+                ) : null}
+                {visibleMailboxes.map((b) => {
+                  const rot = rotationByEmail.get(b.email.trim().toLowerCase());
+                  return (
                   <tr
                     key={b.email}
                     className={cn(
@@ -1197,40 +1284,23 @@ export default function Planner() {
                       />
                     </td>
                     <td className="truncate px-3 py-2 font-semibold">{b.email}</td>
-                    {/* Composite real-health score — bounce/placement/status, not
-                        the warmup number. Reasons on hover; "—" when there isn't
-                        enough real signal yet. */}
+                    {/* Instantly's warmup score, straight from the account — the
+                        app no longer synthesizes its own health here. "—" when
+                        Instantly reports no score. */}
                     <td className="px-3 py-2">
-                      {(() => {
-                        const h = healthByEmail.get(b.email);
-                        if (!h || h.healthScore === null) {
-                          return (
-                            <span
-                              className="text-muted"
-                              title={
-                                h && h.healthReasons.length
-                                  ? h.healthReasons.join(" · ")
-                                  : "Not enough real deliverability data yet"
-                              }
-                            >
-                              —
-                            </span>
-                          );
-                        }
-                        const tone =
-                          h.healthBand === "good"
-                            ? "mint"
-                            : h.healthBand === "watch"
-                              ? "sky"
-                              : h.healthBand === "warn"
-                                ? "sun"
-                                : "danger";
-                        return (
-                          <span title={h.healthReasons.join(" · ") || undefined}>
-                            <Badge tone={tone}>{h.healthScore}</Badge>
-                          </span>
-                        );
-                      })()}
+                      {b.warmupScoreKnown ? (
+                        <span
+                          className="inline-flex items-center gap-1"
+                          title={`Instantly warmup ${b.warmupScore}/100 · warmup ${b.warmupOn ? "on" : "off"}`}
+                        >
+                          <Badge tone={b.warmupScore >= 90 ? "mint" : b.warmupScore >= 70 ? "sky" : b.warmupScore >= 40 ? "sun" : "danger"}>
+                            {b.warmupScore}
+                          </Badge>
+                          {!b.warmupOn ? <span className="text-[10px] text-muted">off</span> : null}
+                        </span>
+                      ) : (
+                        <span className="text-muted" title="Instantly reports no warmup score for this inbox">—</span>
+                      )}
                     </td>
                     <td className="px-3 py-2">{fmtNumber(b.dailyLimit)}</td>
                     {/* Real measured sends, or nothing. Never a share of a
@@ -1262,9 +1332,7 @@ export default function Planner() {
                       {b.lastUsedAt ? fmtDateShort(b.lastUsedAt) : "never"}
                     </td>
                     <td className="px-3 py-2 text-xs text-muted">
-                      {b.allCampaignIds.length === 0 ? (
-                        <span className="text-muted">not in any campaign</span>
-                      ) : (
+                      {b.allCampaignIds.length > 0 ? (
                         <span
                           className="line-clamp-2"
                           title={b.allCampaignIds.map((id) => campaignName.get(id) ?? id).join("\n")}
@@ -1272,6 +1340,13 @@ export default function Planner() {
                           {b.allCampaignIds.map((id) => campaignName.get(id) ?? id).join(", ")}
                           {b.pausedOnly ? " (paused)" : ""}
                         </span>
+                      ) : rot ? (
+                        <span className="inline-flex items-center gap-1 text-ink" title={`Reserved by rotation: ${rot.campaignName} · cohort ${rot.cohort} (${rot.paused ? "paused" : rot.active ? "active/sending" : "resting"})`}>
+                          <Repeat size={11} className="shrink-0" />
+                          {rot.campaignName} · {rot.cohort} {rot.paused ? "(paused)" : rot.active ? "(active)" : "(resting)"}
+                        </span>
+                      ) : (
+                        <span className="text-muted">not in any campaign</span>
                       )}
                     </td>
                     {/* Live IMAP/SMTP identity — which login this account is on,
@@ -1318,10 +1393,17 @@ export default function Planner() {
                         </Badge>
                       ) : b.beyondCount ? (
                         <Badge tone="white">not in use</Badge>
+                      ) : rot ? (
+                        <Badge
+                          tone={rot.paused ? "white" : rot.active ? "mint" : "lavender"}
+                          className="whitespace-nowrap"
+                        >
+                          <Repeat size={11} /> {rot.cohort} {rot.paused ? "paused" : rot.active ? "sending" : "resting"}
+                        </Badge>
                       ) : b.pausedOnly ? (
                         <Badge tone="sky">parked</Badge>
                       ) : b.idle ? (
-                        <Badge tone="sun">idle</Badge>
+                        <Badge tone="sun">free</Badge>
                       ) : b.warmingUp ? (
                         <Badge tone="lavender">warming</Badge>
                       ) : (
@@ -1329,7 +1411,8 @@ export default function Planner() {
                       )}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

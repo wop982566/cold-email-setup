@@ -143,11 +143,12 @@ async function write<T = unknown>(body: Record<string, unknown>): Promise<WriteR
 // Both paths hit the scheduled function directly. dryRun computes a full
 // decision and writes nothing; testEmail sends one email and reports what
 // Resend actually said.
-async function autoSwapCall(mode: "dryRun" | "testEmail"): Promise<Record<string, unknown>> {
-  // Note the endpoint: auto-swap-test, NOT auto-swap. The latter is a scheduled
-  // function and Netlify does not serve those over HTTP — its URL returns an
-  // empty 404, which is what produced "Unexpected end of JSON input".
-  const url = `/.netlify/functions/auto-swap-test?${mode}=1`;
+// Robust POST to a Netlify HTTP function. Reads the body as text first (a
+// scheduled function's URL 404s with an EMPTY body, and res.json() would throw
+// on that), parses JSON when present, and always resolves to a plain object
+// with { ok, error? } rather than throwing — so a missing deploy reports itself
+// instead of surfacing as a fabricated cause.
+async function functionPost(url: string): Promise<Record<string, unknown>> {
   let res: Response;
   try {
     res = await fetch(url, { method: "POST", headers: headers() });
@@ -159,10 +160,6 @@ async function autoSwapCall(mode: "dryRun" | "testEmail"): Promise<Record<string
     };
   }
 
-  // Read as text first. Calling res.json() on an empty or HTML body throws, and
-  // the old catch turned that into a result object with every field missing —
-  // which the UI then rendered as "RESEND_API_KEY is missing". Reporting a
-  // cause we never observed is worse than reporting nothing.
   const text = await res.text().catch(() => "");
   let body: Record<string, unknown> | null = null;
   try {
@@ -190,10 +187,22 @@ async function autoSwapCall(mode: "dryRun" | "testEmail"): Promise<Record<string
 }
 
 export const autoSwap = {
+  // The endpoint is auto-swap-test, NOT auto-swap: the latter is scheduled and
+  // Netlify doesn't serve scheduled functions over HTTP.
   /** Full pipeline, zero writes — what the cron would do right now. */
-  dryRun: () => autoSwapCall("dryRun"),
+  dryRun: () => functionPost(`/.netlify/functions/auto-swap-test?dryRun=1`),
   /** One email through Resend, with the raw result. */
-  testEmail: () => autoSwapCall("testEmail"),
+  testEmail: () => functionPost(`/.netlify/functions/auto-swap-test?testEmail=1`),
+};
+
+export const rotationSwap = {
+  /** Preview every due (or forced) rotation — direction, target set, pairs. Writes nothing. */
+  dryRun: () => functionPost(`/.netlify/functions/rotation-swap-test?dryRun=1`),
+  /** Force ONE campaign to rotate right now (still write-gated + read-back verified). */
+  rotateNow: (campaignId: string) =>
+    functionPost(`/.netlify/functions/rotation-swap-test?run=1&campaignId=${encodeURIComponent(campaignId)}`),
+  /** One sample notification email through Resend, with the raw result. */
+  testEmail: () => functionPost(`/.netlify/functions/rotation-swap-test?testEmail=1`),
 };
 
 export const instantly = {
@@ -273,6 +282,14 @@ export const instantly = {
     payload: { campaignId: string; add: string[]; expectedList?: string[] },
     dryRun = false,
   ) => write({ op: "add-campaign-emails", ...payload, dryRun }),
+
+  // Replace a campaign's ENTIRE mailbox list with a new set — the rotation
+  // swapper. `expectedList` aborts (409) if the live list drifted since it was
+  // read; the server verifies the whole set by read-back (applied = sameSet).
+  replaceCampaignEmails: (
+    payload: { campaignId: string; email_list: string[]; expectedList?: string[] },
+    dryRun = false,
+  ) => write({ op: "replace-campaign-emails", ...payload, dryRun }),
 };
 
 // --- Inbox tester ----------------------------------------------------------

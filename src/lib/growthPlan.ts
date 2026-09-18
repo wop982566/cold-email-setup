@@ -1,50 +1,33 @@
 // ---------------------------------------------------------------------------
 // The growth calculator: given a daily-send goal and the structure you build
-// with (a per-campaign cap, a per-mailbox limit, mailboxes per domain, and a
-// per-niche spare buffer), work out what you already have and exactly what to
-// add — campaigns, sending inboxes, healthy spares per niche, and the domains
-// to host them on.
+// with (a per-campaign cap, a per-mailbox limit, and mailboxes per domain),
+// work out what you already have and exactly what to add — campaigns, connected
+// (sending) inboxes, the matching ROTATION inboxes, and the domains to host them.
 //
-// It extends the simple goal planner (which only sized inboxes/domains) with
-// the two things that decide a real cold-email fleet: the per-campaign limit
-// (campaigns are capped, so hitting a big number needs *many* campaigns) and a
-// swap buffer of healthy spares kept PER NICHE, since a spare can only replace
-// a mailbox in a campaign of its own niche.
+// The rotation strategy sizes the fleet: every connected inbox needs a same-niche
+// partner to swap in every ~15 days, so you own TWICE the sending count — the
+// connected set plus an equal rotation set that rests and re-warms until its turn.
+// Sizing is per campaign (a campaign is capped, so a big goal needs several, and
+// each needs ceil(cap / per-mailbox) inboxes to fill it), then doubled.
 //
-// Pure module — the caller resolves niches and current spare counts (which need
-// the tag system) and passes them in as plain numbers, so this stays testable.
+// Pure module — the caller resolves the live numbers and passes them in as plain
+// values, so this stays testable with no network or DOM.
 // ---------------------------------------------------------------------------
-
-export interface NicheSpare {
-  niche: string;
-  /** Healthy spares currently tagged this niche. */
-  current: number;
-  /** Spares you want to keep for this niche. */
-  target: number;
-  /** How many more tagged spares to add for this niche. */
-  shortfall: number;
-}
 
 export interface GrowthInput {
   /** Emails/day to reach — already in email terms (leads → emails applied upstream). */
   goalPerDay: number;
   /** Daily cap you set per campaign, e.g. 200. */
   perCampaignLimit: number;
-  /** Safe sends per inbox/day (the planner's perBoxCap). */
+  /** Safe sends per inbox/day (the planner's perBoxCap), e.g. 15. */
   perMailboxLimit: number;
   /** Sending mailboxes hosted per domain (1..3). */
   mailboxesPerDomain: number;
-  /** Healthy spares to keep for each distinct niche. */
-  sparesPerNiche: number;
-  /** Distinct niches your active campaigns run in. */
-  niches: readonly string[];
-  /** Healthy spares you already have, per niche. */
-  currentSparesByNiche: Record<string, number>;
   /** Active campaigns you already run. */
   activeCampaigns: number;
   /** Sum of your active campaigns' configured daily limits. */
   configuredDemand: number;
-  /** Usable inboxes you already have. */
+  /** Usable inboxes you already have (connected + free spares you can rotate in). */
   usableInboxes: number;
   /** Sum of your usable mailboxes' daily limits — what you can actually send. */
   currentSupply: number;
@@ -62,13 +45,14 @@ export interface GrowthPlan {
   campaignsToAdd: number;
   /** More emails/day of campaign capacity to configure to reach the goal. */
   demandGap: number;
-  // --- Sending mailboxes ---------------------------------------------------
-  sendingMailboxesRequired: number;
-  // --- Spare buffer, per niche ---------------------------------------------
-  spares: NicheSpare[];
-  spareMailboxesRequired: number;
-  spareShortfall: number;
-  // --- Whole fleet ---------------------------------------------------------
+  /** Connected (sending) inboxes one campaign needs to fill its cap. */
+  inboxesPerCampaign: number;
+  // --- Rotation fleet (connected + an equal rotation set) -------------------
+  /** Connected (sending) inboxes across all campaigns. */
+  connectedRequired: number;
+  /** The matching rotation partners — equal to the connected set (1:1 mirror). */
+  rotationRequired: number;
+  /** The whole fleet you must own = connected × 2. */
   totalMailboxesRequired: number;
   mailboxesToAdd: number;
   domainsToAdd: number;
@@ -88,28 +72,22 @@ export function computeGrowthPlan(input: GrowthInput): GrowthPlan {
   const perCampaign = nonneg(input.perCampaignLimit);
   const perMailbox = nonneg(input.perMailboxLimit);
   const perDomain = Math.max(1, Math.floor(nonneg(input.mailboxesPerDomain) || 1));
-  const sparesPerNiche = Math.max(0, Math.floor(nonneg(input.sparesPerNiche)));
 
   // Campaigns: each is capped, so a big goal needs several.
-  const campaignsRequired = ceilDiv(goal, perCampaign);
+  const campaignsRequired = perCampaign > 0 ? ceilDiv(goal, perCampaign) : goal > 0 ? 1 : 0;
   const campaignsToAdd = Math.max(0, campaignsRequired - Math.max(0, input.activeCampaigns));
   const demandGap = Math.max(0, goal - Math.max(0, input.configuredDemand));
 
-  // Sending mailboxes for the raw volume.
-  const sendingMailboxesRequired = ceilDiv(goal, perMailbox);
+  // Connected (sending) inboxes: one campaign needs ceil(cap / per-mailbox) to
+  // fill it (200 / 15 = 14); the whole goal needs that across every campaign.
+  // With no campaign cap set, fall back to sizing the raw volume directly.
+  const inboxesPerCampaign = perCampaign > 0 ? ceilDiv(perCampaign, perMailbox) : ceilDiv(goal, perMailbox);
+  const connectedRequired = perCampaign > 0 ? campaignsRequired * inboxesPerCampaign : ceilDiv(goal, perMailbox);
 
-  // Spares kept per niche — the swap buffer. A spare only helps its own niche,
-  // so the target is per-niche and the shortfall is per-niche.
-  const spares: NicheSpare[] = [...new Set(input.niches)].map((niche) => {
-    const current = Math.max(0, input.currentSparesByNiche[niche] ?? 0);
-    const shortfall = Math.max(0, sparesPerNiche - current);
-    return { niche, current, target: sparesPerNiche, shortfall };
-  });
-  const spareMailboxesRequired = spares.length * sparesPerNiche;
-  const spareShortfall = spares.reduce((n, s) => n + s.shortfall, 0);
+  // The rotation mirror: an equal same-niche partner set to swap in on schedule.
+  const rotationRequired = connectedRequired;
+  const totalMailboxesRequired = connectedRequired + rotationRequired; // = connected × 2
 
-  // The whole fleet you must own: sending inboxes + the spare buffer.
-  const totalMailboxesRequired = sendingMailboxesRequired + spareMailboxesRequired;
   const mailboxesToAdd = Math.max(0, totalMailboxesRequired - Math.max(0, input.usableInboxes));
   const domainsToAdd = ceilDiv(mailboxesToAdd, perDomain);
 
@@ -127,10 +105,9 @@ export function computeGrowthPlan(input: GrowthInput): GrowthPlan {
     campaignsRequired,
     campaignsToAdd,
     demandGap,
-    sendingMailboxesRequired,
-    spares,
-    spareMailboxesRequired,
-    spareShortfall,
+    inboxesPerCampaign,
+    connectedRequired,
+    rotationRequired,
     totalMailboxesRequired,
     mailboxesToAdd,
     domainsToAdd,

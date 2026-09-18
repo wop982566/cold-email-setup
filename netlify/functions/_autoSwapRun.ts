@@ -31,7 +31,7 @@ import { computePlan } from "../../src/lib/campaignPlan.js";
 import { computeMaintenance } from "../../src/lib/mailboxHealth.js";
 import { computeCapacity } from "../../src/lib/capacity.js";
 import { planAutoSwaps, recordScores, type ScoreHistory } from "../../src/lib/autoSwap.js";
-import { buildTagMap, mergeTagMaps, parseTagPayload } from "../../src/lib/tags.js";
+import { parseTagPayload, resolveTagMap } from "../../src/lib/tags.js";
 import { DEFAULT_SETTINGS, type AppSettings, type Domain } from "../../src/lib/types.js";
 
 const STORE = "cec-data";
@@ -176,11 +176,6 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     return json({ ok: false, error: "Unauthorized" }, 401);
   }
 
-  // Safety backstop: revert any test swap the operator left running (real runs
-  // only — a dry run must never write). Done before anything else so a stale
-  // test swap can't skew the health read that follows.
-  if (mode === "scheduled") await revertOverdueTestSwaps(log);
-
   const settingsForEmail = await readSettings().catch(() => null);
 
   // --- Does Resend work? Asked on its own, so a broken key is distinguishable
@@ -211,6 +206,29 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
       keyConfigured: Boolean(process.env.RESEND_API_KEY),
     });
   }
+
+  // Rotation mode REPLACES health-based swapping. When the operator turns on the
+  // periodic 15-day rotation (settings.rotation_swap_enabled), this swapper stands
+  // down ENTIRELY — checked before the test-swap backstop below so it can't issue
+  // even that write to a rotation-managed campaign.
+  if (settingsForEmail?.rotation_swap_enabled === true) {
+    log("rotation mode is active — health-based swapping is disabled");
+    if (mode === "dryRun") {
+      return json({
+        ok: false,
+        mode,
+        error: "Rotation mode is on (rotation_swap_enabled), so the health-based swapper is disabled. Use the Rotation tab instead.",
+        writesEnabled: false,
+      });
+    }
+    return new Response("disabled — rotation mode is active", { status: 200 });
+  }
+
+  // Safety backstop: revert any test swap the operator left running (real runs
+  // only — a dry run must never write). Before the health read so a stale test
+  // swap can't skew it; after the rotation standdown so it never touches a
+  // rotation-managed campaign.
+  if (mode === "scheduled") await revertOverdueTestSwaps(log);
 
   if (!enabled()) {
     log("AUTO_SWAP_ENABLED is not true — nothing done");
@@ -268,8 +286,25 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     // whatever Instantly doesn't carry. Read through the same proxy resource
     // the UI uses, so the cron and the tab can't disagree about eligibility.
     const tagsRes = await callInstantly("resource=tags");
-    const assignments = parseTagPayload(tagsRes.data);
-    const tagMap = mergeTagMaps(buildTagMap(tagRows), assignments.byEmail);
+    // Instantly references a mailbox by its internal id — map id→email from the
+    // accounts payload so per-inbox tags are recognised as a fallback, while the
+    // operator's app tags win (precedence), matching the UI exactly.
+    const accItems = Array.isArray((accountsData.data as { items?: unknown[] })?.items)
+      ? ((accountsData.data as { items: Record<string, unknown>[] }).items)
+      : Array.isArray(accountsData.data)
+        ? (accountsData.data as Record<string, unknown>[])
+        : [];
+    const idToEmail = new Map<string, string>();
+    for (const a of accItems) {
+      const email = String(a.email ?? "").trim().toLowerCase();
+      if (!email) continue;
+      for (const idKey of ["id", "_id", "account_id", "uuid"]) {
+        const id = a[idKey];
+        if (typeof id === "string" && id.trim()) idToEmail.set(id.trim().toLowerCase(), email);
+      }
+    }
+    const assignments = parseTagPayload(tagsRes.data, idToEmail);
+    const tagMap = resolveTagMap(assignments.byEmail, tagRows);
     if (tagsRes.supported === false) {
       log("Instantly returned no custom-tags endpoint — using this app's own mailbox tags only");
     }

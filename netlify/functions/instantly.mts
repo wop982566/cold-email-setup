@@ -42,7 +42,7 @@ const ALLOWED_PARAMS = ["id", "campaign_id", "start_date", "end_date", "limit", 
 // The only three mutations this function can perform. Deleting anything,
 // pausing or starting a campaign, and everything to do with leads are absent
 // on purpose — there is no code path to them.
-const WRITE_OPS = ["create-account", "update-account", "set-campaign-emails", "add-campaign-emails"] as const;
+const WRITE_OPS = ["create-account", "update-account", "set-campaign-emails", "add-campaign-emails", "replace-campaign-emails"] as const;
 type WriteOp = (typeof WRITE_OPS)[number];
 
 function tokenOk(req: Request): boolean {
@@ -686,6 +686,98 @@ export default async (req: Request): Promise<Response> => {
           before: current,
           after: next,
           added: fresh,
+          verified,
+          verifyStatus: verifyRes.status,
+          attempts,
+          applied,
+        });
+      }
+
+      // Replace a campaign's ENTIRE mailbox list with a new set — the rotation
+      // swapper. Same read-modify-verify discipline as the other two ops, but
+      // the list is written wholesale, so it may grow, shrink, or fully change.
+      // Deliberately NOT equal-size: rotation allows a smaller partner cohort.
+      if (op === "replace-campaign-emails") {
+        const campaignId = str(body.campaignId);
+        const nextList = Array.isArray(body.email_list)
+          ? [...new Set((body.email_list as unknown[]).map(normEmail).filter(Boolean))]
+          : [];
+        if (!campaignId) return json({ ok: false, error: "campaignId is required" }, 400);
+        if (nextList.length === 0) {
+          return json({ ok: false, error: "email_list must be a non-empty list of emails" }, 400);
+        }
+
+        const readRes = await fetch(`${BASE}/campaigns/${encodeURIComponent(campaignId)}`, { headers: auth });
+        const campaign = await readRes.json().catch(() => null);
+        if (!readRes.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${readRes.status} reading campaign`, data: scrub(campaign) },
+            readRes.status,
+          );
+        }
+
+        const current = emailListOf(campaign);
+        if (current.length === 0) {
+          return json(
+            { ok: false, campaignId, error: "Campaign returned no email_list — refusing to write one from scratch." },
+            409,
+          );
+        }
+        // Optimistic concurrency: abort if the list moved under the caller.
+        const expected = Array.isArray(body.expectedList)
+          ? (body.expectedList as unknown[]).map(normEmail).filter(Boolean)
+          : null;
+        if (expected && !sameSet(expected, current)) {
+          return json(
+            {
+              ok: false,
+              campaignId,
+              error: "This campaign's mailbox list changed since the page loaded. Refresh and try again.",
+              current,
+              expected,
+            },
+            409,
+          );
+        }
+
+        const next = nextList;
+        // Already exactly this set — nothing to write, nothing to verify against.
+        if (sameSet(next, current)) {
+          return json({ ok: true, campaignId, before: current, after: current, verified: current, applied: true, noop: true });
+        }
+        const path = `/campaigns/${encodeURIComponent(campaignId)}`;
+
+        if (dryRun) {
+          return json({ ok: true, dryRun: true, campaignId, before: current, after: next });
+        }
+
+        const attempts: { method: string; path: string; status: number; body: unknown }[] = [];
+        const tryWrite = async (method: string) => {
+          const r = await post(path, { email_list: next }, method);
+          const b = await r.json().catch(() => null);
+          attempts.push({ method, path, status: r.status, body: scrub(b) });
+          return r;
+        };
+
+        let res = await tryWrite("PATCH");
+        if (res.status === 404 || res.status === 405) res = await tryWrite("POST");
+
+        if (!res.ok) {
+          return json(
+            { ok: false, campaignId, error: `Instantly ${res.status}`, attempts, before: current, attempted: next },
+            res.status,
+          );
+        }
+
+        const verifyRes = await fetch(`${BASE}${path}`, { headers: auth });
+        const verified = verifyRes.ok ? emailListOf(await verifyRes.json().catch(() => null)) : null;
+        const applied = verified === null ? null : sameSet(verified, next);
+
+        return json({
+          ok: true,
+          campaignId,
+          before: current,
+          after: next,
           verified,
           verifyStatus: verifyRes.status,
           attempts,

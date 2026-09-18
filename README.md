@@ -94,7 +94,8 @@ Set these env vars in **Netlify → Site settings → Environment variables**:
 | `ANTHROPIC_MODEL` | functions | Optional, defaults to `claude-opus-4-8` (cheaper: `claude-sonnet-4-6`, `claude-haiku-4-5`) |
 | `INSTANTLY_API_KEY` | functions | Instantly v2 key (read scopes) — live insights page |
 | `INSTANTLY_WRITE_ENABLED` | functions | **Required for any write.** Set to `true` to let the planner create mailboxes and swap them on campaigns. Unset, every write returns 403 and the Maintenance tab shows a banner saying so. Reads are unaffected. |
-| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`, logic in `_autoSwapRun.ts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. |
+| `AUTO_SWAP_ENABLED` | functions | Kill switch for the daily automatic swapper (`netlify/functions/auto-swap.mts`, logic in `_autoSwapRun.ts`). Unset or not `true`, the scheduled run exits immediately having changed nothing. Also requires `INSTANTLY_WRITE_ENABLED`. Automatically stands down when rotation mode is on (below). |
+| `ROTATION_SWAP_ENABLED` | functions | Kill switch for the daily **periodic rotation swap** (`netlify/functions/rotation-swap.mts`, logic in `_rotationRun.ts`). The scheduled run also needs the in-app master toggle (`rotation_swap_enabled`) and `INSTANTLY_WRITE_ENABLED`. Unset or not `true`, no unattended rotation happens (the Planner's **Rotate now** button still works). |
 | `RESEND_API_KEY` | functions | Resend key for run-summary emails. Without it the swapper still runs and still logs — it just can't email you. The sending domain must be verified in Resend or sends fail with 403. |
 | `OPENAI_API_KEY` | functions | Enables AI lead enrichment (server-side only) |
 | `OPENAI_MODEL` | functions | Optional, defaults to `gpt-4o-mini` |
@@ -263,6 +264,13 @@ read back to confirm, with `expectedList` aborting if the campaign changed under
 you. Immature (still-warming) inboxes are included but flagged in the preview so
 you can back out.
 
+**Rotation cohorts are never offered.** Any inbox locked to a rotation cohort (A or
+B, active *or* resting) is withheld from the idle pool before autopopulate picks —
+including cohorts of **paused** rotations, so pausing keeps your A/B sets intact and
+off-limits; only **Forget** (delete) frees those inboxes back into the pool. The
+reservation is one map (`rotationMembership`), shared with the Mailboxes list's
+**Free inboxes** count, so what reads as free is exactly what autopopulate can use.
+
 Every run is logged to `populate_runs` and rendered on the Plan tab: which inboxes
 went to which campaign, before/after counts, and per-campaign `applied` /
 `unconfirmed` / `failed` — so "which emails were populated" is a durable,
@@ -417,36 +425,142 @@ clean table.
 
 ---
 
-## 📈 Growth calculator
+## 🔁 Periodic rotation swap (Planner → Rotation tab)
 
-On the Planner's **Plan** tab, the growth calculator sizes the whole fleet for a
-daily-send goal against the structure you already run — all inputs dynamic and
-persisted. You give it four numbers: the **goal** (emails/day, or leads/day which
+A durability strategy that doesn't depend on health scores (Instantly reports a
+flat 100% warmup, so the health-based swapper has little to act on). For a chosen
+campaign it keeps **two fixed same-niche cohorts** and **alternates the whole
+connected set every 15 days**: while one cohort sends, its partner rests and
+re-warms (warmup is already on for every account), then they swap back — forever,
+so no inbox sends continuously past ~15 days.
+
+- **Enable** on a campaign captures **cohort A** = its live inbox set, and
+  **auto-picks cohort B** = idle, same-niche spares (previewed, then *locked* as
+  the fixed partner). If there aren't enough same-niche idle spares, it rotates
+  with what's available and the preview warns that capacity dips on B's turn.
+- **Manual editor + used-account guard.** Every cohort is editable (a filterable
+  picker); only **same-niche, unused** accounts can be added, and adding one that's
+  already on another campaign or in another rotation cohort is refused with
+  *"This account has been used. Please select another account."* Editing the
+  **resting** cohort is a metadata change; editing the **active** (currently
+  sending) cohort pushes the change **live** to Instantly with a verified read-back.
+- **Correct niche resolution.** Per-inbox tags resolve by **precedence, not
+  union** (`resolveTagMap`): the operator's **app tags win** (the niche you set
+  and see in the Accounts tab), and Instantly fills in only inboxes the app
+  hasn't tagged — so a stale/auto tag from the other source can't add a second
+  niche and pull an AEO inbox into a CBD campaign. The Accounts tab, the rotation
+  picker and the cron all use this one resolver, so what you see is what the
+  picker matches on. `parseTagPayload` also maps Instantly's internal account
+  id→email (from the accounts payload) so an inbox's Instantly niche is a usable
+  fallback. Both cohort previews and the manual editor show each inbox's resolved
+  niche and flag a mismatch, so a wrong pick is visible, not a mystery.
+- A **daily** scheduled worker (`rotation-swap.mts` → `_rotationRun.ts`) rotates
+  each campaign whose 15-day interval has elapsed (per-campaign state, so the
+  cadence is configurable). Each swap is one guarded write — a new
+  `replace-campaign-emails` op sets the whole `email_list` and verifies it by
+  read-back — and if the live list has drifted from the active cohort (a manual
+  edit), it's **skipped**, not clobbered.
+- **One email per campaign rotation** (Resend) lists every out→in pair and any
+  failure; the Rotation tab shows the full run **log** and a **Rotate now**
+  button that drives one on demand (scheduled functions fire only on the
+  production deploy).
+- The master toggle (`rotation_swap_enabled`) **replaces the health-based
+  swapper**: when it's on, `_autoSwapRun.ts` stands down entirely, and inboxes
+  locked to a rotation cohort are withheld from autopopulate so a resting cohort
+  is never handed to another campaign. Gated by `ROTATION_SWAP_ENABLED` +
+  `INSTANTLY_WRITE_ENABLED` for any unattended write. The pure decision logic
+  lives in `src/lib/rotationSwap.ts`.
+
+### Turn it on, and confirm it's actually live
+
+Unattended rotation only runs when **all four** of these are true, so set them in
+order:
+
+1. **Netlify env vars.** Site settings → **Environment variables** → add
+   `ROTATION_SWAP_ENABLED=true` and `INSTANTLY_WRITE_ENABLED=true` (Functions
+   scope), then **redeploy** — env changes only take effect on a new deploy.
+2. **Master toggle.** Planner → **Rotation** tab → turn the master switch **On**
+   (this also disables the health-based auto-swapper).
+3. **Per campaign.** Click **Enable rotation** on each campaign and confirm the
+   auto-picked cohort B (or edit it).
+4. **Production deploy.** The daily worker is a Netlify *scheduled function*, which
+   fires **only on the production deploy** — never on a branch deploy or preview.
+   Make sure the branch you configured these vars on is your Netlify **production**
+   branch.
+
+**Confirming it's live — the "Is rotation live?" panel.** The Rotation tab has a
+status card that calls the `rotation-swap-test` dry-run endpoint (it writes
+nothing) and shows a plain checklist, so you never have to guess whether the setup
+took:
+
+- **Rotation mode** — the in-app master toggle is on.
+- **Scheduled worker enabled** — `ROTATION_SWAP_ENABLED=true` reached the deploy.
+- **Writes enabled** — `INSTANTLY_WRITE_ENABLED=true` reached the deploy.
+- **Daily worker firing** — reads the `rotation_swap_runs` log: ✅ *"last ran …"*
+  once the production cron has actually fired (the real proof it's scheduled), or a
+  ⏳ *"hasn't run yet"* note otherwise. The first scheduled run can take up to ~24h;
+  **Rotate now** on a campaign drives one immediately and end-to-end (still
+  write-gated and verified), which flips this to ✅ without waiting.
+- **Coverage** — how many campaigns are managed and how many are due right now.
+
+A green banner (*"Rotation is live"*) appears only when the three config gates are
+on **and** the scheduled worker has fired at least once. The panel is only
+meaningful on the deployed site — on a local/preview build it says so, because
+scheduled functions don't run there. Press **Re-check** to refresh it.
+
+---
+
+## 📈 Growth calculator (rotation-sized)
+
+On the Planner's **Plan** tab, the growth calculator sizes the whole **rotation
+fleet** for a daily-send goal against what you already run — all inputs dynamic and
+persisted. You give it three numbers: the **goal** (emails/day, or leads/day which
 it converts via your sends-per-lead), the **limit per campaign** (campaigns are
-capped, so a big goal needs several), the **inboxes per domain** (1–3 — you can
-safely stretch past the default 2), and the **healthy spares to keep per niche**.
+capped, so a big goal needs several), and the **inboxes per domain** (1–3).
+
+The model is the 15-day rotation strategy: every connected (sending) inbox needs a
+same-niche **rotation partner** to swap in every cycle, so you own **twice** the
+sending count — the connected set plus an equal set that rests and re-warms until
+its turn.
 
 It then reports, live (`src/lib/growthPlan.ts`, pure + tested):
 
 - **Campaigns** — `ceil(goal ÷ per-campaign limit)` and how many more than your
   active campaigns; plus the **emails/day gap** vs. what your active campaigns are
   already configured to allow (`plan.totalDemand`).
-- **Sending inboxes** — `ceil(goal ÷ per-mailbox limit)` at your observed
-  `perBoxCap`.
-- **Healthy spares, per niche** — a small table of each campaign niche, the
-  healthy spares you currently have tagged for it, the target you set, and how many
-  more to tag. A spare only replaces a mailbox in a campaign of its own niche, so
-  the buffer is per-niche; untagged spares count for none. Current spares come from
-  the same "healthy spare" pool the swapper uses (`maintenance.candidates`).
-- **Inboxes & domains to add** — sending inboxes + the spare buffer, minus what you
-  already have, divided across domains at your chosen inboxes/domain — with a
-  monthly-cost estimate from your Costs, a warmup lead-time, and the
-  **provider-ceiling** check (won't let the goal exceed your tightest SES/Instantly
-  daily cap). If your live mailbox supply is short of the goal even before new
-  campaigns, it says so.
+- **Connected inboxes** — sized **per campaign**: each campaign needs
+  `ceil(per-campaign limit ÷ per-mailbox limit)` inboxes to fill it (e.g. 200 ÷ 15 =
+  **14**), across every campaign the goal needs.
+- **Rotation inboxes** — an equal set (1:1 mirror of the connected inboxes) that
+  swaps in on schedule.
+- **Total to own (×2)** — connected + rotation partners; e.g. a single 200/day
+  campaign = 14 + 14 = **28** inboxes.
+- **Inboxes & domains to add** — the total minus the usable inboxes you already
+  have, divided across domains at your chosen inboxes/domain — with a monthly-cost
+  estimate from your Costs, a warmup lead-time, and the **provider-ceiling** check
+  (won't let the goal exceed your tightest SES/Instantly daily cap).
 
 (Domain records store two mailbox slots today, so 3/domain is a planning figure —
 the extra mailbox is created in Instantly but not yet tracked in the domain row.)
+
+### Rotation-aware Mailboxes list
+
+The Mailboxes card on the same tab reflects the rotation world:
+
+- **State** reads Instantly-first and rotation-aware — a resting rotation spare
+  shows `↻ B resting` (not a misleading `idle`), a live cohort shows `↻ A sending`,
+  and a genuinely unused inbox shows `free`. The **Campaigns** column names the
+  rotation (`<campaign> · cohort A/B (active/resting)`) for inboxes that aren't
+  directly connected, so you can always see *which* rotation holds an inbox.
+- **Warmup** column shows Instantly's own warmup score (`stat_warmup_score`)
+  straight from the account — the app no longer synthesizes its own health score on
+  the Plan tab (the health-based swapper and its Maintenance tab remain as a dormant
+  fallback, off while rotation mode is on).
+- **Filters** — a search box (email or niche) plus state segments
+  (`All · Free · In rotation · Sending · No campaign · Warming · Excluded`) with live
+  counts, so 120 rows can be sliced to the bird's-eye view.
+- A **Free inboxes** metric tile counts inboxes in **no campaign and no rotation** —
+  the real pool a new rotation can be built from.
 
 ---
 
