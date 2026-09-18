@@ -157,10 +157,35 @@ function addTag(map: Map<string, string[]>, key: string, tag: string): void {
 
 const EMAILISH = /^[^@\s]+@[^@\s]+$/;
 
-export function parseTagPayload(payload: unknown): TagAssignments {
+/**
+ * @param idToEmail Instantly account **id (UUID) → email**. Instantly v2
+ *   references a mailbox by its internal id, not its address, so without this an
+ *   account tag can't be recognised as a mailbox tag and its niche is lost. Pass
+ *   the map (built from the accounts payload) so account-id assignments reach
+ *   `byEmail`. Optional and backward-compatible: an email-keyed workspace works
+ *   without it, and an unresolved id simply isn't recorded (never mis-filed as a
+ *   wrong-niche mailbox tag).
+ */
+export function parseTagPayload(payload: unknown, idToEmail?: Map<string, string>): TagAssignments {
   const byCampaign = new Map<string, string[]>();
   const byEmail = new Map<string, string[]>();
   const all = new Set<string>();
+
+  const idMap = new Map<string, string>();
+  if (idToEmail) {
+    for (const [k, v] of idToEmail) {
+      const kk = String(k ?? "").trim().toLowerCase();
+      const vv = String(v ?? "").trim().toLowerCase();
+      if (kk && vv) idMap.set(kk, vv);
+    }
+  }
+  // The address for an id: itself if email-shaped, else its mapped account email.
+  const emailFor = (raw: string): string | null => {
+    const v = raw.trim();
+    if (!v) return null;
+    if (EMAILISH.test(v)) return v.toLowerCase();
+    return idMap.get(v.toLowerCase()) ?? null;
+  };
 
   const rows: unknown[] = Array.isArray(payload)
     ? payload
@@ -170,44 +195,69 @@ export function parseTagPayload(payload: unknown): TagAssignments {
         ? ((payload as { data: unknown[] }).data)
         : [];
 
+  const strList = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) : [];
+
   for (const row of rows) {
     if (!row || typeof row !== "object") continue;
     const o = row as Record<string, unknown>;
 
-    const label = normaliseTag(
-      String(o.label ?? o.name ?? o.tag ?? o.title ?? ""),
-    );
+    const label = normaliseTag(String(o.label ?? o.name ?? o.tag ?? o.title ?? ""));
 
-    // Direction 1: the row IS a tag, listing what it's attached to.
+    // Direction 1: the row IS a tag, listing what it's attached to. Route by the
+    // ARRAY the id came from when the payload separates account vs campaign, and
+    // by shape/id-resolution for a generic resource list — NOT by "has an @".
     if (label) {
       all.add(label);
-      const ids = [
-        o.resource_ids, o.resourceIds, o.entity_ids, o.entityIds,
-        o.campaign_ids, o.campaignIds, o.account_ids, o.accountIds, o.emails,
-      ].filter(Array.isArray) as unknown[][];
-      for (const list of ids) {
-        for (const raw of list) {
-          const v = typeof raw === "string" ? raw.trim() : "";
-          if (!v) continue;
-          if (EMAILISH.test(v)) addTag(byEmail, v.toLowerCase(), label);
-          else addTag(byCampaign, v, label);
+      // Explicit mailbox lists: resolve id→email; an unresolved account id is
+      // dropped, never mis-filed as a campaign (that was the wrong-niche bug).
+      for (const list of [o.account_ids, o.accountIds, o.mailbox_ids, o.mailboxIds, o.emails, o.email_list]) {
+        for (const raw of strList(list)) {
+          const email = emailFor(raw);
+          if (email) addTag(byEmail, email, label);
+        }
+      }
+      // Explicit campaign lists.
+      for (const list of [o.campaign_ids, o.campaignIds]) {
+        for (const raw of strList(list)) addTag(byCampaign, raw, label);
+      }
+      // Generic lists: email-shaped or resolvable → mailbox; else → campaign.
+      for (const list of [o.resource_ids, o.resourceIds, o.entity_ids, o.entityIds]) {
+        for (const raw of strList(list)) {
+          const email = emailFor(raw);
+          if (email) addTag(byEmail, email, label);
+          else addTag(byCampaign, raw, label);
         }
       }
     }
 
-    // Direction 2: the row is an entity, carrying its own tags. Handled in the
-    // same pass because a payload may legitimately mix the two.
+    // Direction 2: the row is an entity carrying its own tags. Prefer an explicit
+    // resource type, then an email field, then an id we can resolve to an email.
     const own = normaliseTags(
-      (Array.isArray(o.tags) ? o.tags : Array.isArray(o.labels) ? o.labels : [])
-        .map((t) => (typeof t === "string" ? t : String((t as Record<string, unknown>)?.name ?? (t as Record<string, unknown>)?.label ?? ""))),
+      (Array.isArray(o.tags) ? o.tags : Array.isArray(o.labels) ? o.labels : []).map((t) =>
+        typeof t === "string" ? t : String((t as Record<string, unknown>)?.name ?? (t as Record<string, unknown>)?.label ?? ""),
+      ),
     );
     if (own.length > 0) {
+      const type = String(o.resource_type ?? o.type ?? o.entity_type ?? "").toLowerCase();
       const email = typeof o.email === "string" ? o.email.trim().toLowerCase() : "";
       const id = typeof o.id === "string" ? o.id.trim() : "";
+      const resolvedEmail = email || (id ? emailFor(id) : null);
+      const isCampaign = type.includes("campaign");
+      const isMailbox = type.includes("account") || type.includes("mailbox") || type.includes("inbox");
       for (const t of own) {
         all.add(t);
-        if (email) addTag(byEmail, email, t);
-        else if (id) addTag(byCampaign, id, t);
+        if (isCampaign) {
+          if (id) addTag(byCampaign, id, t);
+        } else if (isMailbox) {
+          if (resolvedEmail) addTag(byEmail, resolvedEmail, t);
+        } else if (email) {
+          addTag(byEmail, email, t);
+        } else if (resolvedEmail) {
+          addTag(byEmail, resolvedEmail, t);
+        } else if (id) {
+          addTag(byCampaign, id, t);
+        }
       }
     }
   }
@@ -246,6 +296,33 @@ export function mergeTagMaps(...maps: (TagMap | undefined)[]): TagMap {
     if (!map) continue;
     for (const [email, tags] of map) {
       out.set(email, normaliseTags([...(out.get(email) ?? []), ...tags]));
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-mailbox niche with PRECEDENCE, not union.
+ *
+ * Instantly's per-inbox tags are authoritative and WIN; the app's `mailbox_tags`
+ * fill in only for inboxes Instantly doesn't tag. This mirrors `campaignTagsOf`
+ * (Instantly wins over the override) and is the fix for the wrong-niche bug: a
+ * stale/duplicate `mailbox_tags` row can no longer add a second niche to an inbox
+ * that Instantly has already tagged, so it can't be matched into the wrong
+ * campaign. (Where Instantly has no per-inbox tag, behaviour is unchanged.)
+ */
+export function resolveTagMap(
+  instantlyByEmail: TagMap | undefined,
+  appRows: readonly { email: string; tags: string[] }[],
+): TagMap {
+  const out: TagMap = new Map();
+  // App tags as the fallback layer.
+  for (const [email, tags] of buildTagMap(appRows)) out.set(email, tags);
+  // Instantly replaces (does not merge into) the app layer wherever it has tags.
+  if (instantlyByEmail) {
+    for (const [email, tags] of instantlyByEmail) {
+      const n = normaliseTags(tags);
+      if (n.length) out.set(email.trim().toLowerCase(), n);
     }
   }
   return out;

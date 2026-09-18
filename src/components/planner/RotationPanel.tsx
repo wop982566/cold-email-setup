@@ -18,6 +18,7 @@ import {
   Power,
   Play,
   Trash2,
+  Pencil,
   AlertTriangle,
   Check,
   X,
@@ -35,17 +36,20 @@ import {
   pairSwaps,
   capacityOf,
   reservedEmails,
+  reservedByOtherCampaign,
+  classifyAccount,
   dueForRotation,
   nextDueMs,
   type CohortBResult,
 } from "../../lib/rotationSwap";
-import { campaignTagsOf } from "../../lib/tags";
+import { campaignTagsOf, eligibleFor, tagsFor, explainIneligible } from "../../lib/tags";
 import type { TagMap } from "../../lib/tags";
-import type { Plan, PlannerCampaign } from "../../lib/campaignPlan";
+import type { Plan, PlannerCampaign, PlannerMailbox } from "../../lib/campaignPlan";
 import type { MailboxHealth } from "../../lib/mailboxHealth";
 import { useCollection, useUpsertMany, useUpdate, useRemove } from "../../lib/hooks";
 import { type AppSettings, type RotationState, type RotationRun, TABLES } from "../../lib/types";
 import { fmtDateShort, fmtNumber } from "../../lib/format";
+import { CohortEditor, type CandidateRow } from "./CohortEditor";
 
 function emailListOf(data: unknown): string[] {
   const list = (data as { email_list?: unknown })?.email_list;
@@ -134,6 +138,141 @@ export function RotationPanel({
     );
 
   const activeCampaigns = plan.campaigns.filter((c) => c.active);
+  const campaignById = useMemo(() => new Map(plan.campaigns.map((c) => [c.id, c])), [plan.campaigns]);
+  const campaignNameById = useMemo(() => new Map(plan.campaigns.map((c) => [c.id, c.name])), [plan.campaigns]);
+  const mailboxByEmail = useMemo(() => {
+    const m = new Map<string, PlannerMailbox>();
+    for (const b of plan.mailboxes) m.set(b.email.toLowerCase(), b);
+    return m;
+  }, [plan.mailboxes]);
+
+  /** Which OTHER enabled rotation campaign locks this email in a cohort, if any. */
+  function rotationOwnerOf(email: string, exceptCampaignId: string): string | null {
+    const e = email.trim().toLowerCase();
+    for (const s of states) {
+      if (!s.enabled || s.campaign_id === exceptCampaignId) continue;
+      if ((s.cohort_a ?? []).map((x) => x.toLowerCase()).includes(e) || (s.cohort_b ?? []).map((x) => x.toLowerCase()).includes(e)) {
+        return s.campaign_name || s.campaign_id;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Status of every account for adding to a cohort of `campaignId`. The verdict
+   * is the pure, tested `classifyAccount`; here we only attach human labels (with
+   * real campaign names). Current cohort members stay removable in the editor.
+   */
+  function buildCandidateRows(campaignId: string, campaignTags: string[], otherCohort: Set<string>): CandidateRow[] {
+    const reservedByOther = reservedByOtherCampaign(states, campaignId);
+    return plan.mailboxes.map((mb) => {
+      const email = mb.email;
+      const tags = tagsFor(tagMap, email);
+      const { status, reason } = classifyAccount({
+        email,
+        mailboxTags: tags,
+        campaignTags,
+        allCampaignIds: mb.allCampaignIds ?? [],
+        ready: mb.active && !mb.excluded && !mb.setupPending,
+        campaignId,
+        otherCohort,
+        reservedByOther,
+      });
+      let label: string | undefined;
+      if (reason === "other-cohort") label = "in this campaign's other cohort";
+      else if (reason === "other-campaign") {
+        const names = (mb.allCampaignIds ?? []).filter((id) => id !== campaignId).map((id) => campaignNameById.get(id) ?? id);
+        label = `used by ${names.join(", ")}`;
+      } else if (reason === "other-rotation") label = `used by rotation: ${rotationOwnerOf(email, campaignId) ?? "another campaign"}`;
+      else if (reason === "not-ready") label = mb.setupPending ? "still setting up" : mb.excluded ? "excluded" : "inactive";
+      else if (reason === "wrong-niche") label = explainIneligible(email, tags, campaignTags) ?? "different niche";
+      return { email, dailyLimit: mb.dailyLimit, status, label };
+    });
+  }
+
+  // --- Manual cohort editor ---------------------------------------------------
+  type EditorState = {
+    title: string;
+    subtitle?: string;
+    warning?: string;
+    rows: CandidateRow[];
+    initial: string[];
+    saveLabel: string;
+    onSave: (emails: string[]) => void | Promise<void>;
+  };
+  const [editor, setEditor] = useState<EditorState | null>(null);
+  const [editorSaving, setEditorSaving] = useState(false);
+
+  // Edit cohort B while enabling (before it's locked) — updates the preview only.
+  function openFixPicks() {
+    const e = enabling;
+    if (!e || !e.cohortB) return;
+    setEditor({
+      title: `Choose cohort B — ${e.campaign.name}`,
+      subtitle: `Same-niche idle accounts for the ${e.campaignTags.join(" / ")} partner cohort. Cohort A (the live set) is reserved.`,
+      rows: buildCandidateRows(e.campaign.id, e.campaignTags, new Set(e.cohortA.map((x) => x.toLowerCase()))),
+      initial: e.cohortB.picks,
+      saveLabel: "Use these",
+      onSave: (emails) => {
+        setEnabling((cur) =>
+          cur ? { ...cur, cohortB: { picks: emails, shortfall: Math.max(0, cur.cohortA.length - emails.length), poolSize: cur.cohortB?.poolSize ?? emails.length } } : cur,
+        );
+        setEditor(null);
+      },
+    });
+  }
+
+  // Edit a live cohort of an enabled campaign.
+  function openEditCohort(s: RotationState, side: "A" | "B") {
+    const c = campaignById.get(s.campaign_id);
+    const campaignTags = c ? tagsForCampaign(c) : s.niche ?? [];
+    const isActive = s.active === side;
+    const otherSide = side === "A" ? s.cohort_b : s.cohort_a;
+    setEditor({
+      title: `Edit cohort ${side} — ${s.campaign_name}`,
+      subtitle: `${isActive ? "This cohort is CONNECTED and sending right now." : "This cohort is resting."} Only same-niche, unused accounts can be added.`,
+      warning: isActive
+        ? "Saving updates the LIVE Instantly campaign to match this set (verified read-back) so rotation stays in sync."
+        : undefined,
+      rows: buildCandidateRows(s.campaign_id, campaignTags, new Set((otherSide ?? []).map((x) => x.toLowerCase()))),
+      initial: side === "A" ? s.cohort_a : s.cohort_b,
+      saveLabel: isActive ? "Save & push live" : "Save",
+      onSave: (emails) => saveCohort(s, side, emails, isActive),
+    });
+  }
+
+  async function saveCohort(s: RotationState, side: "A" | "B", emails: string[], isActive: boolean) {
+    setEditorSaving(true);
+    try {
+      if (isActive) {
+        if (!writesEnabled) {
+          toast.push("Writes are disabled — can't update the live campaign. Enable INSTANTLY_WRITE_ENABLED, or edit the resting cohort instead.", "error");
+          return;
+        }
+        const detail = await instantly.campaignDetail(s.campaign_id);
+        if (!detail.ok) {
+          toast.push(`Couldn't read the live campaign: ${detail.error ?? "unknown error"}`, "error");
+          return;
+        }
+        const live = emailListOf(detail.ok ? detail.data : null);
+        const res = await instantly.replaceCampaignEmails({ campaignId: s.campaign_id, email_list: emails, expectedList: live });
+        if (!(res.ok && res.applied === true)) {
+          toast.push(
+            `Couldn't update the live campaign: ${res.applied === null ? "sent but couldn't confirm" : String(res.error ?? "rejected")}`,
+            "error",
+          );
+          return;
+        }
+      }
+      await updateState.mutateAsync({ id: s.id, patch: { [side === "A" ? "cohort_a" : "cohort_b"]: emails } as Partial<RotationState> });
+      toast.push(`Cohort ${side} updated${isActive ? " and pushed live" : ""}.`, "success");
+      setEditor(null);
+    } catch (err) {
+      toast.push(`Couldn't save: ${err instanceof Error ? err.message : "error"}`, "error");
+    } finally {
+      setEditorSaving(false);
+    }
+  }
 
   // --- Enable flow (auto-pick & lock the partner cohort) ---------------------
   async function openEnable(c: PlannerCampaign) {
@@ -319,6 +458,12 @@ export function RotationPanel({
                           >
                             {rotating === c.id ? <Spinner /> : <Play size={13} />} Rotate now
                           </button>
+                          <button className="btn-ghost btn-sm" onClick={() => openEditCohort(s!, "A")} title="Add/remove cohort A accounts">
+                            <Pencil size={13} /> A
+                          </button>
+                          <button className="btn-ghost btn-sm" onClick={() => openEditCohort(s!, "B")} title="Add/remove cohort B accounts">
+                            <Pencil size={13} /> B
+                          </button>
                           <button className="btn-ghost btn-sm" onClick={() => void disable(s!)}>
                             <Power size={13} /> Pause
                           </button>
@@ -491,8 +636,14 @@ export function RotationPanel({
                 dailyLimitByEmail={dailyLimitByEmail}
                 activeTone
               />
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase text-muted">Cohort B — the locked partner</span>
+                <button className="btn-ghost btn-sm ml-auto" onClick={openFixPicks}>
+                  <Pencil size={12} /> Choose / fix these
+                </button>
+              </div>
               <CohortView
-                label={`Cohort B — the locked partner (${enabling.cohortB?.picks.length ?? 0} inboxes, ${fmtNumber(capacityOf(enabling.cohortB?.picks ?? [], dailyLimitByEmail))}/day)`}
+                label={`${enabling.cohortB?.picks.length ?? 0} inboxes, ${fmtNumber(capacityOf(enabling.cohortB?.picks ?? [], dailyLimitByEmail))}/day`}
                 emails={enabling.cohortB?.picks ?? []}
                 dailyLimitByEmail={dailyLimitByEmail}
                 activeTone={false}
@@ -519,6 +670,20 @@ export function RotationPanel({
           )
         ) : null}
       </Modal>
+
+      {/* Manual cohort editor — strict same-niche picker with the used-account guard */}
+      <CohortEditor
+        open={editor !== null}
+        onClose={() => (editorSaving ? undefined : setEditor(null))}
+        title={editor?.title ?? "Edit cohort"}
+        subtitle={editor?.subtitle}
+        warning={editor?.warning}
+        rows={editor?.rows ?? []}
+        initialSelected={editor?.initial ?? []}
+        saveLabel={editor?.saveLabel ?? "Save"}
+        saving={editorSaving}
+        onSave={(emails) => void editor?.onSave(emails)}
+      />
     </div>
   );
 }

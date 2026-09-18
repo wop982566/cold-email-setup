@@ -31,7 +31,7 @@ import { computePlan } from "../../src/lib/campaignPlan.js";
 import { computeMaintenance } from "../../src/lib/mailboxHealth.js";
 import { computeCapacity } from "../../src/lib/capacity.js";
 import { planAutoSwaps, recordScores, type ScoreHistory } from "../../src/lib/autoSwap.js";
-import { buildTagMap, mergeTagMaps, parseTagPayload } from "../../src/lib/tags.js";
+import { parseTagPayload, resolveTagMap } from "../../src/lib/tags.js";
 import { DEFAULT_SETTINGS, type AppSettings, type Domain } from "../../src/lib/types.js";
 
 const STORE = "cec-data";
@@ -286,8 +286,25 @@ export async function runAutoSwap(req?: Request): Promise<Response> {
     // whatever Instantly doesn't carry. Read through the same proxy resource
     // the UI uses, so the cron and the tab can't disagree about eligibility.
     const tagsRes = await callInstantly("resource=tags");
-    const assignments = parseTagPayload(tagsRes.data);
-    const tagMap = mergeTagMaps(buildTagMap(tagRows), assignments.byEmail);
+    // Instantly references a mailbox by its internal id — map id→email from the
+    // accounts payload so per-inbox tags are recognised, and let Instantly win
+    // over the app table (precedence), matching the UI exactly.
+    const accItems = Array.isArray((accountsData.data as { items?: unknown[] })?.items)
+      ? ((accountsData.data as { items: Record<string, unknown>[] }).items)
+      : Array.isArray(accountsData.data)
+        ? (accountsData.data as Record<string, unknown>[])
+        : [];
+    const idToEmail = new Map<string, string>();
+    for (const a of accItems) {
+      const email = String(a.email ?? "").trim().toLowerCase();
+      if (!email) continue;
+      for (const idKey of ["id", "_id", "account_id", "uuid"]) {
+        const id = a[idKey];
+        if (typeof id === "string" && id.trim()) idToEmail.set(id.trim().toLowerCase(), email);
+      }
+    }
+    const assignments = parseTagPayload(tagsRes.data, idToEmail);
+    const tagMap = resolveTagMap(assignments.byEmail, tagRows);
     if (tagsRes.supported === false) {
       log("Instantly returned no custom-tags endpoint — using this app's own mailbox tags only");
     }

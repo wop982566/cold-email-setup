@@ -157,3 +157,57 @@ export function reservedEmails(
   }
   return s;
 }
+
+/** Emails locked to an enabled rotation cohort of a DIFFERENT campaign. */
+export function reservedByOtherCampaign(
+  states: Pick<RotationState, "enabled" | "campaign_id" | "cohort_a" | "cohort_b">[],
+  campaignId: string,
+): Set<string> {
+  const s = new Set<string>();
+  for (const st of states) {
+    if (!st.enabled || st.campaign_id === campaignId) continue;
+    for (const e of st.cohort_a ?? []) s.add(norm(e));
+    for (const e of st.cohort_b ?? []) s.add(norm(e));
+  }
+  return s;
+}
+
+// --- Manual-picker classification (the "already used" guard) ----------------
+
+export type AccountUse = "available" | "used" | "wrong";
+export type AccountUseReason = "other-cohort" | "other-campaign" | "other-rotation" | "not-ready" | "wrong-niche" | null;
+
+export interface ClassifyAccountInput {
+  email: string;
+  /** The inbox's resolved niche tags (`tagsFor(tagMap, email)`). */
+  mailboxTags: string[];
+  /** The target campaign's niche. */
+  campaignTags: string[];
+  /** Every campaign (any status) the inbox is attached to (`allCampaignIds`). */
+  allCampaignIds: string[];
+  /** active && !excluded && !setupPending — is the inbox usable at all. */
+  ready: boolean;
+  /** The campaign whose cohort is being edited (its own attachment is fine). */
+  campaignId: string;
+  /** This campaign's OTHER cohort (can't be in both), lowercased. */
+  otherCohort: Set<string>;
+  /** Emails locked to another campaign's rotation cohort, lowercased. */
+  reservedByOther: Set<string>;
+}
+
+/**
+ * Can this account be ADDED to the cohort? Strict same-niche, and "used" if it's
+ * on another campaign (any status), locked in another rotation cohort, or already
+ * in this campaign's other cohort. Order matters: the "used" checks come before
+ * the niche check so a same-niche account that's used elsewhere still reads as
+ * used, not available.
+ */
+export function classifyAccount(inp: ClassifyAccountInput): { status: AccountUse; reason: AccountUseReason } {
+  const e = norm(inp.email);
+  if (inp.otherCohort.has(e)) return { status: "used", reason: "other-cohort" };
+  if ((inp.allCampaignIds ?? []).some((id) => id !== inp.campaignId)) return { status: "used", reason: "other-campaign" };
+  if (inp.reservedByOther.has(e)) return { status: "used", reason: "other-rotation" };
+  if (!inp.ready) return { status: "wrong", reason: "not-ready" };
+  if (!eligibleFor(inp.mailboxTags, inp.campaignTags)) return { status: "wrong", reason: "wrong-niche" };
+  return { status: "available", reason: null };
+}

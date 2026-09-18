@@ -48,7 +48,7 @@ import {
 import { computeMaintenance, type MailboxHealth } from "../lib/mailboxHealth";
 import { rollupAll } from "../lib/inboxPlacement";
 import type { InboxTest } from "../lib/types";
-import { buildTagMap, mergeTagMaps, normaliseTag, parseTagPayload, tagsFor } from "../lib/tags";
+import { normaliseTag, parseTagPayload, resolveTagMap, tagsFor } from "../lib/tags";
 import {
   accountCredentials,
   credsOf,
@@ -283,18 +283,36 @@ export default function Planner() {
   // tab and the swap decision all read one source.
   const tagRowsQ = useCollection<MailboxTag>(TABLES.mailboxTags);
   // Tags set in Instantly are the source of truth; the app's own table covers
-  // workspaces (or mailboxes) Instantly doesn't tag. Union, not precedence.
+  // mailboxes Instantly doesn't tag. Instantly WINS per inbox (precedence, not
+  // union) so a stale app tag can't add a wrong niche.
   const instTagsQ = useQuery({
     queryKey: ["inst", "tags"],
     queryFn: () => instantly.tags(),
     staleTime: 5 * 60_000,
   });
+  // Instantly references a mailbox by its internal id, not its address, so give
+  // parseTagPayload an id→email map (from the accounts payload) or its per-inbox
+  // tags are lost and the niche falls back to the app's (possibly stale) table.
+  const accountIdToEmail = useMemo(() => {
+    const m = new Map<string, string>();
+    if (acctQ.data?.ok) {
+      for (const a of asItems<Record<string, unknown>>(acctQ.data.data)) {
+        const email = String(a.email ?? "").trim().toLowerCase();
+        if (!email) continue;
+        for (const idKey of ["id", "_id", "account_id", "uuid"]) {
+          const id = a[idKey];
+          if (typeof id === "string" && id.trim()) m.set(id.trim().toLowerCase(), email);
+        }
+      }
+    }
+    return m;
+  }, [acctQ.data]);
   const tagAssignments = useMemo(
-    () => parseTagPayload(instTagsQ.data?.data),
-    [instTagsQ.data],
+    () => parseTagPayload(instTagsQ.data?.data, accountIdToEmail),
+    [instTagsQ.data, accountIdToEmail],
   );
   const tagMap = useMemo(
-    () => mergeTagMaps(buildTagMap(tagRowsQ.data ?? []), tagAssignments.byEmail),
+    () => resolveTagMap(tagAssignments.byEmail, tagRowsQ.data ?? []),
     [tagRowsQ.data, tagAssignments],
   );
 
